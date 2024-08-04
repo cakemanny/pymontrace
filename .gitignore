@@ -1,0 +1,18 @@
+# compiled python files
+*.pyc
+__pycache__/
+build/
+*.so
+
+*.egg-info
+.pytest_cache
+.mypy_cache
+
+.coverage*
+!.coveragerc
+
+# virtual environment nonsense
+.venv
+venv
+env
+

@@ -1,0 +1,26 @@
+[project]
+name        = "pymontrace"
+description = "production safe low impact tracing"
+version     = "0.1.0"
+
+dependencies = []
+
+[project.optional-dependencies]
+test = [
+  "pytest       ~= 7.0",
+]
+dev = [
+  "black        ==23.12.1",
+  "flake8       ~= 7.0",
+  "isort        ~= 5.0",
+#  "maturin",
+]
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+testpaths = [
+  "tests",
+]
+
+#[tool.maturin]
+#python-source = "src"

@@ -1,0 +1,27 @@
+
+    @pymontrace("path/to/code.py:13")
+    def _(ctx):
+        pass
+
+
+Downside... no one-liners
+Upside... familiar to python users
+
+
+    pymontrace -p 123 -l
+    pymontrace -p 123 -e '/expr/ { ... }'
+
+
+Downside needs an adhoc language for the actions
+
+
+
+If python, then could define some sort of api to use in probe context:
+
+    # This would send the data back to the controlling process for printing
+    pmt.print(a, b, c)
+
+
+-c
+Instead of running the program in process we could start a python subprocess
+with a modified PYTHONPATH ...
