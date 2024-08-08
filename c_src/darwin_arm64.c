@@ -316,7 +316,6 @@ catch_mach_exception_raise_state_identity(
         assert(inj_len <= PYTHON_CODE_OFFSET);
         memcpy((void*)data, injection, inj_len);
 
-        assert(g_allocated != NULL);
         const char* arg = g_python_code;
         size_t len = strlen(arg) + 1;
         assert(PYTHON_CODE_OFFSET + len <= pagesize);
@@ -336,7 +335,7 @@ catch_mach_exception_raise_state_identity(
 
         vm_address_t fn_addr = find_pyfn(task, "PyRun_SimpleString");
         if (!fn_addr) {
-            fatal("find_sysfn");
+            fatal("find_pyfn(PyRun_SimpleString)");
         }
 
         g_orig_threadstate = *state;

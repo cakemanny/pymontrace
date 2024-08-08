@@ -85,16 +85,21 @@ def settrace(user_break, user_python_snippet):
 
 
 def unsettrace():
-    if sys.version_info < (3, 12):
-        sys.settrace(None)
-    else:
-        sys.monitoring.register_callback(
-            TOOL_ID, sys.monitoring.events.LINE, None
-        )
-        sys.monitoring.set_events(
-            TOOL_ID, sys.monitoring.events.NO_EVENTS
-        )
-        sys.monitoring.free_tool_id(TOOL_ID)
+    # This can fail if installing probes failed.
+    try:
+        if sys.version_info < (3, 12):
+            sys.settrace(None)
+        else:
+            sys.monitoring.register_callback(
+                TOOL_ID, sys.monitoring.events.LINE, None
+            )
+            sys.monitoring.set_events(
+                TOOL_ID, sys.monitoring.events.NO_EVENTS
+            )
+            sys.monitoring.free_tool_id(TOOL_ID)
+    except Exception:
+        print(f'{__name__}.unsettrace failed', file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
 
 
 def parse_probe(probe_spec):
