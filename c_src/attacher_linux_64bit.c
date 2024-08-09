@@ -355,6 +355,7 @@ find_symbol(pid_t pid, const char* symbol, const char* fnsrchstr)
             continue;
         }
 
+        size_t map_size = map.addr_end - map.addr_start;
         if ((es_info.section_addr >= map.addr_start &&
                     es_info.section_addr < map.addr_end) &&
                 (es_info.sym_addr >= map.addr_start &&
@@ -368,6 +369,9 @@ find_symbol(pid_t pid, const char* symbol, const char* fnsrchstr)
             // DYN
             // TODO: actually check the address in the program headers
             symbol_addr = map.addr_start + es_info.sym_addr;
+        } else if (es_info.sym_addr > map.offset && (es_info.sym_addr < map.offset + map_size)) {
+            // Maybe this one works in all cases?
+            symbol_addr = (map.addr_start - map.offset) + es_info.sym_addr;
         } else {
             // and or DYN
             fprintf(stderr, "TODO: implement better SO handling\n");
@@ -690,7 +694,7 @@ attach_and_execute(int pid, const char* python_code)
 
     // TODO: check python_code size < page size
 
-    uint64_t breakpoint_addr = find_pyfn(pid, SAFE_POINT);
+    uintptr_t breakpoint_addr = find_pyfn(pid, SAFE_POINT);
     if (breakpoint_addr == 0) {
         fprintf(stderr, "unable to find %s\n", SAFE_POINT);
         return ATT_FAIL;
