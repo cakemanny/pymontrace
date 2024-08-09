@@ -7,7 +7,7 @@ DARWIN_SOURCES = [
 ]
 
 LINUX_SOURCES = [
-    "c_src/attacher_linux_aarch64.c",
+    "c_src/attacher_linux_64bit.c",
 ]
 
 sources = [

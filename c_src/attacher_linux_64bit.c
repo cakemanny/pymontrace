@@ -26,9 +26,17 @@
 
 #define SAFE_POINT  "PyEval_SaveThread"
 
+#if defined(__aarch64__)
 // this is what gcc gives for __builtin_trap()
 //    brk    #0x3e8
-#define DEBUG_TRAP_INSTR    ((uint32_t)0xd4207d00)
+    #define DEBUG_TRAP_INSTR    ((uint32_t)0xd4207d00)
+    #define user_regs_retval(uregs) ((uregs).regs[0])
+#elif defined(__x86_64__)
+// this is what clang gives for __builtin_debugtrap()
+//    int3
+    #define DEBUG_TRAP_INSTR    ((uint8_t)0xcc)
+    #define user_regs_retval(uregs) ((uregs).rax)
+#endif
 
 
 #define log_err(fmt, ...) fprintf(stderr, "[error]: " fmt "\n", ##__VA_ARGS__)
@@ -387,6 +395,25 @@ typedef union {
     uint64_t u64;
 } word_of_instr_t;
 
+
+static int
+save_instrs(pid_t pid, word_of_instr_t* psaved, uintptr_t addr)
+{
+    struct iovec local = {
+        .iov_base = psaved->c_bytes,
+        .iov_len = sizeof *psaved,
+    };
+    struct iovec remote = {
+        .iov_base = (void*)addr,
+        .iov_len = sizeof *psaved,
+    };
+    if (process_vm_readv(pid, &local, 1, &remote, 1, 0) != remote.iov_len) {
+        perror("process_vm_readv");
+        return ATT_FAIL;
+    }
+    return 0;
+}
+
 static int
 call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t* addr)
 {
@@ -407,20 +434,11 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t* addr)
                 iov.iov_len, sizeof user_regs);
     }
 
+#if defined(__aarch64__)
     // ... we don't *need* to save the instructions since, in this case
     // we've already saved them in attach_and_exec.
     word_of_instr_t saved_instrs = {};
-
-    struct iovec local = {
-        .iov_base = saved_instrs.c_bytes,
-        .iov_len = sizeof saved_instrs,
-    };
-    struct iovec remote = {
-        .iov_base = (void*)user_regs.pc,
-        .iov_len = sizeof saved_instrs,
-    };
-    if (process_vm_readv(pid, &local, 1, &remote, 1, 0) != remote.iov_len) {
-        perror("process_vm_readv");
+    if (save_instrs(pid, &saved_instrs, user_regs.pc) != 0) {
         return ATT_FAIL;
     }
 
@@ -444,6 +462,36 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t* addr)
     urmmap.regs[3] = MAP_PRIVATE | MAP_ANONYMOUS;
     urmmap.regs[4] = -1; // fd
     urmmap.regs[5] = 0; // offset
+
+#elif defined(__x86_64__)
+
+    word_of_instr_t saved_instrs = {};
+    if (save_instrs(pid, &saved_instrs, user_regs.rip) != 0) {
+        return ATT_FAIL;
+    }
+
+    word_of_instr_t syscall_and_brk = {
+        .c_bytes[0] = 0x0f, .c_bytes[1] = 0x05, /* syscall */
+        .c_bytes[2] = 0xcc, /* debug trap */
+    };
+    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)user_regs.rip,
+                syscall_and_brk.u64)) {
+        perror("ptrace(PTRACE_POKETEXT, ...)");
+        return ATT_FAIL;
+    }
+
+    // Setup registers for mmap call
+    struct user_regs_struct urmmap = user_regs;
+
+    urmmap.rax = SYS_mmap;
+    urmmap.rdi = 0; // addr
+    urmmap.rsi = sysconf(_SC_PAGESIZE); // length
+    urmmap.rdx = PROT_READ | PROT_WRITE; // prot
+    urmmap.r10 = MAP_PRIVATE | MAP_ANONYMOUS;
+    urmmap.r8 = -1; // fd
+    urmmap.r9 = 0; // offset
+
+#endif
 
     struct iovec iov_mmap = {.iov_base = &urmmap, .iov_len = sizeof urmmap};
 
@@ -480,7 +528,12 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t* addr)
     }
 
     // from linux/tools/include/nolibc/sys.h
-    void* ret = (void*)urmmap.regs[0];
+    void* ret =
+#if defined(__aarch64__)
+        (void*)urmmap.regs[0];
+#elif defined(__x86_64__)
+        (void*)urmmap.rax;
+#endif
     if ((unsigned long)ret >= -4095UL) {
         errno = -(long)ret;
         perror("mmap_in_target");
@@ -540,24 +593,22 @@ call_pyfn_in_target(pid_t pid, pid_t tid, uintptr_t fn_addr, uintptr_t buf)
     }
 
     word_of_instr_t saved_instrs = {};
-
-    struct iovec local = {
-        .iov_base = saved_instrs.c_bytes,
-        .iov_len = sizeof saved_instrs,
-    };
-    struct iovec remote = {
-        .iov_base = (void*)libc_start_addr,
-        .iov_len = sizeof saved_instrs,
-    };
-    if (process_vm_readv(pid, &local, 1, &remote, 1, 0) != remote.iov_len) {
-        perror("process_vm_readv");
+    if (save_instrs(pid, &saved_instrs, libc_start_addr) != 0) {
         return ATT_FAIL;
     }
 
-    word_of_instr_t indirect_call_and_brk = {
-        .u32s[0] = 0xd63f0200,  /* blr	x16 */
-        .u32s[1] = DEBUG_TRAP_INSTR,
-    };
+    word_of_instr_t indirect_call_and_brk =
+#if defined(__aarch64__)
+        {
+            .u32s[0] = 0xd63f0200,  /* blr	x16 */
+            .u32s[1] = DEBUG_TRAP_INSTR,
+        };
+#elif defined(__x86_64__)
+        {
+            .c_bytes[0] = 0xff, .c_bytes[1] = 0xd0, /* callq *%rax */
+            .c_bytes[2] = DEBUG_TRAP_INSTR,
+        };
+#endif
     if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)libc_start_addr,
                 indirect_call_and_brk.u64)) {
         perror("ptrace(PTRACE_POKETEXT, ...)");
@@ -567,10 +618,17 @@ call_pyfn_in_target(pid_t pid, pid_t tid, uintptr_t fn_addr, uintptr_t buf)
     // Setup registers for call
     struct user_regs_struct urcall = user_regs;
 
+#if defined(__aarch64__)
     urcall.regs[0] = fn_addr;
     urcall.regs[1] = buf;
     urcall.regs[16] = add_pending_call_addr;
     urcall.pc = libc_start_addr;
+#elif defined(__x86_64__)
+    urcall.rdi = fn_addr;
+    urcall.rsi = buf;
+    urcall.rax = add_pending_call_addr;
+    urcall.rip = libc_start_addr;
+#endif
 
     struct iovec iov_call = {.iov_base = &urcall, .iov_len = sizeof urcall};
 
@@ -604,7 +662,7 @@ call_pyfn_in_target(pid_t pid, pid_t tid, uintptr_t fn_addr, uintptr_t buf)
         goto restore_instuctions;
     }
 
-    if (urcall.regs[0] != 0) {
+    if (user_regs_retval(urcall) != 0) {
         log_err("running python code failed");
     }
 
@@ -660,19 +718,9 @@ attach_and_execute(int pid, const char* python_code)
         return ATT_UNKNOWN_STATE;
     }
 
-    // TODO: write simple wrapper for this
     word_of_instr_t saved_instrs = {};
-    struct iovec local = {
-        .iov_base = saved_instrs.c_bytes,
-        .iov_len = sizeof saved_instrs,
-    };
-    struct iovec remote = {
-        .iov_base = (void*)breakpoint_addr,
-        .iov_len = sizeof saved_instrs,
-    };
-    if (process_vm_readv(pid, &local, 1, &remote, 1, 0) != remote.iov_len) {
-        perror("process_vm_readv");
-        if (ptrace(PTRACE_DETACH, pid, 0, 0) == -1){
+    if (save_instrs(pid, &saved_instrs, breakpoint_addr) != 0) {
+        if (ptrace(PTRACE_DETACH, pid, 0, 0) == -1) {
             return ATT_UNKNOWN_STATE;
         }
         return ATT_FAIL;
@@ -680,10 +728,12 @@ attach_and_execute(int pid, const char* python_code)
 
     // Note aarch64 has 64-bit words but 32-bit instructions so
     // we only write to the first four bytes.
-    word_of_instr_t breakpoint_instrs = {
-        .u32s[0] = DEBUG_TRAP_INSTR,
-        .u32s[1] = saved_instrs.u32s[1],
-    };
+    word_of_instr_t breakpoint_instrs = saved_instrs;
+    #if defined(__aarch64__)
+        breakpoint_instrs.u32s[0] = DEBUG_TRAP_INSTR;
+    #elif defined(__x86_64__)
+        breakpoint_instrs.c_bytes[0] = DEBUG_TRAP_INSTR;
+    #endif
     if (-1 == ptrace(PTRACE_POKETEXT, tid, breakpoint_addr,
                 breakpoint_instrs.u64)) {
         perror("ptrace(PTRACE_POKETEXT, ...)");
