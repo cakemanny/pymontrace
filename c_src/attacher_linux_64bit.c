@@ -40,6 +40,10 @@
 
 
 #define log_err(fmt, ...) fprintf(stderr, "[error]: " fmt "\n", ##__VA_ARGS__)
+const int debug = 1;
+#define log_dbg(fmt, ...) do { \
+    if (debug) { fprintf(stderr, "[debug]: " fmt "\n", ##__VA_ARGS__); } \
+} while (0)
 
 typedef struct {
     uintptr_t addr_start;
@@ -364,11 +368,6 @@ find_symbol(pid_t pid, const char* symbol, const char* fnsrchstr)
             // Maybe that's how things are with exec files.
 
             symbol_addr = es_info.sym_addr;
-        } else if (map.offset == 0 && (
-                    map.addr_start + es_info.sym_addr < map.addr_end)) {
-            // DYN
-            // TODO: actually check the address in the program headers
-            symbol_addr = map.addr_start + es_info.sym_addr;
         } else if (es_info.sym_addr > map.offset && (es_info.sym_addr < map.offset + map_size)) {
             // Maybe this one works in all cases?
             symbol_addr = (map.addr_start - map.offset) + es_info.sym_addr;
@@ -419,7 +418,7 @@ save_instrs(pid_t pid, word_of_instr_t* psaved, uintptr_t addr)
 }
 
 static int
-call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t* addr)
+call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t bp_addr, uintptr_t* addr)
 {
     int err = 0;
 
@@ -438,19 +437,19 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t* addr)
                 iov.iov_len, sizeof user_regs);
     }
 
-#if defined(__aarch64__)
-    // ... we don't *need* to save the instructions since, in this case
-    // we've already saved them in attach_and_exec.
     word_of_instr_t saved_instrs = {};
-    if (save_instrs(pid, &saved_instrs, user_regs.pc) != 0) {
+    if (save_instrs(pid, &saved_instrs, bp_addr) != 0) {
         return ATT_FAIL;
     }
+
+
+#if defined(__aarch64__)
 
     word_of_instr_t syscall_and_brk = {
         .u32s[0] = 0xd4000001, /* svc	#0 */
         .u32s[1] = DEBUG_TRAP_INSTR,
     };
-    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)user_regs.pc,
+    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)bp_addr,
                 syscall_and_brk.u64)) {
         perror("ptrace(PTRACE_POKETEXT, ...)");
         return ATT_FAIL;
@@ -466,19 +465,15 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t* addr)
     urmmap.regs[3] = MAP_PRIVATE | MAP_ANONYMOUS;
     urmmap.regs[4] = -1; // fd
     urmmap.regs[5] = 0; // offset
+    urmmap.pc = bp_addr;
 
 #elif defined(__x86_64__)
 
-    word_of_instr_t saved_instrs = {};
-    if (save_instrs(pid, &saved_instrs, user_regs.rip) != 0) {
-        return ATT_FAIL;
-    }
-
     word_of_instr_t syscall_and_brk = {
         .c_bytes[0] = 0x0f, .c_bytes[1] = 0x05, /* syscall */
-        .c_bytes[2] = 0xcc, /* debug trap */
+        .c_bytes[2] = DEBUG_TRAP_INSTR,
     };
-    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)user_regs.rip,
+    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)bp_addr,
                 syscall_and_brk.u64)) {
         perror("ptrace(PTRACE_POKETEXT, ...)");
         return ATT_FAIL;
@@ -494,6 +489,7 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t* addr)
     urmmap.r10 = MAP_PRIVATE | MAP_ANONYMOUS;
     urmmap.r8 = -1; // fd
     urmmap.r9 = 0; // offset
+    urmmap.rip = bp_addr;
 
 #endif
 
@@ -502,13 +498,13 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t* addr)
     if (-1 == ptrace(PTRACE_SETREGSET, tid, NT_PRSTATUS, &iov_mmap)) {
         perror("ptrace(PTRACE_SETREGSET, ...)");
         err = ATT_UNKNOWN_STATE;
-        goto restore_regs;
+        goto restore_instuctions;
     }
 
     if (ptrace(PTRACE_CONT, tid, 0, 0) == -1) {
         perror("ptrace(PTRACE_CONT, ...)");
         err = ATT_UNKNOWN_STATE;
-        goto restore_regs;
+        goto restore_instuctions;
     }
 
     // This waits until the next signal, which will be the breakpoint
@@ -517,10 +513,10 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t* addr)
     if ((tid = waitpid(pid, &wstatus, 0)) == -1) {
         perror("waitpid");
         err = ATT_UNKNOWN_STATE;
-        goto restore_regs;
+        goto restore_instuctions;
     }
     if (!WIFSTOPPED(wstatus) || WSTOPSIG(wstatus) != SIGTRAP) {
-        // TODO, loop until correct signal, or use the newer apis
+        // We should bail if this is not the breakpoint signal at this point
         fprintf(stderr, "WIFSTOPPED(status) = %d, WSTOPSIG(wstatus)= %d\n",
                 WIFSTOPPED(wstatus), WSTOPSIG(wstatus));
     }
@@ -528,7 +524,7 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t* addr)
     if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_PRSTATUS, &iov_mmap)) {
         perror("ptrace(PTRACE_GETREGSET, ...)");
         err = ATT_UNKNOWN_STATE;
-        goto restore_regs;
+        goto restore_instuctions;
     }
 
     // from linux/tools/include/nolibc/sys.h
@@ -546,9 +542,15 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t* addr)
 
     *addr = (uintptr_t)ret;
 
-    // todo: restore instructions?
 
-restore_regs:
+restore_instuctions:
+
+    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)bp_addr,
+                saved_instrs.u64)) {
+        perror("ptrace(PTRACE_POKETEXT, ...)");
+        err = ATT_UNKNOWN_STATE;
+        // Intentionally not going to return, in order to restore registers
+    }
 
     if (-1 == ptrace(PTRACE_SETREGSET, tid, NT_PRSTATUS, &iov)) {
         perror("ptrace(PTRACE_SETREGSET,...)");
@@ -560,7 +562,9 @@ restore_regs:
 
 
 static ssize_t
-call_pyfn_in_target(pid_t pid, pid_t tid, uintptr_t fn_addr, uintptr_t buf)
+call_pyfn_in_target(
+        pid_t pid, pid_t tid, uintptr_t scratch_addr, uintptr_t fn_addr,
+        uintptr_t buf)
 {
     // not sure it really makes sense to pass in the fn_addr since
     // this will only work for functions of a single string argument...
@@ -581,14 +585,6 @@ call_pyfn_in_target(pid_t pid, pid_t tid, uintptr_t fn_addr, uintptr_t buf)
                 iov.iov_len, sizeof user_regs);
     }
 
-    // There is a build-id at the start of glibc that we can overwrite
-    // temporarily (idea from the readme of kubo/injector)
-    uintptr_t libc_start_addr = find_libc_start(pid);
-    if (libc_start_addr == 0) {
-        fprintf(stderr, "could not find libc\n");
-        return ATT_FAIL;
-    }
-
     uintptr_t add_pending_call_addr = find_pyfn(pid, "Py_AddPendingCall");
 
     if (add_pending_call_addr == 0) {
@@ -597,7 +593,7 @@ call_pyfn_in_target(pid_t pid, pid_t tid, uintptr_t fn_addr, uintptr_t buf)
     }
 
     word_of_instr_t saved_instrs = {};
-    if (save_instrs(pid, &saved_instrs, libc_start_addr) != 0) {
+    if (save_instrs(pid, &saved_instrs, scratch_addr) != 0) {
         return ATT_FAIL;
     }
 
@@ -613,7 +609,7 @@ call_pyfn_in_target(pid_t pid, pid_t tid, uintptr_t fn_addr, uintptr_t buf)
             .c_bytes[2] = DEBUG_TRAP_INSTR,
         };
 #endif
-    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)libc_start_addr,
+    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)scratch_addr,
                 indirect_call_and_brk.u64)) {
         perror("ptrace(PTRACE_POKETEXT, ...)");
         return ATT_FAIL;
@@ -626,12 +622,12 @@ call_pyfn_in_target(pid_t pid, pid_t tid, uintptr_t fn_addr, uintptr_t buf)
     urcall.regs[0] = fn_addr;
     urcall.regs[1] = buf;
     urcall.regs[16] = add_pending_call_addr;
-    urcall.pc = libc_start_addr;
+    urcall.pc = scratch_addr;
 #elif defined(__x86_64__)
     urcall.rdi = fn_addr;
     urcall.rsi = buf;
     urcall.rax = add_pending_call_addr;
-    urcall.rip = libc_start_addr;
+    urcall.rip = scratch_addr;
 #endif
 
     struct iovec iov_call = {.iov_base = &urcall, .iov_len = sizeof urcall};
@@ -671,7 +667,7 @@ call_pyfn_in_target(pid_t pid, pid_t tid, uintptr_t fn_addr, uintptr_t buf)
     }
 
 restore_instuctions:
-    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)libc_start_addr,
+    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)scratch_addr,
                 saved_instrs.u64)) {
         perror("ptrace(PTRACE_POKETEXT, ...)");
         err = ATT_UNKNOWN_STATE;
@@ -699,6 +695,7 @@ attach_and_execute(int pid, const char* python_code)
         fprintf(stderr, "unable to find %s\n", SAFE_POINT);
         return ATT_FAIL;
     }
+    log_dbg(SAFE_POINT " = %lx", breakpoint_addr);
 
     // TODO: consider using PTRACE_SEIZE and then PTRACE_INTERRUPT
     if (-1 == ptrace(PTRACE_ATTACH, pid, 0, 0)) {
@@ -721,6 +718,8 @@ attach_and_execute(int pid, const char* python_code)
                 WIFEXITED(wstatus), WIFSIGNALED(wstatus));
         return ATT_UNKNOWN_STATE;
     }
+
+    // TODO: consider setting hardware a breakpoint instead.
 
     word_of_instr_t saved_instrs = {};
     if (save_instrs(pid, &saved_instrs, breakpoint_addr) != 0) {
@@ -748,7 +747,8 @@ attach_and_execute(int pid, const char* python_code)
     fprintf(stderr, "Waiting for process to reach safepoint...\n");
     if (ptrace(PTRACE_CONT, tid, 0, 0) == -1) {
         perror("ptrace(PTRACE_CONT, ...)");
-        return ATT_UNKNOWN_STATE;
+        err = ATT_UNKNOWN_STATE;
+        goto detach;
     }
 
     // This waits until the next signal, which will be the breakpoint
@@ -763,13 +763,59 @@ attach_and_execute(int pid, const char* python_code)
                 WIFSTOPPED(wstatus), WSTOPSIG(wstatus));
     }
 
+    // Restore patched code
+    if (-1 == ptrace(PTRACE_POKETEXT, tid, breakpoint_addr,
+                saved_instrs.u64)) {
+        perror("ptrace(PTRACE_POKETEXT, ...)");
+        err = ATT_UNKNOWN_STATE;
+        goto detach;
+    }
+
+    // Back the instruction pointer back to the breakpoint_addr for
+    // architectures where the instruction pointer still increments on the
+    // trap. Note: an illegal instruction, ud2, would not have this problem
+    // but then we'd have to adapt our signal handling code ... Let's compare
+    // HW breakpoints before deciding.
+#if defined(__x86_64__)
+    {
+        struct user_regs_struct user_regs = {};
+        struct iovec iov = {.iov_base = &user_regs, .iov_len = sizeof user_regs};
+        if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_PRSTATUS, &iov)) {
+            perror("ptrace(PTRACE_GETREGSET,...)");
+            err = ATT_UNKNOWN_STATE; /* until we succeed with the next the
+                                        instruction pointer, we're in a bad
+                                        state */
+
+            goto detach;
+        }
+        log_dbg("Setting rip from %llx to %lx", user_regs.rip, breakpoint_addr);
+        user_regs.rip = breakpoint_addr;
+        if (-1 == ptrace(PTRACE_SETREGSET, tid, NT_PRSTATUS, &iov)) {
+            perror("ptrace(PTRACE_SETREGSET,...)");
+            err = ATT_UNKNOWN_STATE;
+            goto detach;
+        }
+    }
+#endif // defined(__x86_64__)
+
+    // TODO: extract from here to detch into a function
+
+    // There is a build-id at the start of glibc that we can overwrite
+    // temporarily (idea from the readme of kubo/injector)
+    uintptr_t libc_start_addr = find_libc_start(pid);
+    if (libc_start_addr == 0) {
+        fprintf(stderr, "could not find libc\n");
+        err = ATT_FAIL;
+        goto detach;
+    }
+    log_dbg("libc_start_addr = %lx\n", libc_start_addr);
+
 
     // This is the point at which we can start to do our work.
     uintptr_t mapped_addr = 0;
-    if (call_mmap_in_target(pid, tid, &mapped_addr) != 0) {
+    if ((err = call_mmap_in_target(pid, tid, libc_start_addr, &mapped_addr)) != 0) {
         fprintf(stderr, "call_mmap_in_target failed\n");
-        err = ATT_FAIL;
-        goto restore_text;
+        goto detach;
     }
 
 
@@ -782,33 +828,27 @@ attach_and_execute(int pid, const char* python_code)
         if (process_vm_writev(pid, &local, 1, &remote, 1, 0) != len) {
             perror("process_vm_writev");
             err = ATT_FAIL;
-            goto restore_text;
+            goto detach;
         }
     }
-
 
     uint64_t PyRun_SimpleString = find_pyfn(pid, "PyRun_SimpleString");
     if (PyRun_SimpleString == 0) {
         fprintf(stderr, "unable to find %s\n", "PyRun_SimpleString");
         err = ATT_FAIL;
-        goto restore_text;
+        goto detach;
     }
 
-    if (call_pyfn_in_target(pid, tid, PyRun_SimpleString, mapped_addr) != 0) {
+    if ((err = call_pyfn_in_target(pid, tid, libc_start_addr,
+                    PyRun_SimpleString, mapped_addr)) != 0) {
         fprintf(stderr, "call PyRun_SimpleString in target failed\n");
-        err = ATT_FAIL;
+        goto detach;
     }
 
     // TODO: munmap (requires setting the breakpoint in the function passed
     // to Py_AddPendingCall)
 
-restore_text:
-
-    if (-1 == ptrace(PTRACE_POKETEXT, tid, breakpoint_addr,
-                saved_instrs.u64)) {
-        perror("ptrace(PTRACE_POKETEXT, ...)");
-        return ATT_UNKNOWN_STATE;
-    }
+detach:
 
     if (-1 == ptrace(PTRACE_DETACH, pid, 0, 0)) {
         perror("ptrace(PTRACE_DETACH,...)");

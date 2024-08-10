@@ -4,7 +4,7 @@ import sys
 import textwrap
 import traceback
 
-TOOL_ID = sys.monitoring.DEBUGGER_ID
+TOOL_ID = sys.monitoring.DEBUGGER_ID if sys.version_info >= (3, 12) else 0
 
 
 class LineProbe:
