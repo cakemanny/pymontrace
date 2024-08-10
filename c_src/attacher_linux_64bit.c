@@ -17,6 +17,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#if defined(__riscv) && __riscv_xlen == 64
+    // struct user_regs_struct isn't defined properly without this
+    #include <linux/ptrace.h>
+#endif
 #include <linux/elf.h>
 #include <sys/uio.h>
 
@@ -36,6 +40,12 @@
 //    int3
     #define DEBUG_TRAP_INSTR    ((uint8_t)0xcc)
     #define user_regs_retval(uregs) ((uregs).rax)
+#elif defined(__riscv)
+    #define DEBUG_TRAP_INSTR    ((uint32_t)0x00100073)
+    // x10 == a0 == first argument and also return value
+    #define user_regs_retval(uregs) ((uregs).a0)
+#else
+    #error "unsupported arch"
 #endif
 
 
@@ -491,6 +501,32 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t bp_addr, uintptr_t* addr)
     urmmap.r9 = 0; // offset
     urmmap.rip = bp_addr;
 
+#elif defined(__riscv) && __riscv_xlen == 64
+
+    // We use the 32-bit instructions so that we don't need to check
+    // whether the processor supports the RVC extension.
+    word_of_instr_t syscall_and_brk = {
+        .u32s[0] = 0x00000073, /* ecall */
+        .u32s[1] = DEBUG_TRAP_INSTR,
+    };
+    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)bp_addr,
+                syscall_and_brk.u64)) {
+        perror("ptrace(PTRACE_POKETEXT, ...)");
+        return ATT_FAIL;
+    }
+
+    // Setup registers for mmap call
+    struct user_regs_struct urmmap = user_regs;
+
+    urmmap.a7 = SYS_mmap;
+    urmmap.a0 = 0; // addr
+    urmmap.a1 = sysconf(_SC_PAGESIZE); // length
+    urmmap.a2 = PROT_READ | PROT_WRITE; // prot
+    urmmap.a3 = MAP_PRIVATE | MAP_ANONYMOUS;
+    urmmap.a4 = -1; // fd
+    urmmap.a5 = 0; // offset
+    urmmap.pc = bp_addr;
+
 #endif
 
     struct iovec iov_mmap = {.iov_base = &urmmap, .iov_len = sizeof urmmap};
@@ -528,12 +564,7 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t bp_addr, uintptr_t* addr)
     }
 
     // from linux/tools/include/nolibc/sys.h
-    void* ret =
-#if defined(__aarch64__)
-        (void*)urmmap.regs[0];
-#elif defined(__x86_64__)
-        (void*)urmmap.rax;
-#endif
+    void* ret = (void*) user_regs_retval(urmmap);
     if ((unsigned long)ret >= -4095UL) {
         errno = -(long)ret;
         perror("mmap_in_target");
@@ -597,18 +628,18 @@ call_pyfn_in_target(
         return ATT_FAIL;
     }
 
-    word_of_instr_t indirect_call_and_brk =
-#if defined(__aarch64__)
-        {
+    word_of_instr_t indirect_call_and_brk = {
+        #if defined(__aarch64__)
             .u32s[0] = 0xd63f0200,  /* blr	x16 */
             .u32s[1] = DEBUG_TRAP_INSTR,
-        };
-#elif defined(__x86_64__)
-        {
+        #elif defined(__x86_64__)
             .c_bytes[0] = 0xff, .c_bytes[1] = 0xd0, /* callq *%rax */
             .c_bytes[2] = DEBUG_TRAP_INSTR,
-        };
-#endif
+        #elif defined(__riscv)
+            .u32s[0] = 0x000780e7, /* jalr	a5 */
+            .u32s[1] = DEBUG_TRAP_INSTR,
+        #endif
+    };
     if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)scratch_addr,
                 indirect_call_and_brk.u64)) {
         perror("ptrace(PTRACE_POKETEXT, ...)");
@@ -628,6 +659,11 @@ call_pyfn_in_target(
     urcall.rsi = buf;
     urcall.rax = add_pending_call_addr;
     urcall.rip = scratch_addr;
+#elif defined(__riscv)
+    urcall.a0 = fn_addr;
+    urcall.a1 = buf;
+    urcall.a5 = add_pending_call_addr;
+    urcall.pc = scratch_addr;
 #endif
 
     struct iovec iov_call = {.iov_base = &urcall, .iov_len = sizeof urcall};
@@ -732,7 +768,7 @@ attach_and_execute(int pid, const char* python_code)
     // Note aarch64 has 64-bit words but 32-bit instructions so
     // we only write to the first four bytes.
     word_of_instr_t breakpoint_instrs = saved_instrs;
-    #if defined(__aarch64__)
+    #if defined(__aarch64__) || defined(__riscv)
         breakpoint_instrs.u32s[0] = DEBUG_TRAP_INSTR;
     #elif defined(__x86_64__)
         breakpoint_instrs.c_bytes[0] = DEBUG_TRAP_INSTR;
