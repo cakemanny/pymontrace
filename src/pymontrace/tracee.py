@@ -1,9 +1,11 @@
 import inspect
+import io
 import os
 import re
 import sys
 import textwrap
 import traceback
+from typing import Union
 from types import CodeType, FrameType
 
 TOOL_ID = sys.monitoring.DEBUGGER_ID if sys.version_info >= (3, 12) else 0
@@ -45,9 +47,27 @@ class LineProbe:
         return to_match == self.path
 
 
+class pmt:
+
+    # TODO: we need to come up with a message type and encoding format
+    # so that we can buffer and also send other kinds of data
+    comm_fh: Union[io.TextIOWrapper, None] = None
+
+    print_buffer = []
+
+    @staticmethod
+    def print(*args):
+        if pmt.comm_fh is not None:
+            to_write = ' '.join(map(str, args)) + '\n'
+            os.write(pmt.comm_fh.fileno(), to_write.encode())
+
+
 def safe_eval(action: CodeType, frame: FrameType, snippet: str):
     try:
-        eval(action, {**frame.f_globals}, {**frame.f_locals})
+        eval(action, {**frame.f_globals}, {
+            **frame.f_locals,
+            'print': pmt.print,
+        })
     except Exception:
         print('Probe action failed', file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
@@ -97,31 +117,51 @@ def create_event_handlers(probe: LineProbe, action: CodeType, snippet: str):
 
 
 # The function called inside the target to start tracing
-def settrace(user_break, user_python_snippet):
+def settrace(user_break, user_python_snippet, comm_file):
 
-    user_python_obj = compile(user_python_snippet, '<pymontrace expr>', 'exec')
-    probe = LineProbe(user_break[0], user_break[1])
+    if pmt.comm_fh is not None:
+        # Maybe a previous settrace failed half-way through
+        pmt.comm_fh.close()
+    pmt.comm_fh = open(comm_file, 'w')
+    pmt.comm_fh.reconfigure(write_through=True)
 
-    if sys.version_info < (3, 12):
-        sys.settrace(create_event_handlers(
-            probe, user_python_obj, user_python_snippet
-        ))
-    else:
+    try:
+        user_python_obj = compile(user_python_snippet, '<pymontrace expr>', 'exec')
+        probe = LineProbe(user_break[0], user_break[1])
 
-        def handle_line(code: CodeType, line_number: int):
-            if not probe.matches(code.co_filename, line_number):
-                return sys.monitoring.DISABLE
-            if ((cur_frame := inspect.currentframe()) is None
-                    or (frame := cur_frame.f_back) is None):
-                # TODO: warn about not being able to collect data
-                return
-            safe_eval(user_python_obj, frame, user_python_snippet)
+        if sys.version_info < (3, 12):
+            sys.settrace(create_event_handlers(
+                probe, user_python_obj, user_python_snippet
+            ))
+        else:
 
-        sys.monitoring.use_tool_id(TOOL_ID, 'pymontrace')
-        sys.monitoring.register_callback(
-            TOOL_ID, sys.monitoring.events.LINE, handle_line
-        )
-        sys.monitoring.set_events(TOOL_ID, sys.monitoring.events.LINE)
+            def handle_line(code: CodeType, line_number: int):
+                if not probe.matches(code.co_filename, line_number):
+                    return sys.monitoring.DISABLE
+                if ((cur_frame := inspect.currentframe()) is None
+                        or (frame := cur_frame.f_back) is None):
+                    # TODO: warn about not being able to collect data
+                    return
+                safe_eval(user_python_obj, frame, user_python_snippet)
+
+            sys.monitoring.use_tool_id(TOOL_ID, 'pymontrace')
+            sys.monitoring.register_callback(
+                TOOL_ID, sys.monitoring.events.LINE, handle_line
+            )
+            sys.monitoring.set_events(TOOL_ID, sys.monitoring.events.LINE)
+    except Exception as e:
+        try:
+            buf = io.StringIO()
+            print(f'{__name__}.settrace failed', file=buf)
+            traceback.print_exc(file=buf)
+            os.write(pmt.comm_fh.fileno(), buf.getvalue().encode())
+        except Exception:
+            print(f'{__name__}.settrace failed:', repr(e), file=sys.stderr)
+        try:
+            pmt.comm_fh.close()
+            pmt.comm_fh = None
+        except Exception:
+            pass
 
 
 def unsettrace():
@@ -137,6 +177,10 @@ def unsettrace():
                 TOOL_ID, sys.monitoring.events.NO_EVENTS
             )
             sys.monitoring.free_tool_id(TOOL_ID)
+
+        if pmt.comm_fh is not None:
+            pmt.comm_fh.close()
+            pmt.comm_fh = None
     except Exception:
         print(f'{__name__}.unsettrace failed', file=sys.stderr)
         traceback.print_exc(file=sys.stderr)

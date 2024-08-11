@@ -1,18 +1,5 @@
-"""
-Usage: pymontrace [options] -e pymontrace-expr
-       pymontrace [options] -s script
-
-Examples:
-
-    # This will change !
-    pymontrace line:examples/script_to_debug.py:13 'print("a", a, "b", b)' \\
-        -c examples/script_to_debug.py
-
-    python3 examples/script_to_debug.py
-    pymontrace line:examples/script_to_debug.py:13 'print("a", a, "b", b)' \\
-        -p $!
-
-"""
+import socket
+import os
 import argparse
 import signal
 import sys
@@ -40,7 +27,54 @@ parser.add_argument(
     help='Example: line:script.py:13')
 parser.add_argument(
     'action',
-    help='a python expression to each time the probe site is reached ')
+    help='a python expression to evaluate each time the probe site is reached')
+
+
+def tracepid(pid: int, probe, action: str):
+    # ... maybe use an ExitStack to refactor
+
+    # Maybe we'll replace this with a unix socket.
+    # Need to rethink directories when it comes to containers
+    comm_file = f'/tmp/pymontrace-{pid}'
+
+    # TODO: only do this if we're not the owner of the process.
+    # maybe it makes sense to set. (Linux: /proc/pid/loginuid, macos:
+    # sysctl with KERN_PROC, KERN_PROC_UID , ...
+    saved_umask = os.umask(0o000)
+    os.mkfifo(comm_file, mode=0o666)
+    os.umask(saved_umask)
+
+    comm_fh = None
+    try:
+        # requires sudo on mac
+        pymontrace.attacher.attach_and_exec(
+            pid,
+            format_bootstrap_snippet(probe, action, comm_file)
+        )
+
+        comm_fh = open(comm_file, 'r')
+        comm_fh.reconfigure(line_buffering=True)
+
+        print('Probes installed. Hit CTRL-C to end...')
+        try:
+            while (line := comm_fh.readline()) != '':
+                print(f'[{pid}]', line, end="")
+        except KeyboardInterrupt:
+            print('Removing probes...')
+            pymontrace.attacher.attach_and_exec(
+                pid,
+                format_untrace_snippet()
+            )
+    finally:
+        try:
+            if comm_fh:
+                comm_fh.close()
+        except Exception as e:
+            print(f'closing {comm_file} failed:', repr(e), file=sys.stderr)
+        try:
+            os.unlink(comm_file)
+        except Exception as e:
+            print(f'unlinking {comm_file} failed:', repr(e), file=sys.stderr)
 
 
 def cli_main():
@@ -57,21 +91,7 @@ def cli_main():
         prog_globals = {'__name__': '__main__'}
         exec(prog_code, prog_globals)
     elif args.pid:
-        # requires sudo on mac
-        pymontrace.attacher.attach_and_exec(
-            args.pid,
-            format_bootstrap_snippet(args.probe, args.action)
-        )
-
-        print('Probes installed. Hit CTRL-C to end...')
-        try:
-            signal.pause()
-        except KeyboardInterrupt:
-            print('Removing probes...')
-            pymontrace.attacher.attach_and_exec(
-                args.pid,
-                format_untrace_snippet()
-            )
+        tracepid(args.pid, args.probe, args.action)
     else:
         print('one or -p or -c required', file=sys.stderr)
         parser.print_usage(file=sys.stderr)

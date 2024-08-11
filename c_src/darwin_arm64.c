@@ -333,8 +333,12 @@ catch_mach_exception_raise_state_identity(
          * set up call
          */
 
-        vm_address_t fn_addr = find_pyfn(task, "PyRun_SimpleString");
+        vm_address_t fn_addr = find_pyfn(task, "Py_AddPendingCall");
         if (!fn_addr) {
+            fatal("find_pyfn(Py_AddPendingCall)");
+        }
+        vm_address_t cb_addr = find_pyfn(task, "PyRun_SimpleString");
+        if (!cb_addr) {
             fatal("find_pyfn(PyRun_SimpleString)");
         }
 
@@ -343,7 +347,8 @@ catch_mach_exception_raise_state_identity(
         arm_thread_state64_t* state = (arm_thread_state64_t*)new_state;
 
         // we're gonna die!
-        state->__x[0] = allocated + 16;
+        state->__x[0] = cb_addr;
+        state->__x[1] = allocated + 16;
         state->__x[16] = fn_addr;
         arm_thread_state64_set_pc_fptr(*state, allocated);
 
@@ -354,9 +359,12 @@ catch_mach_exception_raise_state_identity(
 
         *(arm_thread_state64_t*)new_state = g_orig_threadstate;
 
-        kr = vm_deallocate(task, g_allocated.addr, g_allocated.size);
-        if (kr != KERN_SUCCESS) {
-            log_mach("vm_deallocate", kr);
+        // we can't call this because it will be referenced in the callback
+        if (false) {
+            kr = vm_deallocate(task, g_allocated.addr, g_allocated.size);
+            if (kr != KERN_SUCCESS) {
+                log_mach("vm_deallocate", kr);
+            }
         }
 
         dispatch_semaphore_signal(sync_sema);
