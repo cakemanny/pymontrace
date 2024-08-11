@@ -1,6 +1,6 @@
 In priority order:
 
-- [ ] Add <3.12 support
+- [x] Add <3.12 support
 - [ ] Support targets in Linux containers
 - [ ] Tracer / tracee communication. i.e. the tool should be there primarily
       for observing behaviour. Want to see it in pymontrace stdout.
