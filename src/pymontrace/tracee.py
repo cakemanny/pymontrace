@@ -1,9 +1,10 @@
+import inspect
 import os
 import re
 import sys
 import textwrap
 import traceback
-
+from types import CodeType, FrameType
 
 TOOL_ID = sys.monitoring.DEBUGGER_ID if sys.version_info >= (3, 12) else 0
 
@@ -30,6 +31,9 @@ class LineProbe:
     def matches(self, co_filename: str, line_number: int):
         if line_number != self.lineno:
             return False
+        return self.matches_file(co_filename)
+
+    def matches_file(self, co_filename: str):
         if self.is_path_endswith:
             return co_filename.endswith(self.pathend)
         if self.abs:
@@ -41,26 +45,68 @@ class LineProbe:
         return to_match == self.path
 
 
-# TODO: move this to some 'hook' module?
-def settrace(user_break, user_python_snippet):
-    # This bit would ideally be injected somehow
-    if sys.version_info < (3, 12):
-        def handle_events(frame, event, arg):
-            print(frame, event, arg)
-        sys.settrace(handle_events)
+def safe_eval(action: CodeType, frame: FrameType, snippet: str):
+    try:
+        eval(action, {**frame.f_globals}, {**frame.f_locals})
+    except Exception:
+        print('Probe action failed', file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        print(textwrap.indent(snippet, 4 * ''), file=sys.stderr)
+
+
+# Handlers for 3.11 and earlier
+def create_event_handlers(probe: LineProbe, action: CodeType, snippet: str):
+
+    if sys.version_info < (3, 10):
+        # https://github.com/python/cpython/blob/3.12/Objects/lnotab_notes.txt
+        def num_lines(f_code: CodeType):
+            lineno = addr = 0
+            it = iter(f_code.co_lnotab)
+            for addr_incr in it:
+                line_incr = next(it)
+                addr += addr_incr
+                if line_incr >= 0x80:
+                    line_incr -= 0x100
+                lineno += line_incr
+            return lineno
     else:
-        import inspect
-        from types import CodeType
+        def num_lines(f_code: CodeType):
+            lineno = f_code.co_firstlineno
+            for (start, end, this_lineno) in f_code.co_lines():
+                if this_lineno is not None:
+                    lineno = max(lineno, this_lineno)
+            return lineno - f_code.co_firstlineno
 
-        # An improvement might be to only register function start events
-        # and then enable line events when we come across the right
-        # file/function and disable otherwise. But that can come later.
-        # maybe iterating over co_lines is more efficient than
-        #   registering for all LINE events
+    def handle_local(frame, event, arg):
+        if event != 'line' or probe.lineno != frame.f_lineno:
+            return handle_local
+        safe_eval(action, frame, snippet)
+        return handle_local
 
-        user_python_obj = compile(user_python_snippet, '<pymontrace expr>', 'exec')
+    def handle_call(frame: FrameType, event, arg):
+        if probe.lineno < frame.f_lineno:
+            return None
+        f_code = frame.f_code
+        if not probe.matches_file(f_code.co_filename):
+            return None
+        if probe.lineno > f_code.co_firstlineno + num_lines(f_code):
+            return None
+        return handle_local
 
-        probe = LineProbe(user_break[0], user_break[1])
+    return handle_call
+
+
+# The function called inside the target to start tracing
+def settrace(user_break, user_python_snippet):
+
+    user_python_obj = compile(user_python_snippet, '<pymontrace expr>', 'exec')
+    probe = LineProbe(user_break[0], user_break[1])
+
+    if sys.version_info < (3, 12):
+        sys.settrace(create_event_handlers(
+            probe, user_python_obj, user_python_snippet
+        ))
+    else:
 
         def handle_line(code: CodeType, line_number: int):
             if not probe.matches(code.co_filename, line_number):
@@ -69,13 +115,7 @@ def settrace(user_break, user_python_snippet):
                     or (frame := cur_frame.f_back) is None):
                 # TODO: warn about not being able to collect data
                 return
-            try:
-                eval(user_python_obj, {**frame.f_globals}, {**frame.f_locals})
-            except Exception:
-                print('Probe action failed', file=sys.stderr)
-                traceback.print_exc(file=sys.stderr)
-                print(textwrap.indent(user_python_snippet, 4 * ''),
-                      file=sys.stderr)
+            safe_eval(user_python_obj, frame, user_python_snippet)
 
         sys.monitoring.use_tool_id(TOOL_ID, 'pymontrace')
         sys.monitoring.register_callback(

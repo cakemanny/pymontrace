@@ -1,9 +1,16 @@
 
+
 .PHONY: dev-setup
 dev-setup:
 	test -n "$$VIRTUAL_ENV"
-	"$$VIRTUAL_ENV"/bin/pip install uv
-	"$$VIRTUAL_ENV"/bin/uv pip install -e '.[dev,test]'
+	type uv || "$$VIRTUAL_ENV"/bin/pip install uv
+	uv pip install -e '.[dev,test]'
+
+
+.PHONY: lint
+lint:
+	flake8 src
+
 
 # Pre-flight the linux code when working on mac
 .PHONY: check
