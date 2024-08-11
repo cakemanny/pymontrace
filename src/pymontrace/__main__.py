@@ -18,9 +18,11 @@ import signal
 import sys
 
 import pymontrace.attacher
-from pymontrace import (
-    settrace, parse_probe, format_bootstrap_snippet, format_untrace_snippet
+from pymontrace.tracer import (
+    parse_probe, format_bootstrap_snippet, format_untrace_snippet
 )
+# TODO
+from pymontrace.tracee import settrace
 
 
 parser = argparse.ArgumentParser(prog='pymontrace')
@@ -45,6 +47,8 @@ def cli_main():
     args = parser.parse_args()
 
     if args.pyprog:
+        # FIXME: use runpy or subprocess or os.spawn
+        #  (look at sys.executable maybe , maybe multiprocess.Process )
         with open(args.pyprog) as f:
             prog_code = compile(f.read(), args.pyprog, 'exec')
 

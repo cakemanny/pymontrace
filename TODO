@@ -1,0 +1,20 @@
+In priority order:
+
+- [ ] Add <3.12 support
+- [ ] Support targets in Linux containers
+- [ ] Tracer / tracee communication. i.e. the tool should be there primarily
+      for observing behaviour. Want to see it in pymontrace stdout.
+- [ ] Trace target which has not had pymontrace already pip installed.
+- [ ] Clean up C code (specific TODOs are within)
+- [ ] Use Py_AddPendingCall on Darwin too
+
+- [o] Factor code into tracer and tracee parts
+
+- [ ] Trace many targets at once. Main need: trace forking servers.
+
+- [ ] Firm up the language / interface.
+      - [ ] Create buffer spaces to support aggregations?
+- [ ] func probes (entry, exit, exception, yield, unwind, resume, ...)
+
+- [ ] Support FreeBSD + jails , Illumos + zones, ...
+- [ ] Rewrite the C code in Rust

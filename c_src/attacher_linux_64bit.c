@@ -50,7 +50,13 @@
 
 
 #define log_err(fmt, ...) fprintf(stderr, "[error]: " fmt "\n", ##__VA_ARGS__)
+
+// Always define debug to avoid warnings about use vs non-use.
+#ifdef NDEBUG
+const int debug = 0;
+#else
 const int debug = 1;
+#endif // NDEBUG
 #define log_dbg(fmt, ...) do { \
     if (debug) { fprintf(stderr, "[debug]: " fmt "\n", ##__VA_ARGS__); } \
 } while (0)
@@ -798,6 +804,9 @@ attach_and_execute(int pid, const char* python_code)
         fprintf(stderr, "WIFSTOPPED(status) = %d, WSTOPSIG(wstatus)= %d\n",
                 WIFSTOPPED(wstatus), WSTOPSIG(wstatus));
     }
+
+    // TODO: we should check the PC that it's at (or just after) the
+    // breakpoint.
 
     // Restore patched code
     if (-1 == ptrace(PTRACE_POKETEXT, tid, breakpoint_addr,
