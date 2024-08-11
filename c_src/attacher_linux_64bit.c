@@ -335,10 +335,32 @@ find_libc_start(pid_t pid)
 }
 
 
+static bool
+in_other_mount_ns(pid_t pid)
+{
+    struct stat self_root_stat = {};
+    if (stat("/proc/self/root/", &self_root_stat) == -1) {
+        perror("stat(/proc/self/root/)");
+        return false;
+    }
+
+    char rootpath[80];
+    snprintf(rootpath, sizeof rootpath, "/proc/%d/root/", pid);
+    struct stat pid_root_stat = {};
+    if (stat(rootpath, &pid_root_stat) == -1) {
+        perror("stat");
+        return false;
+    }
+
+    return (self_root_stat.st_ino != pid_root_stat.st_ino);
+}
+
+
 static uintptr_t
 find_symbol(pid_t pid, const char* symbol, const char* fnsrchstr)
 {
     uintptr_t symbol_addr = 0;
+    bool other_mount_ns = in_other_mount_ns(pid);
     char mapspath[PATH_MAX];
     snprintf(mapspath, PATH_MAX, "/proc/%d/maps", pid);
 
@@ -360,18 +382,29 @@ find_symbol(pid_t pid, const char* symbol, const char* fnsrchstr)
             continue;
         }
         // We only care about code
-        if (!perms_has_exec(map)) {
+        if (!perms_has_exec(map) || map.pathname == NULL) {
             continue;
         }
 
+        // The target may be in in another mount namespace, so we
+        // make sure to search in it's namespace for it's libs
+        char prefixed_path[PATH_MAX];
+        if (other_mount_ns && map.pathname[0] == '/') {
+            snprintf(prefixed_path, PATH_MAX, "/proc/%d/root%s", pid,
+                    map.pathname);
+        } else {
+            strncpy(prefixed_path, map.pathname, PATH_MAX-1);
+            prefixed_path[PATH_MAX-1] = '\0';
+        }
+
         elfsym_info_t es_info;
-        int err = elf_find_symbol(map.pathname, symbol, &es_info);
+        int err = elf_find_symbol(prefixed_path, symbol, &es_info);
         if (err == ESRCH) {
             continue;
         }
         if (err != 0) {
             fprintf(stderr, "attacher: error reading %s (%d)",
-                    map.pathname, err);
+                    prefixed_path, err);
             continue;
         }
 
@@ -785,7 +818,7 @@ attach_and_execute(int pid, const char* python_code)
         return ATT_FAIL;
     }
 
-
+    // TODO: we need to protect ourselves from signals here
     fprintf(stderr, "Waiting for process to reach safepoint...\n");
     if (ptrace(PTRACE_CONT, tid, 0, 0) == -1) {
         perror("ptrace(PTRACE_CONT, ...)");
@@ -796,6 +829,8 @@ attach_and_execute(int pid, const char* python_code)
     // This waits until the next signal, which will be the breakpoint
     // hopefully.
     if ((tid = waitpid(pid, &wstatus, 0)) == -1) {
+        // If this gets interrupted (EINTR), it means the user is impatient.
+        // We would be btter to remove the trap instruction before leaving.
         perror("waitpid");
         return ATT_UNKNOWN_STATE;
     }

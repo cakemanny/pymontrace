@@ -1,7 +1,9 @@
 In priority order:
 
 - [x] Add <3.12 support
-- [ ] Support targets in Linux containers
+- [o] Support targets in Linux containers
+      (We'll need to keep coming back to this as we progress through the
+       next two items)
 - [ ] Tracer / tracee communication. i.e. the tool should be there primarily
       for observing behaviour. Want to see it in pymontrace stdout.
 - [ ] Trace target which has not had pymontrace already pip installed.
