@@ -1,16 +1,14 @@
-import struct
-import socket
-import os
 import argparse
+import os
+import socket
+import struct
+import subprocess
 import sys
 
 import pymontrace.attacher
 from pymontrace.tracer import (
     parse_probe, format_bootstrap_snippet, format_untrace_snippet, CommsFile
 )
-# TODO
-from pymontrace.tracee import settrace
-
 
 parser = argparse.ArgumentParser(prog='pymontrace')
 parser.add_argument(
@@ -21,6 +19,9 @@ parser.add_argument(
     help='pid of a python process to attach to',
     type=int,
 )
+parser.add_argument(
+    '-X', dest='subproc',
+    help='used internal for handling -c')
 parser.add_argument(
     'probe',
     type=parse_probe,
@@ -90,19 +91,76 @@ def tracepid(pid: int, probe, action: str):
             print(f'unlinking {comms.localpath} failed:', repr(e), file=sys.stderr)
 
 
+def subprocess_entry(progpath, probe, action):
+    from pymontrace.tracee import settrace
+    import time
+    import runpy
+
+    comm_file = CommsFile(os.getpid()).remotepath
+    while not os.path.exists(comm_file):
+        time.sleep(1)
+    settrace(probe[1:], action, comm_file)
+
+    runpy.run_path(progpath, run_name='__main__')
+
+
+# TODO: factor this with tracepid
+def tracesubprocess(progpath: str, probe, action):
+
+    probestr = ':'.join(map(str, probe))
+    p = subprocess.Popen(
+        [sys.executable, '-m', 'pymontrace', '-X', progpath, probestr, action]
+    )
+
+    comms = CommsFile(p.pid)
+
+    ss = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    saved_umask = os.umask(0o000)
+    ss.bind(comms.localpath)
+    os.umask(saved_umask)
+    ss.listen(0)
+
+    try:
+        s, addr = ss.accept()
+        os.unlink(comms.localpath)
+
+        print('Probes installed. Hit CTRL-C to end...', file=sys.stderr)
+        try:
+            header_fmt = struct.Struct('HH')
+            while True:
+                header = s.recv(4)
+                if header == b'':
+                    break
+                (kind, size) = header_fmt.unpack(header)
+                line = s.recv(size)
+                out = (sys.stderr if kind == 2 else sys.stdout)
+                out.write(line.decode())
+            print('Target disconnected.')
+        except KeyboardInterrupt:
+            pass
+        print('Removing probes...', file=sys.stderr)
+        p.terminate()
+    finally:
+        try:
+            ss.close()
+        except Exception as e:
+            print(f'closing {comms.localpath} failed:', repr(e), file=sys.stderr)
+        try:
+            os.unlink(comms.localpath)
+        except FileNotFoundError:
+            # We unlink already after connecting, when things went well
+            pass
+        except Exception as e:
+            print(f'unlinking {comms.localpath} failed:', repr(e), file=sys.stderr)
+
+
 def cli_main():
     args = parser.parse_args()
 
     if args.pyprog:
-        # FIXME: use runpy or subprocess or os.spawn
-        #  (look at sys.executable maybe , maybe multiprocess.Process )
-        with open(args.pyprog) as f:
-            prog_code = compile(f.read(), args.pyprog, 'exec')
-
-        settrace(args.probe[1:], args.action)
-
-        prog_globals = {'__name__': '__main__'}
-        exec(prog_code, prog_globals)
+        tracesubprocess(args.pyprog, args.probe, args.action)
+    elif args.subproc:
+        subprocess_entry(args.subproc, args.probe, args.action)
     elif args.pid:
         tracepid(args.pid, args.probe, args.action)
     else:
