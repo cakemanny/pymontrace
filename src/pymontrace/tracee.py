@@ -2,6 +2,7 @@ import inspect
 import io
 import os
 import re
+import socket
 import sys
 import textwrap
 import traceback
@@ -51,22 +52,23 @@ class pmt:
 
     # TODO: we need to come up with a message type and encoding format
     # so that we can buffer and also send other kinds of data
-    comm_fh: Union[io.TextIOWrapper, None] = None
+    comm_fh: Union[socket.socket, None] = None
 
     print_buffer = []
 
     @staticmethod
     def print(*args):
         if pmt.comm_fh is not None:
-            to_write = ' '.join(map(str, args)) + '\n'
-            os.write(pmt.comm_fh.fileno(), to_write.encode())
+            to_write = (' '.join(map(str, args)) + '\n').encode()
+            to_write = bytes([len(to_write)]) + to_write  # This will break
+            pmt.comm_fh.sendall(to_write)
 
 
 def safe_eval(action: CodeType, frame: FrameType, snippet: str):
     try:
         eval(action, {**frame.f_globals}, {
             **frame.f_locals,
-            'print': pmt.print,
+            'pmt': pmt,
         })
     except Exception:
         print('Probe action failed', file=sys.stderr)
@@ -122,8 +124,8 @@ def settrace(user_break, user_python_snippet, comm_file):
     if pmt.comm_fh is not None:
         # Maybe a previous settrace failed half-way through
         pmt.comm_fh.close()
-    pmt.comm_fh = open(comm_file, 'w')
-    pmt.comm_fh.reconfigure(write_through=True)
+    pmt.comm_fh = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    pmt.comm_fh.connect(comm_file)
 
     try:
         user_python_obj = compile(user_python_snippet, '<pymontrace expr>', 'exec')

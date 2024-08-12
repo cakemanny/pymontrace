@@ -40,11 +40,13 @@ def tracepid(pid: int, probe, action: str):
     # TODO: only do this if we're not the owner of the process.
     # maybe it makes sense to set. (Linux: /proc/pid/loginuid, macos:
     # sysctl with KERN_PROC, KERN_PROC_UID , ...
-    saved_umask = os.umask(0o000)
-    os.mkfifo(comm_file, mode=0o666)
-    os.umask(saved_umask)
 
-    comm_fh = None
+    ss = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    saved_umask = os.umask(0o000)
+    ss.bind(comm_file)
+    os.umask(saved_umask)
+    ss.listen(0)
+
     try:
         # requires sudo on mac
         pymontrace.attacher.attach_and_exec(
@@ -52,27 +54,35 @@ def tracepid(pid: int, probe, action: str):
             format_bootstrap_snippet(probe, action, comm_file)
         )
 
-        comm_fh = open(comm_file, 'r')
-        comm_fh.reconfigure(line_buffering=True)
+        s, addr = ss.accept()
+        os.unlink(comm_file)
 
         print('Probes installed. Hit CTRL-C to end...')
         try:
-            while (line := comm_fh.readline()) != '':
-                print(f'[{pid}]', line, end="")
+            while True:
+                size = s.recv(1)
+                if size == b'':
+                    break
+                line = s.recv(size[0])
+                print(f'[{pid}]', line.decode(), end="")
+            print('Target disconnected.')
         except KeyboardInterrupt:
-            print('Removing probes...')
-            pymontrace.attacher.attach_and_exec(
-                pid,
-                format_untrace_snippet()
-            )
+            pass
+        print('Removing probes...')
+        pymontrace.attacher.attach_and_exec(
+            pid,
+            format_untrace_snippet()
+        )
     finally:
         try:
-            if comm_fh:
-                comm_fh.close()
+            ss.close()
         except Exception as e:
             print(f'closing {comm_file} failed:', repr(e), file=sys.stderr)
         try:
             os.unlink(comm_file)
+        except FileNotFoundError:
+            # We unlink already after connecting, when things went well
+            pass
         except Exception as e:
             print(f'unlinking {comm_file} failed:', repr(e), file=sys.stderr)
 
