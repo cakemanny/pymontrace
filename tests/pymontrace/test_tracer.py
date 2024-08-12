@@ -16,5 +16,5 @@ def test_format_bootstrap_snippet():
         "line",
         "path/to/filename.py",
         56,
-    ), 'print("a", a, "b", b)') == \
-        "import pymontrace.tracee; pymontrace.tracee.settrace(('path/to/filename.py', 56), 'print(\"a\", a, \"b\", b)')"
+    ), 'print("a", a, "b", b)', '/tmp/pymontrace-654') == \
+        "import pymontrace.tracee; pymontrace.tracee.settrace(('path/to/filename.py', 56), 'print(\"a\", a, \"b\", b)', '/tmp/pymontrace-654')"

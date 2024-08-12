@@ -4,11 +4,11 @@ In priority order:
 - [o] Support targets in Linux containers
       (We'll need to keep coming back to this as we progress through the
        next two items)
-- [ ] Tracer / tracee communication. i.e. the tool should be there primarily
+- [o] Tracer / tracee communication. i.e. the tool should be there primarily
       for observing behaviour. Want to see it in pymontrace stdout.
 - [ ] Trace target which has not had pymontrace already pip installed.
 - [ ] Clean up C code (specific TODOs are within)
-- [ ] Use Py_AddPendingCall on Darwin too
+- [x] Use Py_AddPendingCall on Darwin too
 
 - [o] Factor code into tracer and tracee parts
 
@@ -18,6 +18,8 @@ In priority order:
       - [ ] Create buffer spaces to support aggregations?
 - [ ] func probes (entry, exit, exception, yield, unwind, resume, ...)
 
+- [ ] our own signal handlers, to be able to sneak out maps as the program
+      is about to end...
 - [ ] Support FreeBSD + jails , Illumos + zones, ...
 - [ ] musl support on Linux ...
 - [ ] Rewrite the C code in Rust

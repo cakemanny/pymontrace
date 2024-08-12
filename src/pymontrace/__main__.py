@@ -1,3 +1,4 @@
+import struct
 import socket
 import os
 import argparse
@@ -33,7 +34,6 @@ parser.add_argument(
 def tracepid(pid: int, probe, action: str):
     # ... maybe use an ExitStack to refactor
 
-    # Maybe we'll replace this with a unix socket.
     # Need to rethink directories when it comes to containers
     comm_file = f'/tmp/pymontrace-{pid}'
 
@@ -57,18 +57,21 @@ def tracepid(pid: int, probe, action: str):
         s, addr = ss.accept()
         os.unlink(comm_file)
 
-        print('Probes installed. Hit CTRL-C to end...')
+        print('Probes installed. Hit CTRL-C to end...', file=sys.stderr)
         try:
+            header_fmt = struct.Struct('HH')
             while True:
-                size = s.recv(1)
-                if size == b'':
+                header = s.recv(4)
+                if header == b'':
                     break
-                line = s.recv(size[0])
-                print(f'[{pid}]', line.decode(), end="")
+                (kind, size) = header_fmt.unpack(header)
+                line = s.recv(size)
+                out = sys.stderr if kind == 2 else sys.stdout
+                print(f'[{pid}]', line.decode(), end="", file=out)
             print('Target disconnected.')
         except KeyboardInterrupt:
             pass
-        print('Removing probes...')
+        print('Removing probes...', file=sys.stderr)
         pymontrace.attacher.attach_and_exec(
             pid,
             format_untrace_snippet()

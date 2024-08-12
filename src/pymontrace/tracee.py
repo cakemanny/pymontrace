@@ -3,6 +3,7 @@ import io
 import os
 import re
 import socket
+import struct
 import sys
 import textwrap
 import traceback
@@ -48,19 +49,38 @@ class LineProbe:
         return to_match == self.path
 
 
+class Message:
+    PRINT = 1
+    ERROR = 2
+
+
 class pmt:
+    """
+    pmt is a utility namespace of functions that may be useful for examining
+    the system and returning data to the tracer.
+    """
 
     # TODO: we need to come up with a message type and encoding format
     # so that we can buffer and also send other kinds of data
     comm_fh: Union[socket.socket, None] = None
 
-    print_buffer = []
+    @staticmethod
+    def _encode_print(*args, **kwargs):
+        message_type = Message.PRINT
+        if kwargs.get('file') == sys.stderr:
+            message_type = Message.ERROR
+
+        buf = io.StringIO()
+        kwargs['file'] = buf
+        print(*args, **kwargs)
+
+        to_write = buf.getvalue().encode()
+        return struct.pack('BH', message_type, len(to_write)) + to_write
 
     @staticmethod
-    def print(*args):
+    def print(*args, **kwargs):
         if pmt.comm_fh is not None:
-            to_write = (' '.join(map(str, args)) + '\n').encode()
-            to_write = bytes([len(to_write)]) + to_write  # This will break
+            to_write = pmt._encode_print(*args, **kwargs)
             pmt.comm_fh.sendall(to_write)
 
 
@@ -156,7 +176,7 @@ def settrace(user_break, user_python_snippet, comm_file):
             buf = io.StringIO()
             print(f'{__name__}.settrace failed', file=buf)
             traceback.print_exc(file=buf)
-            os.write(pmt.comm_fh.fileno(), buf.getvalue().encode())
+            pmt.print(buf.getvalue(), end='', file=sys.stderr)
         except Exception:
             print(f'{__name__}.settrace failed:', repr(e), file=sys.stderr)
         try:

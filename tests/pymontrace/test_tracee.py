@@ -1,6 +1,8 @@
+import sys
+import struct
 import inspect
 
-from pymontrace.tracee import LineProbe
+from pymontrace.tracee import LineProbe, pmt, Message
 
 
 def empty_user_action():
@@ -58,3 +60,24 @@ def test_handle_events__wrong_function():
 
         local_handler = handler(test_frame, 'call', None)
         assert local_handler is None
+
+
+def test_pmt_print():
+
+    encoded = pmt._encode_print('a', 1, 'b', 2)
+
+    assert encoded == b'\x01\x00\x08\x00a 1 b 2\n'
+
+    assert struct.unpack('HH', encoded[:4]) == (Message.PRINT, 8,)
+    assert len(encoded[4:]) == 8
+
+    assert pmt._encode_print('a', 1, 'b', 2, sep='-', end='') \
+        == b'\x01\x00\x07\x00a-1-b-2'
+
+
+def test_pmt_print_error():
+
+    encoded = pmt._encode_print('xxx', file=sys.stderr)
+
+    assert encoded == b'\x02\x00\x04\x00xxx\n'
+    assert encoded[0] == Message.ERROR
