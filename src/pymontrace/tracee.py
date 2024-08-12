@@ -141,11 +141,18 @@ def create_event_handlers(probe: LineProbe, action: CodeType, snippet: str):
 # The function called inside the target to start tracing
 def settrace(user_break, user_python_snippet, comm_file):
 
-    if pmt.comm_fh is not None:
-        # Maybe a previous settrace failed half-way through
-        pmt.comm_fh.close()
-    pmt.comm_fh = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    pmt.comm_fh.connect(comm_file)
+    try:
+        if pmt.comm_fh is not None:
+            # Maybe a previous settrace failed half-way through
+            pmt.comm_fh.close()
+        pmt.comm_fh = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        pmt.comm_fh.connect(comm_file)
+    except Exception:
+        # Once we are more stable, we should avoid this printing inside the
+        # tracee.
+        print(f'{__name__}.settrace failed', file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return
 
     try:
         user_python_obj = compile(user_python_snippet, '<pymontrace expr>', 'exec')

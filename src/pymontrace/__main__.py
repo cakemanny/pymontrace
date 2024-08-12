@@ -2,12 +2,11 @@ import struct
 import socket
 import os
 import argparse
-import signal
 import sys
 
 import pymontrace.attacher
 from pymontrace.tracer import (
-    parse_probe, format_bootstrap_snippet, format_untrace_snippet
+    parse_probe, format_bootstrap_snippet, format_untrace_snippet, CommsFile
 )
 # TODO
 from pymontrace.tracee import settrace
@@ -35,7 +34,7 @@ def tracepid(pid: int, probe, action: str):
     # ... maybe use an ExitStack to refactor
 
     # Need to rethink directories when it comes to containers
-    comm_file = f'/tmp/pymontrace-{pid}'
+    comms = CommsFile(pid)
 
     # TODO: only do this if we're not the owner of the process.
     # maybe it makes sense to set. (Linux: /proc/pid/loginuid, macos:
@@ -43,7 +42,7 @@ def tracepid(pid: int, probe, action: str):
 
     ss = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     saved_umask = os.umask(0o000)
-    ss.bind(comm_file)
+    ss.bind(comms.localpath)
     os.umask(saved_umask)
     ss.listen(0)
 
@@ -51,11 +50,12 @@ def tracepid(pid: int, probe, action: str):
         # requires sudo on mac
         pymontrace.attacher.attach_and_exec(
             pid,
-            format_bootstrap_snippet(probe, action, comm_file)
+            format_bootstrap_snippet(probe, action, comms.remotepath)
         )
 
+        # TODO: this needs a timeout
         s, addr = ss.accept()
-        os.unlink(comm_file)
+        os.unlink(comms.localpath)
 
         print('Probes installed. Hit CTRL-C to end...', file=sys.stderr)
         try:
@@ -66,8 +66,8 @@ def tracepid(pid: int, probe, action: str):
                     break
                 (kind, size) = header_fmt.unpack(header)
                 line = s.recv(size)
-                out = sys.stderr if kind == 2 else sys.stdout
-                print(f'[{pid}]', line.decode(), end="", file=out)
+                out = (sys.stderr if kind == 2 else sys.stdout)
+                out.write(line.decode())
             print('Target disconnected.')
         except KeyboardInterrupt:
             pass
@@ -80,14 +80,14 @@ def tracepid(pid: int, probe, action: str):
         try:
             ss.close()
         except Exception as e:
-            print(f'closing {comm_file} failed:', repr(e), file=sys.stderr)
+            print(f'closing {comms.localpath} failed:', repr(e), file=sys.stderr)
         try:
-            os.unlink(comm_file)
+            os.unlink(comms.localpath)
         except FileNotFoundError:
             # We unlink already after connecting, when things went well
             pass
         except Exception as e:
-            print(f'unlinking {comm_file} failed:', repr(e), file=sys.stderr)
+            print(f'unlinking {comms.localpath} failed:', repr(e), file=sys.stderr)
 
 
 def cli_main():
