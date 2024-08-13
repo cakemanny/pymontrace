@@ -16,6 +16,9 @@ dev = [
 #  "maturin",
 ]
 
+[project.scripts]
+pymontrace = "pymontrace.__main__:cli_main"
+
 [tool.pytest.ini_options]
 minversion = "6.0"
 testpaths = [

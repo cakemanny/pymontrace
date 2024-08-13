@@ -6,8 +6,10 @@ import subprocess
 import sys
 
 import pymontrace.attacher
+from pymontrace import tracer
 from pymontrace.tracer import (
-    parse_probe, format_bootstrap_snippet, format_untrace_snippet, CommsFile
+    CommsFile, format_bootstrap_snippet, format_untrace_snippet, parse_probe,
+    to_remote_path
 )
 
 parser = argparse.ArgumentParser(prog='pymontrace')
@@ -34,7 +36,8 @@ parser.add_argument(
 def tracepid(pid: int, probe, action: str):
     # ... maybe use an ExitStack to refactor
 
-    # Need to rethink directories when it comes to containers
+    site_extension = tracer.install_pymontrace(pid)
+
     comms = CommsFile(pid)
 
     # TODO: only do this if we're not the owner of the process.
@@ -51,7 +54,10 @@ def tracepid(pid: int, probe, action: str):
         # requires sudo on mac
         pymontrace.attacher.attach_and_exec(
             pid,
-            format_bootstrap_snippet(probe, action, comms.remotepath)
+            format_bootstrap_snippet(
+                probe, action, comms.remotepath,
+                to_remote_path(pid, site_extension.name),
+            )
         )
 
         # TODO: this needs a timeout
@@ -92,9 +98,10 @@ def tracepid(pid: int, probe, action: str):
 
 
 def subprocess_entry(progpath, probe, action):
-    from pymontrace.tracee import settrace
-    import time
     import runpy
+    import time
+
+    from pymontrace.tracee import settrace
 
     comm_file = CommsFile(os.getpid()).remotepath
     while not os.path.exists(comm_file):

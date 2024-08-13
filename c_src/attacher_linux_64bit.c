@@ -311,6 +311,7 @@ find_libc_start(pid_t pid)
     size_t len = 0;
     char* line = NULL;
     while (getline(&line, &len, f) != -1) {
+        // FIXME: have seen libc-2.x.x.so in the wild
         if (!strstr(line, "/libc.so")) {
             continue;
         }
