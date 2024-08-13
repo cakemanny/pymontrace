@@ -23,7 +23,7 @@ parser.add_argument(
 )
 parser.add_argument(
     '-X', dest='subproc',
-    help='used internal for handling -c')
+    help='used internally for handling -c')
 parser.add_argument(
     'probe',
     type=parse_probe,

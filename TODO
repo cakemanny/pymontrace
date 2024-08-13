@@ -1,13 +1,14 @@
 In priority order:
 
 - [x] Add <3.12 support
-- [o] Support targets in Linux containers
+- [x] Support targets in Linux containers
       (We'll need to keep coming back to this as we progress through the
        next two items)
-- [o] Tracer / tracee communication. i.e. the tool should be there primarily
+- [x] Tracer / tracee communication. i.e. the tool should be there primarily
       for observing behaviour. Want to see it in pymontrace stdout.
-- [ ] Trace target which has not had pymontrace already pip installed.
+- [x] Trace target which has not had pymontrace already pip installed.
 - [ ] Clean up C code (specific TODOs are within)
+- [ ] Add command to list probes (maybe `sys.modules` can help)
 - [x] Use Py_AddPendingCall on Darwin too
 
 - [o] Factor code into tracer and tracee parts
@@ -22,4 +23,4 @@ In priority order:
       is about to end...
 - [ ] Support FreeBSD + jails , Illumos + zones, ...
 - [ ] musl support on Linux ...
-- [ ] Rewrite the C code in Rust
+- [ ] Rewrite the C code in Rust?

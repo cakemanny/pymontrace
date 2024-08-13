@@ -1,7 +1,7 @@
 #!/bin/sh
 
 if [ "$(uname)" = "Linux" ]; then
-         python3 -m pymontrace -p "$(pgrep '[Pp]ython')" line:examples/script_to_debug.py:13 'pmt.print("a", a, "b", b)'
+         pymontrace -p "$(pgrep '[Pp]ython')" line:examples/script_to_debug.py:13 'pmt.print("a", a, "b", b)'
 else
-    sudo python3 -m pymontrace -p "$(pgrep '[Pp]ython')" line:examples/script_to_debug.py:13 'pmt.print("a", a, "b", b)'
+    sudo pymontrace -p "$(pgrep '[Pp]ython')" line:examples/script_to_debug.py:13 'pmt.print("a", a, "b", b)'
 fi
