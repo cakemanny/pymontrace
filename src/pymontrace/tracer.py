@@ -2,6 +2,8 @@ import inspect
 import os
 import pathlib
 import shutil
+import socket
+import struct
 import sys
 import textwrap
 from tempfile import TemporaryDirectory
@@ -100,3 +102,27 @@ class CommsFile:
             self.localpath = f'{pidroot}{self.remotepath[1:]}'
         else:
             self.localpath = self.remotepath
+
+
+def create_and_bind_socket(comms: CommsFile) -> socket.socket:
+    ss = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    # TODO: only do this if we're not the owner of the process.
+    # maybe it makes sense to set. (Linux: /proc/pid/loginuid, macos:
+    # sysctl with KERN_PROC, KERN_PROC_UID , ...
+    saved_umask = os.umask(0o000)
+    ss.bind(comms.localpath)
+    os.umask(saved_umask)
+    ss.listen(0)
+    return ss
+
+
+def decode_and_print_forever(s: socket.socket):
+    header_fmt = struct.Struct('HH')
+    while True:
+        header = s.recv(4)
+        if header == b'':
+            break
+        (kind, size) = header_fmt.unpack(header)
+        line = s.recv(size)
+        out = (sys.stderr if kind == 2 else sys.stdout)
+        out.write(line.decode())

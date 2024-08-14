@@ -2,14 +2,14 @@ import argparse
 import atexit
 import os
 import socket
-import struct
 import subprocess
 import sys
 
 import pymontrace.attacher
 from pymontrace import tracer
 from pymontrace.tracer import (
-    CommsFile, format_bootstrap_snippet, format_untrace_snippet, parse_probe,
+    CommsFile, create_and_bind_socket, decode_and_print_forever,
+    format_bootstrap_snippet, format_untrace_snippet, parse_probe,
     to_remote_path
 )
 
@@ -41,25 +41,24 @@ def force_unlink(path):
         pass
 
 
+def receive_and_print_until_interrupted(s: socket.socket):
+    print('Probes installed. Hit CTRL-C to end...', file=sys.stderr)
+    try:
+        decode_and_print_forever(s)
+        print('Target disconnected.')
+    except KeyboardInterrupt:
+        pass
+    print('Removing probes...', file=sys.stderr)
+
+
 def tracepid(pid: int, probe, action: str):
-    # ... maybe use an ExitStack to refactor
 
     site_extension = tracer.install_pymontrace(pid)
 
     comms = CommsFile(pid)
     atexit.register(force_unlink, comms.localpath)
 
-    # TODO: only do this if we're not the owner of the process.
-    # maybe it makes sense to set. (Linux: /proc/pid/loginuid, macos:
-    # sysctl with KERN_PROC, KERN_PROC_UID , ...
-
-    ss = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    saved_umask = os.umask(0o000)
-    ss.bind(comms.localpath)
-    os.umask(saved_umask)
-    ss.listen(0)
-
-    try:
+    with create_and_bind_socket(comms) as ss:
         # requires sudo on mac
         pymontrace.attacher.attach_and_exec(
             pid,
@@ -70,33 +69,14 @@ def tracepid(pid: int, probe, action: str):
         )
 
         # TODO: this needs a timeout
-        s, addr = ss.accept()
+        s, _ = ss.accept()
         os.unlink(comms.localpath)
 
-        print('Probes installed. Hit CTRL-C to end...', file=sys.stderr)
-        try:
-            header_fmt = struct.Struct('HH')
-            while True:
-                header = s.recv(4)
-                if header == b'':
-                    break
-                (kind, size) = header_fmt.unpack(header)
-                line = s.recv(size)
-                out = (sys.stderr if kind == 2 else sys.stdout)
-                out.write(line.decode())
-            print('Target disconnected.')
-        except KeyboardInterrupt:
-            pass
-        print('Removing probes...', file=sys.stderr)
+        receive_and_print_until_interrupted(s)
         pymontrace.attacher.attach_and_exec(
             pid,
             format_untrace_snippet()
         )
-    finally:
-        try:
-            ss.close()
-        except Exception as e:
-            print(f'closing {comms.localpath} failed:', repr(e), file=sys.stderr)
 
 
 def subprocess_entry(progpath, probe, action):
@@ -113,7 +93,6 @@ def subprocess_entry(progpath, probe, action):
     runpy.run_path(progpath, run_name='__main__')
 
 
-# TODO: factor this with tracepid
 def tracesubprocess(progpath: str, probe, action):
 
     probestr = ':'.join(map(str, probe))
@@ -124,37 +103,12 @@ def tracesubprocess(progpath: str, probe, action):
     comms = CommsFile(p.pid)
     atexit.register(force_unlink, comms.localpath)
 
-    ss = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    saved_umask = os.umask(0o000)
-    ss.bind(comms.localpath)
-    os.umask(saved_umask)
-    ss.listen(0)
-
-    try:
-        s, addr = ss.accept()
+    with create_and_bind_socket(comms) as ss:
+        s, _ = ss.accept()
         os.unlink(comms.localpath)
 
-        print('Probes installed. Hit CTRL-C to end...', file=sys.stderr)
-        try:
-            header_fmt = struct.Struct('HH')
-            while True:
-                header = s.recv(4)
-                if header == b'':
-                    break
-                (kind, size) = header_fmt.unpack(header)
-                line = s.recv(size)
-                out = (sys.stderr if kind == 2 else sys.stdout)
-                out.write(line.decode())
-            print('Target disconnected.')
-        except KeyboardInterrupt:
-            pass
-        print('Removing probes...', file=sys.stderr)
+        receive_and_print_until_interrupted(s)
         p.terminate()
-    finally:
-        try:
-            ss.close()
-        except Exception as e:
-            print(f'closing {comms.localpath} failed:', repr(e), file=sys.stderr)
 
 
 def cli_main():

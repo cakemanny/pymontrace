@@ -10,6 +10,9 @@ In priority order:
 - [ ] Clean up C code (specific TODOs are within)
 - [ ] Add command to list probes (maybe `sys.modules` can help)
 - [x] Use Py_AddPendingCall on Darwin too
+- [ ] Add veneer around PyRun_SimpleString so that we
+      1. don't crash the interpreter on error
+      2. know whether there was an error (trap after call)
 
 - [o] Factor code into tracer and tracee parts
 
