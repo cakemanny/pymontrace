@@ -15,9 +15,11 @@ attacher_attach_and_exec(PyObject *self, PyObject *args)
     }
     err = attach_and_execute(pid, command);
     if (err != 0) {
-        PyErr_SetString(PyExc_RuntimeError,
-                "Error occurred installing/uninstalling probes. "
-                "Target process may be in an unknown state");
+        char* msg = (err == ATT_UNKNOWN_STATE)
+            ? "Error occurred installing/uninstalling probes. "
+                "Target process may be in an unknown state."
+            : "Error occurred installing/uninstalling probes.";
+        PyErr_SetString(PyExc_RuntimeError, msg);
         return NULL;
     }
 

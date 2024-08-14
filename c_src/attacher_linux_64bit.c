@@ -411,7 +411,7 @@ find_symbol(pid_t pid, const char* symbol, const char* fnsrchstr)
             continue;
         }
         if (err != 0) {
-            fprintf(stderr, "attacher: error reading %s (%d)",
+            fprintf(stderr, "attacher: error reading %s (%d)\n",
                     prefixed_path, err);
             continue;
         }
@@ -767,7 +767,7 @@ restore_instuctions:
 
 
 int
-attach_and_execute(int pid, const char* python_code)
+attach_and_execute(const int pid, const char* python_code)
 {
     int err = 0;
 
@@ -838,9 +838,33 @@ attach_and_execute(int pid, const char* python_code)
     // hopefully.
     if ((tid = waitpid(pid, &wstatus, 0)) == -1) {
         // If this gets interrupted (EINTR), it means the user is impatient.
-        // We would be btter to remove the trap instruction before leaving.
+        // We would be better to remove the trap instruction before leaving.
         perror("waitpid");
-        return ATT_UNKNOWN_STATE;
+        fprintf(stderr, "Cancelling...\n");
+        if (kill(pid, SIGSTOP) == -1) {
+            perror("kill");
+            err = ATT_UNKNOWN_STATE;
+            goto detach;
+        }
+        if ((tid = waitpid(pid, &wstatus, 0)) == -1) {
+            perror("waitpid");
+            err = ATT_UNKNOWN_STATE;
+            goto detach;
+        }
+        if (!WIFSTOPPED(wstatus) || WSTOPSIG(wstatus) != SIGSTOP) {
+            log_err("not stopped with SIGSTOP");
+            err = ATT_UNKNOWN_STATE;
+            goto detach;
+        }
+        if (-1 == ptrace(PTRACE_POKETEXT, tid, breakpoint_addr,
+                    saved_instrs.u64)) {
+            perror("ptrace (restoring instructions at breakpoint)");
+            err = ATT_UNKNOWN_STATE;
+            goto detach;
+        }
+        fprintf(stderr, "attacher: cancelled.\n");
+        err = ATT_FAIL;
+        goto detach;
     }
     if (!WIFSTOPPED(wstatus) || WSTOPSIG(wstatus) != SIGTRAP) {
         // TODO, loop until correct signal, or use the newer apis
@@ -886,7 +910,7 @@ attach_and_execute(int pid, const char* python_code)
     }
 #endif // defined(__x86_64__)
 
-    // TODO: extract from here to detch into a function
+    // TODO: extract from here to detach into a function
 
     // There is a build-id at the start of glibc that we can overwrite
     // temporarily (idea from the readme of kubo/injector)

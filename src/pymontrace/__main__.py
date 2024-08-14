@@ -1,4 +1,5 @@
 import argparse
+import atexit
 import os
 import socket
 import struct
@@ -33,12 +34,20 @@ parser.add_argument(
     help='a python expression to evaluate each time the probe site is reached')
 
 
+def force_unlink(path):
+    try:
+        os.unlink(path)
+    except Exception:
+        pass
+
+
 def tracepid(pid: int, probe, action: str):
     # ... maybe use an ExitStack to refactor
 
     site_extension = tracer.install_pymontrace(pid)
 
     comms = CommsFile(pid)
+    atexit.register(force_unlink, comms.localpath)
 
     # TODO: only do this if we're not the owner of the process.
     # maybe it makes sense to set. (Linux: /proc/pid/loginuid, macos:
@@ -88,13 +97,6 @@ def tracepid(pid: int, probe, action: str):
             ss.close()
         except Exception as e:
             print(f'closing {comms.localpath} failed:', repr(e), file=sys.stderr)
-        try:
-            os.unlink(comms.localpath)
-        except FileNotFoundError:
-            # We unlink already after connecting, when things went well
-            pass
-        except Exception as e:
-            print(f'unlinking {comms.localpath} failed:', repr(e), file=sys.stderr)
 
 
 def subprocess_entry(progpath, probe, action):
@@ -120,6 +122,7 @@ def tracesubprocess(progpath: str, probe, action):
     )
 
     comms = CommsFile(p.pid)
+    atexit.register(force_unlink, comms.localpath)
 
     ss = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     saved_umask = os.umask(0o000)
@@ -152,13 +155,6 @@ def tracesubprocess(progpath: str, probe, action):
             ss.close()
         except Exception as e:
             print(f'closing {comms.localpath} failed:', repr(e), file=sys.stderr)
-        try:
-            os.unlink(comms.localpath)
-        except FileNotFoundError:
-            # We unlink already after connecting, when things went well
-            pass
-        except Exception as e:
-            print(f'unlinking {comms.localpath} failed:', repr(e), file=sys.stderr)
 
 
 def cli_main():
