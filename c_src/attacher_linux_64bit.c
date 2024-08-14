@@ -311,19 +311,26 @@ find_libc_start(pid_t pid)
     size_t len = 0;
     char* line = NULL;
     while (getline(&line, &len, f) != -1) {
-        // FIXME: have seen libc-2.x.x.so in the wild
-        if (!strstr(line, "/libc.so")) {
-            continue;
-        }
         proc_map_t map;
         if (parse_proc_map(line, &map) != 0) {
             log_err("failed parsing a procmap line");
             continue;
         }
         // We only care about code
-        if (!perms_has_exec(map)) {
+        if (!perms_has_exec(map) || map.pathname == NULL) {
             continue;
         }
+
+        char* bname = basename(map.pathname);
+
+        // consider libc.so.6 and also libc-2.31.so
+        if (!(strstr(bname, "libc.so")
+                    || (strcmp(bname, "libc-0") > 0
+                        // ':' is the ascii character after '9'
+                        && strcmp(bname, "libc-:") < 0))) {
+            continue;
+        }
+
         assert(map.offset == 0);
         // todo: check basename?
         // check for dups?
