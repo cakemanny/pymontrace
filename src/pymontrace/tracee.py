@@ -80,8 +80,21 @@ class pmt:
     @staticmethod
     def print(*args, **kwargs):
         if pmt.comm_fh is not None:
-            to_write = pmt._encode_print(*args, **kwargs)
-            pmt.comm_fh.sendall(to_write)
+            try:
+                to_write = pmt._encode_print(*args, **kwargs)
+                pmt.comm_fh.sendall(to_write)
+            except BrokenPipeError:
+                pmt._force_close()
+
+    @staticmethod
+    def _force_close():
+        unsettrace()
+        if pmt.comm_fh is not None:
+            try:
+                pmt.comm_fh.close()
+            except Exception:
+                pass
+            pmt.comm_fh = None
 
 
 def safe_eval(action: CodeType, frame: FrameType, snippet: str):
