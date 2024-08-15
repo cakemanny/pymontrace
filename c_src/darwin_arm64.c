@@ -6,6 +6,7 @@
 
 #include <dlfcn.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sys/errno.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -16,6 +17,8 @@
 #include <mach/mach_param.h>
 
 #include <assert.h>
+
+#include "attacher.h"
 
 #if !defined(__arm64__)
 #error "Platform not yet supported"
@@ -32,9 +35,11 @@ const bool debug = false;
 
 // this is what clang gives for __builtin_debugtrap()
 //	brk	#0xf000
-#define DEBUG_TRAP_INSTR    0xd43e0000
+#define DEBUG_TRAP_INSTR    ((uint32_t)0xd43e0000)
 
 static dispatch_semaphore_t sync_sema;
+
+static int g_err; /* failure state from exc handler */
 
 typedef struct {
     vm_address_t    page_addr;
@@ -50,6 +55,12 @@ static struct {
     vm_address_t addr;
     vm_size_t size;
 } g_allocated;  /* page allocated to inject code into */
+
+
+static struct {
+    vm_address_t Py_AddPendingCall;
+    vm_address_t PyRun_SimpleString;
+} g_pyfn_addrs;
 
 static const char* g_python_code;
 #define PYTHON_CODE_OFFSET  16
@@ -74,25 +85,48 @@ _end_of_injection:\n\
 	b	_injection\n\
 ");
 
-
+__attribute__((format(printf, 1, 2)))
 static void
-fatal(const char* msg)
+log_dbg(const char* fmt, ...)
 {
-    if (errno != 0) {
-        int esaved = errno;
-        fputs("attacher: ", stderr);
-        errno = esaved;
-        perror(msg);
-    } else {
-        fprintf(stderr, "attacher: %s\n", msg);
+    va_list valist;
+    va_start(valist, fmt);
+
+    if (debug) {
+        fputs("[debug]: ", stderr);
+        vfprintf(stderr, fmt, valist);
+        if (fmt[strlen(fmt) - 1] != '\n') {
+            fputs("\n", stderr);
+        }
     }
-    exit(1);
+
+    va_end(valist);
 }
+
+__attribute__((format(printf, 1, 2)))
+static void
+log_err(const char* fmt, ...)
+{
+    va_list valist;
+    va_start(valist, fmt);
+    int esaved = errno;
+
+    fputs("attacher: ", stderr);
+    vfprintf(stderr, fmt, valist);
+
+    if (fmt[strlen(fmt) - 1] != '\n') {
+        fprintf(stderr, ": %s\n", strerror(esaved));
+    }
+
+    va_end(valist);
+}
+
 static void
 log_mach(const char* msg, kern_return_t kr)
 {
     fprintf(stderr, "attacher: %s: %s (%d)\n", msg, mach_error_string(kr), kr);
 }
+// TODO: not use this
 static void
 fatal_mach(const char* msg, kern_return_t kr)
 {
@@ -105,7 +139,7 @@ load_and_find_safepoint(const char* sopath, const char* symbol, Dl_info* info)
 {
     void* handle = dlopen(sopath, RTLD_LAZY | RTLD_LOCAL);
     if (handle == NULL) {
-        fprintf(stderr, "attacher: %s\n", dlerror());
+        log_err("dlopen: %s\n", dlerror());
         return 1;
     }
 
@@ -115,14 +149,14 @@ load_and_find_safepoint(const char* sopath, const char* symbol, Dl_info* info)
     }
 
     if (dladdr(faddr, info) == 0) { // yes, 0 means failure for dladdr
-        fprintf(stderr, "attacher: %s\n", dlerror());
+        log_err("dladdr: %s\n", dlerror());
         info = NULL;
         return 1;
     }
     assert(strcmp(info->dli_sname, symbol) == 0);
     if (strcmp(info->dli_fname, sopath) != 0) {
-        fprintf(stderr, "info->dli_fname = %s\n", info->dli_fname);
-        fprintf(stderr, "         sopath = %s\n", sopath);
+        log_err("info->dli_fname = %s\n", info->dli_fname);
+        log_err("         sopath = %s\n", sopath);
         return 1;
     }
     return 0;
@@ -188,18 +222,20 @@ static struct {
     thread_state_flavor_t flavors[TASK_MAX_EXCEPTION_PORT_COUNT];
 } old_exc_ports;
 
-static void
+static int
 setup_exception_handling(task_t target_task, mach_port_t* exc_port)
 {
     kern_return_t kr = 0;
     mach_port_t me = mach_task_self();
     if ((kr = mach_port_allocate(me, MACH_PORT_RIGHT_RECEIVE, exc_port))
             != KERN_SUCCESS) {
-        fatal_mach("mach_port_allocate", kr);
+        log_mach("mach_port_allocate", kr);
+        return ATT_FAIL;
     }
     if ((kr = mach_port_insert_right(me, *exc_port, *exc_port,
                     MACH_MSG_TYPE_MAKE_SEND)) != KERN_SUCCESS) {
-        fatal_mach("mach_port_allocate", kr);
+        log_mach("mach_port_allocate", kr);
+        return ATT_FAIL;
     }
 
     exception_mask_t mask = EXC_MASK_BREAKPOINT;
@@ -209,15 +245,18 @@ setup_exception_handling(task_t target_task, mach_port_t* exc_port)
                     &old_exc_ports.count, old_exc_ports.ports,
                     old_exc_ports.behaviors, old_exc_ports.flavors))
             != KERN_SUCCESS) {
-        fatal_mach("task_get_exception_ports", kr);
+        log_mach("task_get_exception_ports", kr);
+        return ATT_FAIL;
     }
 
     /* set the new exception ports */
     if ((kr = task_set_exception_ports(target_task, mask, *exc_port,
                     EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES,
                     ARM_THREAD_STATE64)) != KERN_SUCCESS) {
-        fatal_mach("task_set_exception_ports", kr);
+        log_mach("task_set_exception_ports", kr);
+        return ATT_FAIL;
     }
+    return ATT_SUCCESS;
 }
 
 
@@ -229,7 +268,7 @@ catch_mach_exception_raise(mach_port_t exception_port,
         mach_exception_data_t code,
         mach_msg_type_number_t code_count)
 {
-    fprintf(stderr, "unexected call: catch_mach_exception_raise\n");
+    log_err("unexected call: catch_mach_exception_raise\n");
     return KERN_NOT_SUPPORTED;
 }
 
@@ -245,7 +284,7 @@ catch_mach_exception_raise_state(mach_port_t exception_port,
         thread_state_t new_state,
         mach_msg_type_number_t * new_state_count)
 {
-    fprintf(stderr, "unexected call: catch_mach_exception_raise_state\n");
+    log_err("unexected call: catch_mach_exception_raise_state\n");
     return KERN_NOT_SUPPORTED;
 }
 
@@ -265,13 +304,13 @@ catch_mach_exception_raise_state_identity(
 {
     kern_return_t kr;
 
-    if (debug) { fprintf(stderr, "in catch_exception_raise_state_identity\n"); }
+    log_dbg("in catch_exception_raise_state_identity");
     assert(exception == EXC_BREAKPOINT);
     assert(*flavor == ARM_THREAD_STATE64);
     assert(old_stateCnt == ARM_THREAD_STATE64_COUNT);
 
     arm_thread_state64_t* state = (arm_thread_state64_t*)old_state;
-    if (debug) { __builtin_dump_struct(state, printf); }
+    if (debug) { __builtin_dump_struct(state, log_dbg); }
 
     // copy old state to new state!
     *(arm_thread_state64_t*)new_state = *state;
@@ -288,7 +327,10 @@ catch_mach_exception_raise_state_identity(
          */
         kr = restore_page(task, &g_breakpoint_restore);
         if (kr != KERN_SUCCESS) {
-            fatal_mach("restore_page", kr);
+            log_mach("restore_page", kr);
+            g_err = ATT_UNKNOWN_STATE;
+            dispatch_semaphore_signal(sync_sema);
+            return KERN_FAILURE; /* I think it'll die anyway */
         }
 
         /* copy in code and data for hijack */
@@ -297,7 +339,10 @@ catch_mach_exception_raise_state_identity(
         vm_address_t allocated = 0;
         kr = vm_allocate(task, &allocated, pagesize, true);
         if (kr != KERN_SUCCESS) {
-            fatal_mach("vm_allocate", kr);
+            log_mach("vm_allocate", kr);
+            g_err = ATT_FAIL; // technically we're leaking memory...
+            dispatch_semaphore_signal(sync_sema);
+            return KERN_SUCCESS;
         }
         /* save so we can deallocate at the end */
         g_allocated.addr = allocated;
@@ -308,7 +353,10 @@ catch_mach_exception_raise_state_identity(
         mach_msg_type_number_t dataCnt;
         if ((kr = vm_read(task, allocated, pagesize, &data, &dataCnt))
                 != KERN_SUCCESS) {
-            fatal_mach("vm_read", kr);
+            log_mach("vm_read", kr);
+            g_err = ATT_FAIL;
+            dispatch_semaphore_signal(sync_sema);
+            return KERN_SUCCESS;
         }
         assert(dataCnt == pagesize);
 
@@ -327,20 +375,21 @@ catch_mach_exception_raise_state_identity(
             .data = data,
             .protection = VM_PROT_READ | VM_PROT_EXECUTE,
         };
-        restore_page(task, &page_restore);
+        if ((kr = restore_page(task, &page_restore)) != KERN_SUCCESS) {
+            log_mach("restore_page", kr);
+            g_err = ATT_FAIL;
+            dispatch_semaphore_signal(sync_sema);
+            return KERN_SUCCESS;
+        }
 
         /*
          * set up call
          */
 
-        vm_address_t fn_addr = find_pyfn(task, "Py_AddPendingCall");
-        if (!fn_addr) {
-            fatal("find_pyfn(Py_AddPendingCall)");
-        }
-        vm_address_t cb_addr = find_pyfn(task, "PyRun_SimpleString");
-        if (!cb_addr) {
-            fatal("find_pyfn(PyRun_SimpleString)");
-        }
+        vm_address_t fn_addr = g_pyfn_addrs.Py_AddPendingCall;
+        assert(fn_addr);
+        vm_address_t cb_addr = g_pyfn_addrs.PyRun_SimpleString;
+        assert(cb_addr);
 
         g_orig_threadstate = *state;
 
@@ -353,7 +402,7 @@ catch_mach_exception_raise_state_identity(
         arm_thread_state64_set_pc_fptr(*state, allocated);
 
     } else {
-        if (debug) { fprintf(stderr, "in the second breakpoint\n"); }
+        log_dbg("in the second breakpoint");
         assert(arm_thread_state64_get_pc(g_orig_threadstate) != 0);
         assert(g_allocated.addr != 0 && g_allocated.size != 0);
 
@@ -397,7 +446,7 @@ struct dyld_image_info_it {
     struct dyld_all_image_infos infos;
     struct dyld_image_info info;
     char filepath[1024];
-    int idx;
+    unsigned int idx;
 };
 
 static void
@@ -409,7 +458,8 @@ iter_dyld_infos(task_t task, struct dyld_image_info_it* it)
     mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
     if ((kr = task_info(task, TASK_DYLD_INFO, (task_info_t)&dyld_info, &count))
             != KERN_SUCCESS) {
-        fatal_mach("task_info", kr);
+        log_mach("task_info", kr);
+        return;
     }
 
     assert(it->infos.infoArrayCount == 0);
@@ -418,13 +468,16 @@ iter_dyld_infos(task_t task, struct dyld_image_info_it* it)
     if ((kr = vm_read_overwrite(task, dyld_info.all_image_info_addr,
                     sizeof it->infos, (vm_address_t)&it->infos, &outsize))
             != KERN_SUCCESS) {
-        fatal_mach("vm_read_overwrite", kr);
+        log_mach("vm_read_overwrite", kr);
+        memset(it, 0, sizeof *it);
+        return;
     }
     assert(it->infos.infoArrayCount <= 1000);
 
     if (it->infos.infoArray == NULL) {
         // TODO: sleep-wait
-        fatal("dyld_all_image_infos is being modified.");
+        log_err("dyld_all_image_infos is being modified.\n");
+        memset(it, 0, sizeof *it);
     }
 }
 
@@ -432,7 +485,7 @@ static bool
 iter_dyld_infos_next(task_t task, struct dyld_image_info_it* it)
 {
     kern_return_t kr;
-    int i = it->idx;
+    unsigned int i = it->idx;
     if (!(i < it->infos.infoArrayCount)) {
         return false;
     }
@@ -442,14 +495,16 @@ iter_dyld_infos_next(task_t task, struct dyld_image_info_it* it)
     kr = vm_read_overwrite(task, (vm_address_t)&it->infos.infoArray[i],
             sizeof it->info, (vm_address_t)&it->info, &outsize);
     if (kr != KERN_SUCCESS) {
-        fatal_mach("vm_read_overwrite", kr);
+        log_mach("vm_read_overwrite", kr);
+        return false;
     }
     assert(outsize >= sizeof it->info);
 
     kr = vm_read_overwrite(task, (vm_address_t)it->info.imageFilePath,
                     sizeof it->filepath, (vm_address_t)it->filepath, &outsize);
     if (kr != KERN_SUCCESS) {
-        fatal_mach("vm_read_overwrite", kr);
+        log_mach("vm_read_overwrite", kr);
+        return false;
     }
     // check for overruns... no idea if that can happen.
     assert(outsize <= 1024);
@@ -474,7 +529,8 @@ find_sysfn(task_t task, void* fptr, const char* symbol)
 {
     Dl_info dlinfo = {};
     if (dladdr(fptr, &dlinfo) == 0) { // yes, 0 means failure for dladdr
-        fatal("dladdr");
+        log_err("attacher: dladdr: %s\n", dlerror());
+        return 0;
     }
     assert(strcmp(dlinfo.dli_sname, symbol) == 0);
 
@@ -511,9 +567,7 @@ find_pyfn(task_t task, const char* symbol)
             if (load_and_find_safepoint(it.filepath, symbol, &dlinfo) != 0) {
                 continue;
             }
-            if (debug) {
-                fprintf(stderr, "found %s in %s\n", symbol, it.filepath);
-            }
+            log_dbg("found %s in %s", symbol, it.filepath);
             ptrdiff_t breakpoint_offset = dlinfo.dli_saddr - dlinfo.dli_fbase;
 
             fn_addr =
@@ -527,36 +581,68 @@ find_pyfn(task_t task, const char* symbol)
 }
 
 
-int
-attach_and_execute(int pid, const char* python_code)
+static int
+find_needed_python_funcs(task_t task)
 {
+    g_pyfn_addrs.Py_AddPendingCall = find_pyfn(task, "Py_AddPendingCall");
+    if (!g_pyfn_addrs.Py_AddPendingCall) {
+        log_err("could not find %s in shared libs", "Py_AddPendingCall");
+        return ATT_FAIL;
+    }
+
+    g_pyfn_addrs.PyRun_SimpleString = find_pyfn(task, "PyRun_SimpleString");
+    if (!g_pyfn_addrs.PyRun_SimpleString) {
+        log_err("could not find %s in shared libs", "PyRun_SimpleString");
+        return ATT_FAIL;
+    }
+    return 0;
+}
+
+
+int
+attach_and_execute(const int pid, const char* python_code)
+{
+    // TODO: we should setup a handler or block SIGHUP, SIGTERM and SIGINT
+    // while the breakpoint is in place. Though python has blocked SIGINT
+    // for us already...
+
+    // TODO: This code is hilariously non-reentrant. Find a way to
+    // protect it. or make it reentrant.
+
     task_t task = TASK_NULL;
     kern_return_t kr;
     if ((kr = task_for_pid(mach_task_self(), pid, &task)) != KERN_SUCCESS) {
-        fatal_mach("task_for_pid", kr);
+        log_mach("task_for_pid", kr);
+        return ATT_FAIL;
     }
     assert(task != TASK_NULL);
 
     vm_size_t pagesize = 0;
     if ((kr = host_page_size(mach_host_self(), &pagesize)) != KERN_SUCCESS) {
-        fatal_mach("host_page_size", kr);
+        log_mach("host_page_size", kr);
+        return ATT_FAIL;
     }
     assert(pagesize != 0);
 
     if (PYTHON_CODE_OFFSET + strlen(python_code) + 1 > pagesize) {
-        fprintf(stderr, "python code exceeds max size: %lu",
+        log_err("python code exceeds max size: %lu",
                 pagesize - PYTHON_CODE_OFFSET - 1);
-        return -1;
+        return ATT_FAIL;
+    }
+
+    // Find some python fn addresses in advance of playing around with
+    // setting breakpoints.
+    if (find_needed_python_funcs(task) != 0) {
+        return ATT_FAIL;
     }
 
     vm_address_t breakpoint_addr = find_pyfn(task, SAFE_POINT);
     if (breakpoint_addr == 0) {
-        fatal(SAFE_POINT " not found in target libraries");
+        log_err("%s not found in target libraries\n", SAFE_POINT);
+        return ATT_FAIL;
     }
-    if (debug) {
-        fprintf(stderr, SAFE_POINT " is at %p in process %d\n",
-                (void*)breakpoint_addr, pid);
-    }
+    log_dbg(SAFE_POINT " is at %p in process %d\n",
+            (void*)breakpoint_addr, pid);
 
 
     // work out page to read and write
@@ -566,20 +652,22 @@ attach_and_execute(int pid, const char* python_code)
 
     // Attach and set breakpoint
     if ((kr = task_suspend(task)) != KERN_SUCCESS) {
-        fatal_mach("task_suspend", kr);
+        log_mach("task_suspend", kr);
+        return ATT_FAIL;
     }
 
     vm_offset_t data;
     mach_msg_type_number_t dataCnt;
     if ((kr = vm_read(task, page_boundary, pagesize, &data, &dataCnt))
             != KERN_SUCCESS) {
-        fatal_mach("vm_read", kr);
+        log_mach("vm_read", kr);
+        return ATT_FAIL;
     }
     assert(dataCnt == pagesize);
     void* local_bp_addr = (char*)data + (ptrdiff_t)bp_page_offset;
 
     uint32_t saved_instruction = *(uint32_t*)local_bp_addr;
-    if (debug) { fprintf(stderr, "instr at BP: %8x\n", saved_instruction); }
+    log_dbg("instr at BP: %8x\n", saved_instruction);
 
     /* write the breakpoint */
     *(uint32_t*)local_bp_addr = DEBUG_TRAP_INSTR;
@@ -588,13 +676,14 @@ attach_and_execute(int pid, const char* python_code)
     int protection;
     kr = get_region_protection(task, page_boundary, &protection);
     if (kr != KERN_SUCCESS) {
-        fatal_mach("get_region_protection", kr);
+        log_mach("get_region_protection", kr);
+        return ATT_FAIL;
     }
 
     if (debug) {
         char prot_str[4];
         fmt_prot(prot_str, protection);
-        fprintf(stderr, "region.protection = %s\n", prot_str);
+        log_dbg("region.protection = %s", prot_str);
     }
 
     page_restore_t page_restore = {
@@ -604,7 +693,8 @@ attach_and_execute(int pid, const char* python_code)
         .protection = protection,
     };
     if ((kr = restore_page(task, &page_restore)) != KERN_SUCCESS) {
-        fatal_mach("restore_page", kr);
+        log_mach("restore_page", kr);
+        return ATT_UNKNOWN_STATE;
     }
 
     /*
@@ -618,25 +708,38 @@ attach_and_execute(int pid, const char* python_code)
     g_python_code = python_code;
 
     mach_port_t exception_port = MACH_PORT_NULL;
-    setup_exception_handling(task, &exception_port);
+
+    if (setup_exception_handling(task, &exception_port) != 0) {
+        // TODO: remove breakpoint
+        return ATT_UNKNOWN_STATE;
+    }
 
     sync_sema = dispatch_semaphore_create(0);
-    if (!sync_sema) fatal("dispatch_semaphore_create");
+    if (!sync_sema) {
+        log_err("dispatch_semaphore_create");
+        // TODO: uninstall exc handlers, remove breakpoint
+        return ATT_UNKNOWN_STATE;
+    }
 
     pthread_t s_exc_thread;
     if (pthread_create(&s_exc_thread, NULL, exception_server_thread,
             &exception_port) != 0) {
-        fatal("pthread_create");
+        log_err("pthread_create");
+        // TODO: uninstall exc handlers, remove breakpoint
+        return ATT_UNKNOWN_STATE;
     }
 
     if (dispatch_semaphore_wait(sync_sema,
                     dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC)) != 0) {
-        fatal("timed out after 2s waiting for pthread_create");
+        log_err("timed out after 2s waiting for pthread_create");
+        // TODO: uninstall exc handlers, remove breakpoint
+        return ATT_UNKNOWN_STATE;
     }
 
     fprintf(stderr, "Waiting for process to reach safepoint...\n");
     if ((kr = task_resume(task)) != KERN_SUCCESS) {
-        fatal_mach("task_resume", kr);
+        log_mach("task_resume", kr);
+        return ATT_UNKNOWN_STATE;
     }
 
     if (dispatch_semaphore_wait(sync_sema,
@@ -645,13 +748,35 @@ attach_and_execute(int pid, const char* python_code)
         if ((kr = task_suspend(task)) != 0) {
             log_mach("task_suspend", kr);
         }
-        if ((kr = restore_page(task, &g_breakpoint_restore)) != 0) {
-            log_mach("restore_page", kr);
+        int kr2;
+        if ((kr2 = restore_page(task, &g_breakpoint_restore)) != 0) {
+            log_mach("restore_page", kr2);
         }
-        fatal("timed out after 20s waiting for exception");
+        log_err("timed out after 20s waiting for exception");
+        if (kr != KERN_SUCCESS || kr2 != KERN_SUCCESS) {
+            return ATT_UNKNOWN_STATE;
+        }
+        // Assuming no race with the exception handler, (which we will ensure
+        // in the future), we're back to original state.
+        // TODO:... we need to also unset the exception handler here.
+        return ATT_FAIL;
     }
 
-    // TODO: uninstall exception handlers
+    // check error code set in the exception handler.
+    int err = g_err;
 
-    return 0;
+    // uninstall exception handlers
+    for (int i = 0; i < old_exc_ports.count; i++) {
+        kr = task_set_exception_ports(task,
+                old_exc_ports.masks[i],
+                old_exc_ports.ports[i],
+                old_exc_ports.behaviors[i],
+                old_exc_ports.flavors[i]);
+        if (kr != KERN_SUCCESS) {
+            log_mach("task_set_exception_ports", kr);
+            return ATT_UNKNOWN_STATE;
+        }
+    }
+
+    return err;
 }

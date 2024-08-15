@@ -162,7 +162,9 @@ def settrace(user_break, user_python_snippet, comm_file):
         pmt.comm_fh.connect(comm_file)
     except Exception:
         # Once we are more stable, we should avoid this printing inside the
-        # tracee.
+        # tracee. Or we could have a flag to enable it.
+        # On mac this tends to happen when ctrl-c'ing while waiting
+        # to attach.
         print(f'{__name__}.settrace failed', file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         return
