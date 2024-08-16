@@ -29,8 +29,8 @@ def install_pymontrace(pid: int) -> TemporaryDirectory:
     # Maybe there will be cases where checking for some TMPDIR is better.
     # but this seems to work so far.
     ptmpdir = '/tmp'
-    if sys.platform == 'linux' and os.path.isdir('/proc/{pid}/root/tmp'):
-        ptmpdir = '/proc/{pid}/root/tmp'
+    if sys.platform == 'linux' and os.path.isdir(f'/proc/{pid}/root/tmp'):
+        ptmpdir = f'/proc/{pid}/root/tmp'
 
     tmpdir = TemporaryDirectory(dir=ptmpdir)
     # Would be nice to change this so the owner group is the target gid
