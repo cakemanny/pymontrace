@@ -167,6 +167,8 @@ def settrace(user_break, user_python_snippet, comm_file):
         # tracee. Or we could have a flag to enable it.
         # On mac this tends to happen when ctrl-c'ing while waiting
         # to attach.
+        # Once we've ported the latest attacher changes over to linux
+        # we can stop catching this again
         print(f'{__name__}.settrace failed', file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         return

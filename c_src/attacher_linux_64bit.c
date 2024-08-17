@@ -41,6 +41,7 @@
     #define DEBUG_TRAP_INSTR    ((uint8_t)0xcc)
     #define user_regs_retval(uregs) ((uregs).rax)
 #elif defined(__riscv)
+//	ebreak
     #define DEBUG_TRAP_INSTR    ((uint32_t)0x00100073)
     // x10 == a0 == first argument and also return value
     #define user_regs_retval(uregs) ((uregs).a0)
@@ -506,6 +507,32 @@ save_instrs(pid_t pid, word_of_instr_t* psaved, uintptr_t addr)
     return 0;
 }
 
+static int
+set_pc(pid_t tid, uintptr_t pc, uintptr_t* oldpc)
+{
+    struct user_regs_struct user_regs = {};
+    struct iovec iov = {.iov_base = &user_regs, .iov_len = sizeof user_regs};
+    if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_PRSTATUS, &iov)) {
+        perror("ptrace(PTRACE_GETREGSET,...)");
+        return -1;
+    }
+#if defined(__aarch64__) || defined(__riscv)
+    if (oldpc) {
+        *oldpc = user_regs.pc;
+    }
+    user_regs.pc = pc;
+#elif defined(__x86_64__)
+    if (oldpc) {
+        *oldpc = user_regs.rip;
+    }
+    user_regs.rip = pc;
+#endif
+    if (-1 == ptrace(PTRACE_SETREGSET, tid, NT_PRSTATUS, &iov)) {
+        perror("ptrace(PTRACE_SETREGSET,...)");
+        return -1;
+    }
+    return 0;
+}
 
 static void
 prepare_syscall6(
@@ -522,23 +549,23 @@ prepare_syscall6(
     user_regs->regs[4] = arg5;
     user_regs->regs[5] = arg6;
 #elif defined(__x86_64__)
-    urmmap.rax = num;
-    urmmap.rdi = arg1;
-    urmmap.rsi = arg2;
-    urmmap.rdx = arg3;
-    urmmap.r10 = arg4;
-    urmmap.r8  = arg5;
-    urmmap.r9  = arg6;
-    urmmap.rip = pc;
+    urmmap->rax = num;
+    urmmap->rdi = arg1;
+    urmmap->rsi = arg2;
+    urmmap->rdx = arg3;
+    urmmap->r10 = arg4;
+    urmmap->r8  = arg5;
+    urmmap->r9  = arg6;
+    urmmap->rip = pc;
 #elif defined(__riscv) && __riscv_xlen == 64
-    urmmap.a7 = num;
-    urmmap.a0 = arg1;
-    urmmap.a1 = arg2;
-    urmmap.a2 = arg3;
-    urmmap.a3 = arg4;
-    urmmap.a4 = arg5;
-    urmmap.a5 = arg6;
-    urmmap.pc = pc;
+    urmmap->a7 = num;
+    urmmap->a0 = arg1;
+    urmmap->a1 = arg2;
+    urmmap->a2 = arg3;
+    urmmap->a3 = arg4;
+    urmmap->a4 = arg5;
+    urmmap->a5 = arg6;
+    urmmap->pc = pc;
 #endif
 }
 
@@ -653,14 +680,11 @@ restore_instuctions:
     return err;
 }
 
-
 static ssize_t
-call_pyfn_in_target(
+indirect_call_and_brk2(
         pid_t pid, pid_t tid, uintptr_t scratch_addr, uintptr_t fn_addr,
-        uintptr_t buf)
+        uintptr_t arg1, uintptr_t arg2, uintptr_t* retval)
 {
-    // not sure it really makes sense to pass in the fn_addr since
-    // this will only work for functions of a single string argument...
     int err = 0;
 
     // If we run into bugs with FP registers we may want to expand this
@@ -676,13 +700,6 @@ call_pyfn_in_target(
     if (iov.iov_len != sizeof user_regs) {
         fprintf(stderr, "iov.iov_len = %lu, sizeof user_regs = %lu\n",
                 iov.iov_len, sizeof user_regs);
-    }
-
-    uintptr_t add_pending_call_addr = find_pyfn(pid, "Py_AddPendingCall");
-
-    if (add_pending_call_addr == 0) {
-        log_err("failed to find symbol Py_AddPendingCall");
-        return ATT_FAIL;
     }
 
     word_of_instr_t saved_instrs = {};
@@ -712,19 +729,19 @@ call_pyfn_in_target(
     struct user_regs_struct urcall = user_regs;
 
 #if defined(__aarch64__)
-    urcall.regs[0] = fn_addr;
-    urcall.regs[1] = buf;
-    urcall.regs[16] = add_pending_call_addr;
+    urcall.regs[0] = arg1;
+    urcall.regs[1] = arg2;
+    urcall.regs[16] = fn_addr;
     urcall.pc = scratch_addr;
 #elif defined(__x86_64__)
-    urcall.rdi = fn_addr;
-    urcall.rsi = buf;
-    urcall.rax = add_pending_call_addr;
+    urcall.rdi = arg1;
+    urcall.rsi = arg2;
+    urcall.rax = fn_addr;
     urcall.rip = scratch_addr;
 #elif defined(__riscv)
-    urcall.a0 = fn_addr;
-    urcall.a1 = buf;
-    urcall.a5 = add_pending_call_addr;
+    urcall.a0 = arg1;
+    urcall.a1 = arg2;
+    urcall.a5 = fn_addr;
     urcall.pc = scratch_addr;
 #endif
 
@@ -753,9 +770,7 @@ call_pyfn_in_target(
         goto restore_instuctions;
     }
 
-    if (user_regs_retval(urcall) != 0) {
-        log_err("running python code failed");
-    }
+    *retval = user_regs_retval(urcall);
 
 restore_instuctions:
     if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)scratch_addr,
@@ -770,6 +785,49 @@ restore_instuctions:
         return ATT_UNKNOWN_STATE;
     }
 
+    return err;
+}
+
+
+static ssize_t
+add_pending_in_target(
+        pid_t pid, pid_t tid, uintptr_t scratch_addr, uintptr_t fn_addr,
+        uintptr_t arg)
+{
+    uintptr_t add_pending_call_addr = find_pyfn(pid, "Py_AddPendingCall");
+
+    if (add_pending_call_addr == 0) {
+        log_err("failed to find symbol Py_AddPendingCall");
+        return ATT_FAIL;
+    }
+
+    uintptr_t retval = 0;
+    int err = indirect_call_and_brk2(pid, tid, scratch_addr,
+            add_pending_call_addr, fn_addr, arg, &retval);
+    if (retval != 0 && err == 0) {
+        log_err("Py_AddPendingCall returned an error");
+        err = ATT_FAIL;
+    }
+    return err;
+}
+
+static ssize_t
+call_pyrun_simplestring(
+        pid_t pid, pid_t tid, uintptr_t scratch_addr, uintptr_t buf)
+{
+    uint64_t PyRun_SimpleString = find_pyfn(pid, "PyRun_SimpleString");
+    if (PyRun_SimpleString == 0) {
+        fprintf(stderr, "unable to find %s\n", "PyRun_SimpleString");
+        return ATT_FAIL;
+    }
+
+    uintptr_t retval = 0;
+    int err = indirect_call_and_brk2(pid, tid, scratch_addr,
+            PyRun_SimpleString, buf, 0, &retval);
+    if (retval != 0 && err == 0) {
+        log_err("PyRun_SimpleString returned an error");
+        err = ATT_FAIL;
+    }
     return err;
 }
 
@@ -805,21 +863,61 @@ exec_python_code(pid_t pid, pid_t tid, const char* python_code)
         return ATT_FAIL;
     }
 
-    uint64_t PyRun_SimpleString = find_pyfn(pid, "PyRun_SimpleString");
-    if (PyRun_SimpleString == 0) {
-        fprintf(stderr, "unable to find %s\n", "PyRun_SimpleString");
-        return ATT_FAIL;
+    // We tell Py_AddPendingCall to call into this function that only
+    // does a trap.
+
+    word_of_instr_t brk_and_ret = {
+        #if defined(__aarch64__)
+            .u32s[0] = DEBUG_TRAP_INSTR,
+            .u32s[1] = 0xd65f03c0,  /* ret */
+        #elif defined(__x86_64__)
+            .c_bytes[0] = DEBUG_TRAP_INSTR,
+            .c_bytes[1] = 0xc3, /* retq */
+        #elif defined(__riscv)
+            .u32s[0] = DEBUG_TRAP_INSTR,
+            .u32s[1] = 0x00008067,  /* ret (jalr x0,x1,0) */
+        #endif
+    };
+    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)(libc_start_addr + sizeof(void*)),
+                brk_and_ret.u64)) {
+        perror("ptrace(PTRACE_POKETEXT, ...)");
+        return ATT_UNKNOWN_STATE;
     }
 
-    if ((err = call_pyfn_in_target(pid, tid, libc_start_addr,
-                    PyRun_SimpleString, mapped_addr)) != 0) {
-        fprintf(stderr, "call PyRun_SimpleString in target failed\n");
+    if ((err = add_pending_in_target(pid, tid, libc_start_addr,
+                    (libc_start_addr + sizeof(void*)), 0)) != 0) {
+        log_err("adding pending call in target failed");
         return err;
     }
 
-    // TODO: munmap (requires setting the breakpoint in the function passed
-    // to Py_AddPendingCall)
-    return 0;
+    if (ptrace(PTRACE_CONT, tid, 0, 0) == -1) {
+        perror("ptrace(PTRACE_CONT, ...)");
+        return ATT_UNKNOWN_STATE;
+    }
+
+    if ((tid = wait_for_stop(pid, SIGTRAP)) == -1) {
+        log_err("wait_for_stop failed");
+        // If this was an EINTR... maybe we could replace the trap with the
+        // ret in order to null out the breakpoint... but we need to improve
+        // the signal handling anyway.
+        return ATT_UNKNOWN_STATE;
+    }
+
+    if ((err = call_pyrun_simplestring(pid, tid, libc_start_addr, mapped_addr))
+            != 0) {
+        // we need to continue to restore the PC and the overwritten libc
+    }
+
+    int err2 = set_pc(tid,
+            libc_start_addr + sizeof(void*) + sizeof(DEBUG_TRAP_INSTR), 0);
+    if (err == ATT_UNKNOWN_STATE || err2 == -1) {
+        return ATT_UNKNOWN_STATE;
+    }
+
+    // TODO: restore libc+8
+
+    // TODO: munmap
+    return err;
 }
 
 int
@@ -836,7 +934,6 @@ attach_and_execute(const int pid, const char* python_code)
     }
     log_dbg(SAFE_POINT " = %lx", breakpoint_addr);
 
-    // TODO: consider using PTRACE_SEIZE and then PTRACE_INTERRUPT
     if (-1 == ptrace(PTRACE_ATTACH, pid, 0, 0)) {
         perror("ptrace");
         return ATT_FAIL;
@@ -920,24 +1017,11 @@ attach_and_execute(const int pid, const char* python_code)
     // but then we'd have to adapt our signal handling code ... Let's compare
     // HW breakpoints before deciding.
 #if defined(__x86_64__)
-    {
-        struct user_regs_struct user_regs = {};
-        struct iovec iov = {.iov_base = &user_regs, .iov_len = sizeof user_regs};
-        if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_PRSTATUS, &iov)) {
-            perror("ptrace(PTRACE_GETREGSET,...)");
-            err = ATT_UNKNOWN_STATE; /* until we succeed with the next the
-                                        instruction pointer, we're in a bad
-                                        state */
-
-            goto detach;
-        }
-        log_dbg("Setting rip from %llx to %lx", user_regs.rip, breakpoint_addr);
-        user_regs.rip = breakpoint_addr;
-        if (-1 == ptrace(PTRACE_SETREGSET, tid, NT_PRSTATUS, &iov)) {
-            perror("ptrace(PTRACE_SETREGSET,...)");
-            err = ATT_UNKNOWN_STATE;
-            goto detach;
-        }
+    if (-1 == set_pc(tid, breakpoint_addr)) {
+        err = ATT_UNKNOWN_STATE; /* until we succeed with the next the
+                                    instruction pointer, we're in a bad
+                                    state */
+        goto detach;
     }
 #endif // defined(__x86_64__)
 
@@ -947,7 +1031,6 @@ attach_and_execute(const int pid, const char* python_code)
     }
 
 detach:
-
     if (-1 == ptrace(PTRACE_DETACH, pid, 0, 0)) {
         perror("ptrace(PTRACE_DETACH,...)");
         return ATT_UNKNOWN_STATE;
