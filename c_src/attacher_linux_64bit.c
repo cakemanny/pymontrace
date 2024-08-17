@@ -406,7 +406,7 @@ find_symbol(pid_t pid, const char* symbol, const char* fnsrchstr)
             prefixed_path[PATH_MAX-1] = '\0';
         }
 
-        elfsym_info_t es_info;
+        elfsym_info_t es_info = {};
         int err = elf_find_symbol(prefixed_path, symbol, &es_info);
         if (err == ESRCH) {
             continue;
@@ -506,6 +506,43 @@ save_instrs(pid_t pid, word_of_instr_t* psaved, uintptr_t addr)
     return 0;
 }
 
+
+static void
+prepare_syscall6(
+        struct user_regs_struct* user_regs, long pc, long num,
+        long arg1, long arg2, long arg3, long arg4, long arg5, long arg6)
+{
+#if defined(__aarch64__)
+    user_regs->pc = pc;
+    user_regs->regs[8] = num;
+    user_regs->regs[0] = arg1;
+    user_regs->regs[1] = arg2;
+    user_regs->regs[2] = arg3;
+    user_regs->regs[3] = arg4;
+    user_regs->regs[4] = arg5;
+    user_regs->regs[5] = arg6;
+#elif defined(__x86_64__)
+    urmmap.rax = num;
+    urmmap.rdi = arg1;
+    urmmap.rsi = arg2;
+    urmmap.rdx = arg3;
+    urmmap.r10 = arg4;
+    urmmap.r8  = arg5;
+    urmmap.r9  = arg6;
+    urmmap.rip = pc;
+#elif defined(__riscv) && __riscv_xlen == 64
+    urmmap.a7 = num;
+    urmmap.a0 = arg1;
+    urmmap.a1 = arg2;
+    urmmap.a2 = arg3;
+    urmmap.a3 = arg4;
+    urmmap.a4 = arg5;
+    urmmap.a5 = arg6;
+    urmmap.pc = pc;
+#endif
+}
+
+
 static int
 call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t bp_addr, uintptr_t* addr)
 {
@@ -531,13 +568,21 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t bp_addr, uintptr_t* addr)
         return ATT_FAIL;
     }
 
-
-#if defined(__aarch64__)
-
     word_of_instr_t syscall_and_brk = {
-        .u32s[0] = 0xd4000001, /* svc	#0 */
-        .u32s[1] = DEBUG_TRAP_INSTR,
+        #if defined(__aarch64__)
+            .u32s[0] = 0xd4000001, /* svc	#0 */
+            .u32s[1] = DEBUG_TRAP_INSTR,
+        #elif defined(__x86_64__)
+            .c_bytes[0] = 0x0f, .c_bytes[1] = 0x05, /* syscall */
+            .c_bytes[2] = DEBUG_TRAP_INSTR,
+        #elif defined(__riscv) && __riscv_xlen == 64
+            // We use the 32-bit instructions so that we don't need to check
+            // whether the processor supports the RVC extension.
+            .u32s[0] = 0x00000073, /* ecall */
+            .u32s[1] = DEBUG_TRAP_INSTR,
+        #endif
     };
+
     if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)bp_addr,
                 syscall_and_brk.u64)) {
         perror("ptrace(PTRACE_POKETEXT, ...)");
@@ -547,66 +592,13 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t bp_addr, uintptr_t* addr)
     // Setup registers for mmap call
     struct user_regs_struct urmmap = user_regs;
 
-    urmmap.regs[8] = SYS_mmap;
-    urmmap.regs[0] = 0; // addr
-    urmmap.regs[1] = sysconf(_SC_PAGESIZE); // length
-    urmmap.regs[2] = PROT_READ | PROT_WRITE; // prot
-    urmmap.regs[3] = MAP_PRIVATE | MAP_ANONYMOUS;
-    urmmap.regs[4] = -1; // fd
-    urmmap.regs[5] = 0; // offset
-    urmmap.pc = bp_addr;
+    prepare_syscall6(&urmmap, bp_addr, SYS_mmap,
+            0, /* addr */
+            sysconf(_SC_PAGESIZE), PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1, /* fd */
+            0); /* offset */
 
-#elif defined(__x86_64__)
-
-    word_of_instr_t syscall_and_brk = {
-        .c_bytes[0] = 0x0f, .c_bytes[1] = 0x05, /* syscall */
-        .c_bytes[2] = DEBUG_TRAP_INSTR,
-    };
-    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)bp_addr,
-                syscall_and_brk.u64)) {
-        perror("ptrace(PTRACE_POKETEXT, ...)");
-        return ATT_FAIL;
-    }
-
-    // Setup registers for mmap call
-    struct user_regs_struct urmmap = user_regs;
-
-    urmmap.rax = SYS_mmap;
-    urmmap.rdi = 0; // addr
-    urmmap.rsi = sysconf(_SC_PAGESIZE); // length
-    urmmap.rdx = PROT_READ | PROT_WRITE; // prot
-    urmmap.r10 = MAP_PRIVATE | MAP_ANONYMOUS;
-    urmmap.r8 = -1; // fd
-    urmmap.r9 = 0; // offset
-    urmmap.rip = bp_addr;
-
-#elif defined(__riscv) && __riscv_xlen == 64
-
-    // We use the 32-bit instructions so that we don't need to check
-    // whether the processor supports the RVC extension.
-    word_of_instr_t syscall_and_brk = {
-        .u32s[0] = 0x00000073, /* ecall */
-        .u32s[1] = DEBUG_TRAP_INSTR,
-    };
-    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)bp_addr,
-                syscall_and_brk.u64)) {
-        perror("ptrace(PTRACE_POKETEXT, ...)");
-        return ATT_FAIL;
-    }
-
-    // Setup registers for mmap call
-    struct user_regs_struct urmmap = user_regs;
-
-    urmmap.a7 = SYS_mmap;
-    urmmap.a0 = 0; // addr
-    urmmap.a1 = sysconf(_SC_PAGESIZE); // length
-    urmmap.a2 = PROT_READ | PROT_WRITE; // prot
-    urmmap.a3 = MAP_PRIVATE | MAP_ANONYMOUS;
-    urmmap.a4 = -1; // fd
-    urmmap.a5 = 0; // offset
-    urmmap.pc = bp_addr;
-
-#endif
 
     struct iovec iov_mmap = {.iov_base = &urmmap, .iov_len = sizeof urmmap};
 
