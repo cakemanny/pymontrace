@@ -126,7 +126,7 @@ log_mach(const char* msg, kern_return_t kr)
 {
     fprintf(stderr, "attacher: %s: %s (%d)\n", msg, mach_error_string(kr), kr);
 }
-// TODO: not use this
+
 static void
 fatal_mach(const char* msg, kern_return_t kr)
 {
@@ -187,6 +187,20 @@ restore_page(task_t task, page_restore_t* r)
     kern_return_t kr2;
     if ((kr2 = vm_protect(task, r->page_addr, r->pagesize, false,
                     r->protection)) != KERN_SUCCESS) {
+        return kr2;
+    }
+    return kr;
+}
+
+static kern_return_t
+suspend_and_restore_page(task_t task, page_restore_t* r)
+{
+    int kr, kr2;
+    if ((kr = task_suspend(task)) != 0) {
+        log_mach("task_suspend", kr);
+    }
+    if ((kr2 = restore_page(task, r)) != 0) {
+        log_mach("restore_page", kr2);
         return kr2;
     }
     return kr;
@@ -303,6 +317,8 @@ catch_mach_exception_raise_state_identity(
         mach_msg_type_number_t *new_stateCnt)
 {
     kern_return_t kr;
+    // TODO: CAS a ATT_UNKNOWN_STATE into the g_err to somewhat protect against
+    // cancellation.
 
     log_dbg("in catch_exception_raise_state_identity");
     assert(exception == EXC_BREAKPOINT);
@@ -416,6 +432,7 @@ catch_mach_exception_raise_state_identity(
             }
         }
 
+        g_err = ATT_SUCCESS;
         dispatch_semaphore_signal(sync_sema);
     }
 
@@ -428,6 +445,7 @@ extern boolean_t mach_exc_server(mach_msg_header_t *, mach_msg_header_t *);
 static void *
 exception_server_thread(void *arg)
 {
+    // TODO: work out how we end this thread.
     kern_return_t kr;
     mach_port_t exc_port = *(mach_port_t *)arg;
 
@@ -438,6 +456,49 @@ exception_server_thread(void *arg)
         fatal_mach("mach_msg_server", kr);
     }
     return NULL;
+}
+
+static sigset_t
+init_signal_mask()
+{
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGHUP);
+    sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGTERM);
+    sigaddset(&mask, SIGQUIT);
+    sigaddset(&mask, SIGUSR1);
+    return mask;
+}
+
+static void *
+signal_handler_thread(void *arg)
+{
+    sigset_t mask = init_signal_mask();
+
+    for (;;) {
+        int signo;
+        errno = sigwait(&mask, &signo);
+        if (errno != 0) {
+            log_err("sigwait");
+            exit(1);
+        }
+        if (signo == SIGUSR1) {
+            // Used internally to shut down this thread.
+            return NULL;
+        } else {
+            // todo: maybe use stdatomic for g_err instead to avoid race
+            g_err = ATT_INTERRUPTED;
+            dispatch_semaphore_signal(sync_sema);
+        }
+    }
+}
+static int
+shutdown_signal_thread(pthread_t thread)
+{
+    // Set errno, because our log_err function likes it
+    errno = pthread_kill(thread, SIGUSR1);
+    return errno;
 }
 
 // Find write or PyRun_SimpleString
@@ -602,9 +663,7 @@ find_needed_python_funcs(task_t task)
 int
 attach_and_execute(const int pid, const char* python_code)
 {
-    // TODO: we should setup a handler or block SIGHUP, SIGTERM and SIGINT
-    // while the breakpoint is in place. Though python has blocked SIGINT
-    // for us already...
+    int err = 0;
 
     // TODO: This code is hilariously non-reentrant. Find a way to
     // protect it. or make it reentrant.
@@ -686,6 +745,26 @@ attach_and_execute(const int pid, const char* python_code)
         log_dbg("region.protection = %s", prot_str);
     }
 
+    /*
+     * Now we enter the critical section, so we block signals until
+     * we've set things up and are in a good state to reverse them
+     * on a ctrl-c
+     */
+
+    sigset_t old_mask = 0;
+    sigset_t signal_mask = init_signal_mask();
+    if ((errno = pthread_sigmask(SIG_BLOCK, &signal_mask, &old_mask)) != 0) {
+        log_err("pthread_sigmask");
+        return ATT_FAIL;
+    }
+    pthread_t t_sig_handler;
+    if ((errno = pthread_create(&t_sig_handler, NULL, signal_handler_thread,
+                    0)) != 0) {
+        log_err("pthread_create");
+        err = ATT_FAIL;
+        goto restore_mask;
+    }
+
     page_restore_t page_restore = {
         .page_addr = page_boundary,
         .pagesize = pagesize,
@@ -694,7 +773,8 @@ attach_and_execute(const int pid, const char* python_code)
     };
     if ((kr = restore_page(task, &page_restore)) != KERN_SUCCESS) {
         log_mach("restore_page", kr);
-        return ATT_UNKNOWN_STATE;
+        err = ATT_UNKNOWN_STATE;
+        goto restore_mask;
     }
 
     /*
@@ -710,61 +790,85 @@ attach_and_execute(const int pid, const char* python_code)
     mach_port_t exception_port = MACH_PORT_NULL;
 
     if (setup_exception_handling(task, &exception_port) != 0) {
-        // TODO: remove breakpoint
-        return ATT_UNKNOWN_STATE;
+        err = ATT_FAIL;
+        if (restore_page(task, &page_restore) != KERN_SUCCESS) {
+            err = ATT_UNKNOWN_STATE;
+        }
+        goto restore_mask;
     }
 
+    // FIXME: call dispatch_release
     sync_sema = dispatch_semaphore_create(0);
     if (!sync_sema) {
         log_err("dispatch_semaphore_create");
-        // TODO: uninstall exc handlers, remove breakpoint
-        return ATT_UNKNOWN_STATE;
+        err = ATT_FAIL;
+        if (restore_page(task, &page_restore) != KERN_SUCCESS) {
+            err = ATT_UNKNOWN_STATE;
+        }
+        goto out;
     }
 
     pthread_t s_exc_thread;
     if (pthread_create(&s_exc_thread, NULL, exception_server_thread,
             &exception_port) != 0) {
         log_err("pthread_create");
-        // TODO: uninstall exc handlers, remove breakpoint
-        return ATT_UNKNOWN_STATE;
+        err = ATT_FAIL;
+        if (restore_page(task, &page_restore) != KERN_SUCCESS) {
+            err = ATT_UNKNOWN_STATE;
+        }
+        goto out;
     }
 
     if (dispatch_semaphore_wait(sync_sema,
                     dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC)) != 0) {
         log_err("timed out after 2s waiting for pthread_create");
-        // TODO: uninstall exc handlers, remove breakpoint
-        return ATT_UNKNOWN_STATE;
+        err = ATT_FAIL;
+        if (restore_page(task, &page_restore) != KERN_SUCCESS) {
+            err = ATT_UNKNOWN_STATE;
+        }
+        goto out;
     }
 
     fprintf(stderr, "Waiting for process to reach safepoint...\n");
     if ((kr = task_resume(task)) != KERN_SUCCESS) {
         log_mach("task_resume", kr);
-        return ATT_UNKNOWN_STATE;
+        err = ATT_FAIL;
+        if (restore_page(task, &page_restore) != KERN_SUCCESS) {
+            err = ATT_UNKNOWN_STATE;
+        }
+        goto out;
     }
 
     if (dispatch_semaphore_wait(sync_sema,
-                dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC)) != 0) {
+                dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) != 0) {
+        // TODO: CAS an atomic to avoid race with exc handler
         // This is quite likely, so we restore the written page before exiting
-        if ((kr = task_suspend(task)) != 0) {
-            log_mach("task_suspend", kr);
+        kr = suspend_and_restore_page(task, &g_breakpoint_restore);
+        log_err("timed out after 30s waiting to hit breakpoint");
+        err = ATT_FAIL;
+        if (kr != KERN_SUCCESS) {
+            err = ATT_UNKNOWN_STATE;
         }
-        int kr2;
-        if ((kr2 = restore_page(task, &g_breakpoint_restore)) != 0) {
-            log_mach("restore_page", kr2);
-        }
-        log_err("timed out after 20s waiting for exception");
-        if (kr != KERN_SUCCESS || kr2 != KERN_SUCCESS) {
-            return ATT_UNKNOWN_STATE;
-        }
+        // It seems like here, we are forgetting to resume the task...
+
         // Assuming no race with the exception handler, (which we will ensure
         // in the future), we're back to original state.
-        // TODO:... we need to also unset the exception handler here.
-        return ATT_FAIL;
+        goto out;
     }
 
     // check error code set in the exception handler.
-    int err = g_err;
+    err = g_err;
 
+    if (err == ATT_INTERRUPTED) {
+        kr = suspend_and_restore_page(task, &g_breakpoint_restore);
+        if (kr != KERN_SUCCESS) {
+            err = ATT_UNKNOWN_STATE;
+        } else {
+            fprintf(stderr, "Cancelled\n");
+        }
+    }
+
+out:
     // uninstall exception handlers
     for (int i = 0; i < old_exc_ports.count; i++) {
         kr = task_set_exception_ports(task,
@@ -774,8 +878,24 @@ attach_and_execute(const int pid, const char* python_code)
                 old_exc_ports.flavors[i]);
         if (kr != KERN_SUCCESS) {
             log_mach("task_set_exception_ports", kr);
-            return ATT_UNKNOWN_STATE;
+            err = ATT_UNKNOWN_STATE;
         }
+    }
+
+    if (shutdown_signal_thread(t_sig_handler) != 0) {
+        log_err("shutdown_signal_thread");
+    }
+
+    if (sync_sema) {
+        dispatch_release(sync_sema);
+        sync_sema = NULL;
+    }
+
+restore_mask:
+    if ((errno = pthread_sigmask(SIG_SETMASK, &old_mask, NULL))) {
+        // We're leaving our process in an inconsistent state. We should die!
+        log_err("pthread_sigmask");
+        exit(1);
     }
 
     return err;

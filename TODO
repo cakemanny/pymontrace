@@ -14,6 +14,10 @@ In priority order:
       1. don't crash the interpreter on error
       2. know whether there was an error (trap after call)
 
+- [ ] Make attach_and_execute re-entrant.
+      We could use thread local storage. On darwin, the returning of the
+      error code may be hard, since it uses two threads.
+
 - [o] Factor code into tracer and tracee parts
 - [ ] add a -w 'unsafe' flag, and then make the default mode safe
 

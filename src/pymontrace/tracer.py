@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import inspect
 import os
 import pathlib
@@ -104,14 +105,39 @@ class CommsFile:
             self.localpath = self.remotepath
 
 
-def create_and_bind_socket(comms: CommsFile) -> socket.socket:
-    ss = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+def is_own_process(pid: int):
+    if sys.platform == 'linux':
+        # Will this work if it's in a container ??
+        with open(f'/proc/{pid}/loginuid') as f:
+            target_uid = int(f.read().strip())
+            return target_uid == os.getuid()
+    elif sys.platform == 'darwin':
+        # TODO
+        return False  # because we have to use sudo anyway
+        raise NotImplementedError
+    else:
+        raise NotImplementedError
+
+
+@contextmanager
+def set_umask(target_pid: int):
     # TODO: only do this if we're not the owner of the process.
     # maybe it makes sense to set. (Linux: /proc/pid/loginuid, macos:
     # sysctl with KERN_PROC, KERN_PROC_UID , ...
-    saved_umask = os.umask(0o000)
-    ss.bind(comms.localpath)
-    os.umask(saved_umask)
+    if not is_own_process(target_pid):
+        saved_umask = os.umask(0o000)
+        try:
+            yield
+        finally:
+            os.umask(saved_umask)
+    else:
+        yield
+
+
+def create_and_bind_socket(comms: CommsFile, pid: int) -> socket.socket:
+    ss = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    with set_umask(pid):
+        ss.bind(comms.localpath)
     ss.listen(0)
     return ss
 

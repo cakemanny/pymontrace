@@ -104,9 +104,11 @@ def safe_eval(action: CodeType, frame: FrameType, snippet: str):
             'pmt': pmt,
         })
     except Exception:
-        print('Probe action failed', file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-        print(textwrap.indent(snippet, 4 * ''), file=sys.stderr)
+        buf = io.StringIO()
+        print('Probe action failed', file=buf)
+        traceback.print_exc(file=buf)
+        print(textwrap.indent(snippet, 4 * ''), file=buf)
+        pmt.print(buf.getvalue(), end='', file=sys.stderr)
 
 
 # Handlers for 3.11 and earlier

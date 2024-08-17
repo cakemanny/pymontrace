@@ -18,20 +18,22 @@ parser.add_argument(
     '-c', dest='pyprog',
     help='a python script to run and trace')
 parser.add_argument(
-    '-p', dest='pid',
+    '-p', dest='pid', type=int,
     help='pid of a python process to attach to',
-    type=int,
 )
+# used internally for handling -c',
 parser.add_argument(
     '-X', dest='subproc',
-    help='used internally for handling -c')
+    help=argparse.SUPPRESS,
+)
 parser.add_argument(
-    'probe',
-    type=parse_probe,
-    help='Example: line:script.py:13')
+    'probe', type=parse_probe,
+    help='Example: line:script.py:13',
+)
 parser.add_argument(
     'action',
-    help='a python expression to evaluate each time the probe site is reached')
+    help='a python expression to evaluate each time the probe site is reached',
+)
 
 
 def force_unlink(path):
@@ -52,13 +54,14 @@ def receive_and_print_until_interrupted(s: socket.socket):
 
 
 def tracepid(pid: int, probe, action: str):
+    os.kill(pid, 0)
 
     site_extension = tracer.install_pymontrace(pid)
 
     comms = CommsFile(pid)
     atexit.register(force_unlink, comms.localpath)
 
-    with create_and_bind_socket(comms) as ss:
+    with create_and_bind_socket(comms, pid) as ss:
         # requires sudo on mac
         pymontrace.attacher.attach_and_exec(
             pid,
@@ -103,7 +106,7 @@ def tracesubprocess(progpath: str, probe, action):
     comms = CommsFile(p.pid)
     atexit.register(force_unlink, comms.localpath)
 
-    with create_and_bind_socket(comms) as ss:
+    with create_and_bind_socket(comms, p.pid) as ss:
         s, _ = ss.accept()
         os.unlink(comms.localpath)
 
