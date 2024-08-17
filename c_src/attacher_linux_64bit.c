@@ -236,6 +236,7 @@ elf_find_symbol(
             symtab_idx = i;
         }
     }
+    if (symtab_idx) {} /* unused, we've not needed to find static symbols yet */
 
     Elf64_Sym target = {};
 
@@ -445,6 +446,36 @@ find_pyfn(pid_t pid, const char* symbol)
     return find_symbol(pid, symbol, "python");
 }
 
+
+/* returns -1 on error */
+static pid_t
+wait_for_stop(pid_t pid, int signo)
+{
+    int wstatus = 0;
+    for (;;) {
+        // TODO: timeout
+        pid_t tid;
+        if ((tid = waitpid(pid, &wstatus, 0)) == -1) {
+            int esaved = errno;
+            perror("waitpid");
+            errno = esaved;
+            return -1;
+        }
+
+        if (!WIFSTOPPED(wstatus)) {
+            fprintf(stderr, "WIFEXITED(wstatus)=%d, WIFSIGNALED(wstatus)=%d\n",
+                    WIFEXITED(wstatus), WIFSIGNALED(wstatus));
+            return -1;
+        }
+        if (WIFSTOPPED(wstatus) && WSTOPSIG(wstatus) != signo) {
+            ptrace(PTRACE_CONT, tid, 0, WSTOPSIG(wstatus));
+            continue;
+        }
+        return tid;
+    }
+}
+
+
 /*
  * ptrace pokedata takes a machine word, i.e. 64 bits. so we create
  * useful union to cast it into bytes or half-words, whatever is useful.
@@ -467,7 +498,8 @@ save_instrs(pid_t pid, word_of_instr_t* psaved, uintptr_t addr)
         .iov_base = (void*)addr,
         .iov_len = sizeof *psaved,
     };
-    if (process_vm_readv(pid, &local, 1, &remote, 1, 0) != remote.iov_len) {
+    if (process_vm_readv(pid, &local, 1, &remote, 1, 0)
+            != (ssize_t)remote.iov_len) {
         perror("process_vm_readv");
         return ATT_FAIL;
     }
@@ -590,18 +622,9 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t bp_addr, uintptr_t* addr)
         goto restore_instuctions;
     }
 
-    // This waits until the next signal, which will be the breakpoint
-    // hopefully. But maybe it's the syscall?
-    int wstatus;
-    if ((tid = waitpid(pid, &wstatus, 0)) == -1) {
-        perror("waitpid");
+    if ((tid = wait_for_stop(pid, SIGTRAP)) == -1) {
         err = ATT_UNKNOWN_STATE;
         goto restore_instuctions;
-    }
-    if (!WIFSTOPPED(wstatus) || WSTOPSIG(wstatus) != SIGTRAP) {
-        // We should bail if this is not the breakpoint signal at this point
-        fprintf(stderr, "WIFSTOPPED(status) = %d, WSTOPSIG(wstatus)= %d\n",
-                WIFSTOPPED(wstatus), WSTOPSIG(wstatus));
     }
 
     if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_PRSTATUS, &iov_mmap)) {
@@ -727,16 +750,9 @@ call_pyfn_in_target(
         goto restore_instuctions;
     }
 
-    // This waits until the next signal, which will be the breakpoint
-    // hopefully.
-    int wstatus;
-    if ((tid = waitpid(pid, &wstatus, 0)) == -1) {
-        perror("waitpid");
+    if ((tid = wait_for_stop(pid, SIGTRAP)) == -1) {
         err = ATT_UNKNOWN_STATE;
         goto restore_instuctions;
-    }
-    if (!WIFSTOPPED(wstatus)) {
-        fprintf(stderr, "TODO: not WIFSTOPPED(status)\n");
     }
 
     if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_PRSTATUS, &iov_call)) {
@@ -766,6 +782,54 @@ restore_instuctions:
 }
 
 
+static int
+exec_python_code(pid_t pid, pid_t tid, const char* python_code)
+{
+    int err;
+    // There is a build-id at the start of glibc that we can overwrite
+    // temporarily (idea from the readme of kubo/injector)
+    uintptr_t libc_start_addr = find_libc_start(pid);
+    if (libc_start_addr == 0) {
+        fprintf(stderr, "could not find libc\n");
+        return ATT_FAIL;
+    }
+    log_dbg("libc_start_addr = %lx\n", libc_start_addr);
+
+
+    // This is the point at which we can start to do our work.
+    uintptr_t mapped_addr = 0;
+    if ((err = call_mmap_in_target(pid, tid, libc_start_addr, &mapped_addr)) != 0) {
+        fprintf(stderr, "call_mmap_in_target failed\n");
+        return err;
+    }
+
+    ssize_t len = (1 + strlen(python_code));
+    // safe to cast away const here as process_vm_writev doesn't modify
+    // the local memory.
+    struct iovec local = { .iov_base = (char*)python_code, .iov_len=len };
+    struct iovec remote = { .iov_base = (void*)mapped_addr, .iov_len=len };
+    if (process_vm_writev(pid, &local, 1, &remote, 1, 0) != len) {
+        perror("process_vm_writev");
+        return ATT_FAIL;
+    }
+
+    uint64_t PyRun_SimpleString = find_pyfn(pid, "PyRun_SimpleString");
+    if (PyRun_SimpleString == 0) {
+        fprintf(stderr, "unable to find %s\n", "PyRun_SimpleString");
+        return ATT_FAIL;
+    }
+
+    if ((err = call_pyfn_in_target(pid, tid, libc_start_addr,
+                    PyRun_SimpleString, mapped_addr)) != 0) {
+        fprintf(stderr, "call PyRun_SimpleString in target failed\n");
+        return err;
+    }
+
+    // TODO: munmap (requires setting the breakpoint in the function passed
+    // to Py_AddPendingCall)
+    return 0;
+}
+
 int
 attach_and_execute(const int pid, const char* python_code)
 {
@@ -786,23 +850,11 @@ attach_and_execute(const int pid, const char* python_code)
         return ATT_FAIL;
     }
 
-    // TODO: timeout
-    // Use waitid?
-    int wstatus = 0;
-    pid_t tid;
-    if ((tid = waitpid(pid, &wstatus, 0)) == -1) {
-        perror("waitpid");
+    if (wait_for_stop(pid, SIGSTOP) == -1) {
         return ATT_UNKNOWN_STATE;
     }
 
-    // TODO: loop and resupply signals until it's the correct one?
-    if (!WIFSTOPPED(wstatus)) {
-        fprintf(stderr, "WIFEXITED(wstatus)=%d, WIFSIGNALED(wstatus)=%d\n",
-                WIFEXITED(wstatus), WIFSIGNALED(wstatus));
-        return ATT_UNKNOWN_STATE;
-    }
-
-    // TODO: consider setting hardware a breakpoint instead.
+    // TODO: consider setting a hardware breakpoint instead.
 
     word_of_instr_t saved_instrs = {};
     if (save_instrs(pid, &saved_instrs, breakpoint_addr) != 0) {
@@ -820,7 +872,7 @@ attach_and_execute(const int pid, const char* python_code)
     #elif defined(__x86_64__)
         breakpoint_instrs.c_bytes[0] = DEBUG_TRAP_INSTR;
     #endif
-    if (-1 == ptrace(PTRACE_POKETEXT, tid, breakpoint_addr,
+    if (-1 == ptrace(PTRACE_POKETEXT, pid, breakpoint_addr,
                 breakpoint_instrs.u64)) {
         perror("ptrace(PTRACE_POKETEXT, ...)");
         return ATT_FAIL;
@@ -828,31 +880,23 @@ attach_and_execute(const int pid, const char* python_code)
 
     // TODO: we need to protect ourselves from signals here
     fprintf(stderr, "Waiting for process to reach safepoint...\n");
-    if (ptrace(PTRACE_CONT, tid, 0, 0) == -1) {
+    if (ptrace(PTRACE_CONT, pid, 0, 0) == -1) {
         perror("ptrace(PTRACE_CONT, ...)");
         err = ATT_UNKNOWN_STATE;
         goto detach;
     }
 
-    // This waits until the next signal, which will be the breakpoint
-    // hopefully.
-    if ((tid = waitpid(pid, &wstatus, 0)) == -1) {
+    pid_t tid;
+    if ((tid = wait_for_stop(pid, SIGTRAP)) == -1) {
         // If this gets interrupted (EINTR), it means the user is impatient.
         // We would be better to remove the trap instruction before leaving.
-        perror("waitpid");
         fprintf(stderr, "Cancelling...\n");
         if (kill(pid, SIGSTOP) == -1) {
             perror("kill");
             err = ATT_UNKNOWN_STATE;
             goto detach;
         }
-        if ((tid = waitpid(pid, &wstatus, 0)) == -1) {
-            perror("waitpid");
-            err = ATT_UNKNOWN_STATE;
-            goto detach;
-        }
-        if (!WIFSTOPPED(wstatus) || WSTOPSIG(wstatus) != SIGSTOP) {
-            log_err("not stopped with SIGSTOP");
+        if ((tid = wait_for_stop(pid, SIGSTOP)) == -1) {
             err = ATT_UNKNOWN_STATE;
             goto detach;
         }
@@ -865,11 +909,6 @@ attach_and_execute(const int pid, const char* python_code)
         fprintf(stderr, "attacher: cancelled.\n");
         err = ATT_FAIL;
         goto detach;
-    }
-    if (!WIFSTOPPED(wstatus) || WSTOPSIG(wstatus) != SIGTRAP) {
-        // TODO, loop until correct signal, or use the newer apis
-        fprintf(stderr, "WIFSTOPPED(status) = %d, WSTOPSIG(wstatus)= %d\n",
-                WIFSTOPPED(wstatus), WSTOPSIG(wstatus));
     }
 
     // TODO: we should check the PC that it's at (or just after) the
@@ -910,55 +949,10 @@ attach_and_execute(const int pid, const char* python_code)
     }
 #endif // defined(__x86_64__)
 
-    // TODO: extract from here to detach into a function
-
-    // There is a build-id at the start of glibc that we can overwrite
-    // temporarily (idea from the readme of kubo/injector)
-    uintptr_t libc_start_addr = find_libc_start(pid);
-    if (libc_start_addr == 0) {
-        fprintf(stderr, "could not find libc\n");
-        err = ATT_FAIL;
+    if ((err = exec_python_code(pid, tid, python_code)) != 0) {
+        // ... actually it's verbose enough
         goto detach;
     }
-    log_dbg("libc_start_addr = %lx\n", libc_start_addr);
-
-
-    // This is the point at which we can start to do our work.
-    uintptr_t mapped_addr = 0;
-    if ((err = call_mmap_in_target(pid, tid, libc_start_addr, &mapped_addr)) != 0) {
-        fprintf(stderr, "call_mmap_in_target failed\n");
-        goto detach;
-    }
-
-
-    {
-        ssize_t len = (1 + strlen(python_code));
-        // safe to cast away const here as process_vm_writev doesn't modify
-        // the local memory.
-        struct iovec local = { .iov_base = (char*)python_code, .iov_len=len };
-        struct iovec remote = { .iov_base = (void*)mapped_addr, .iov_len=len };
-        if (process_vm_writev(pid, &local, 1, &remote, 1, 0) != len) {
-            perror("process_vm_writev");
-            err = ATT_FAIL;
-            goto detach;
-        }
-    }
-
-    uint64_t PyRun_SimpleString = find_pyfn(pid, "PyRun_SimpleString");
-    if (PyRun_SimpleString == 0) {
-        fprintf(stderr, "unable to find %s\n", "PyRun_SimpleString");
-        err = ATT_FAIL;
-        goto detach;
-    }
-
-    if ((err = call_pyfn_in_target(pid, tid, libc_start_addr,
-                    PyRun_SimpleString, mapped_addr)) != 0) {
-        fprintf(stderr, "call PyRun_SimpleString in target failed\n");
-        goto detach;
-    }
-
-    // TODO: munmap (requires setting the breakpoint in the function passed
-    // to Py_AddPendingCall)
 
 detach:
 
