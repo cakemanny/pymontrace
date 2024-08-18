@@ -1,10 +1,11 @@
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <libgen.h>
 
 #include <dlfcn.h>
+#include <libgen.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/errno.h>
@@ -39,7 +40,9 @@ const bool debug = false;
 
 static dispatch_semaphore_t sync_sema;
 
-static int g_err; /* failure state from exc handler */
+// Note we don't use atomic routines to set this when setting it
+// just before using the semaphore.
+static _Atomic int g_err; /* failure state from exc handler */
 
 typedef struct {
     vm_address_t    page_addr;
@@ -344,17 +347,24 @@ catch_mach_exception_raise_state_identity(
 
     uint64_t pc = arm_thread_state64_get_pc(*state);
     if (pc >= r->page_addr && pc < r->page_addr + r->pagesize) {
-        // TODO: we should take some sort of lock to avoid a race condition
-        // with the timeout code.
         /*
          * Restore overwritten instruction
          */
         kr = restore_page(task, &g_breakpoint_restore);
         if (kr != KERN_SUCCESS) {
             log_mach("restore_page", kr);
-            g_err = ATT_UNKNOWN_STATE;
+            atomic_store(&g_err , ATT_UNKNOWN_STATE);
             dispatch_semaphore_signal(sync_sema);
             return KERN_FAILURE; /* I think it'll die anyway */
+        }
+
+        // This is our last chance to bail.
+        int expected = 0;
+        if (!atomic_compare_exchange_strong(&g_err, &expected,
+                    ATT_UNKNOWN_STATE)) {
+            // Either the timeout or a signal beat us but wasn't finished
+            // restoring the page. They can still continue though.
+            return KERN_SUCCESS;
         }
 
         /* copy in code and data for hijack */
@@ -547,9 +557,21 @@ signal_handler_thread(void *arg)
             // Used internally to shut down this thread.
             return NULL;
         } else {
-            // todo: maybe use stdatomic for g_err instead to avoid race
-            g_err = ATT_INTERRUPTED;
-            dispatch_semaphore_signal(sync_sema);
+            int expected = 0;
+            if (atomic_compare_exchange_strong(&g_err, &expected,
+                        ATT_INTERRUPTED)) {
+                dispatch_semaphore_signal(sync_sema);
+            } else {
+                fprintf(stderr,
+                        "Hold on a mo, we're in the middle of surgery. "
+                        "Will be done in a few seconds.\n");
+                // Are we supposed to redeliver the signal to ourselves
+                // in order to be cancelled after we unblock?
+                if (raise(signo) == -1) { // doesn't seem to work.
+                    log_err("failed to re-raise signal");
+                }
+                return NULL;
+            }
         }
     }
 }
@@ -720,6 +742,32 @@ find_needed_python_funcs(task_t task)
 }
 
 
+static int
+wait_for_probe_installation(dispatch_semaphore_t sync_sema, int timeout_s)
+{
+    int err;
+
+    __auto_type initial_timeout =
+        dispatch_time(DISPATCH_TIME_NOW, timeout_s * NSEC_PER_SEC);
+    __auto_type timeout2 = dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC);
+
+    err = dispatch_semaphore_wait(sync_sema, initial_timeout);
+    if (err != 0) {
+        int expected = 0;
+        if (!atomic_compare_exchange_strong(&g_err, &expected,
+                    ATT_INTERRUPTED)) {
+            fprintf(stderr, "Waiting 10s more as it seems we're making "
+                    "progress\n");
+            if (0 == dispatch_semaphore_wait(sync_sema, timeout2)) {
+                return 0;
+            }
+        }
+        return err;
+    }
+    return 0;
+}
+
+
 int
 attach_and_execute(const int pid, const char* python_code)
 {
@@ -727,6 +775,8 @@ attach_and_execute(const int pid, const char* python_code)
 
     // TODO: This code is hilariously non-reentrant. Find a way to
     // protect it. or make it reentrant.
+
+    g_err = 0; // Have to restore this to 0
 
     task_t task = TASK_NULL;
     kern_return_t kr;
@@ -805,6 +855,13 @@ attach_and_execute(const int pid, const char* python_code)
         log_dbg("region.protection = %s", prot_str);
     }
 
+
+    sync_sema = dispatch_semaphore_create(0);
+    if (!sync_sema) {
+        log_err("dispatch_semaphore_create");
+        return ATT_FAIL;
+    }
+
     /*
      * Now we enter the critical section, so we block signals until
      * we've set things up and are in a good state to reverse them
@@ -857,16 +914,6 @@ attach_and_execute(const int pid, const char* python_code)
         goto restore_mask;
     }
 
-    // FIXME: call dispatch_release
-    sync_sema = dispatch_semaphore_create(0);
-    if (!sync_sema) {
-        log_err("dispatch_semaphore_create");
-        err = ATT_FAIL;
-        if (restore_page(task, &page_restore) != KERN_SUCCESS) {
-            err = ATT_UNKNOWN_STATE;
-        }
-        goto out;
-    }
 
     pthread_t s_exc_thread;
     if (pthread_create(&s_exc_thread, NULL, exception_server_thread,
@@ -899,13 +946,11 @@ attach_and_execute(const int pid, const char* python_code)
         goto out;
     }
 
-    if (dispatch_semaphore_wait(sync_sema,
-                dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) != 0) {
-        // TODO: CAS an atomic to avoid race with exc handler
-        // This is quite likely, so we restore the written page before exiting
+    if (wait_for_probe_installation(sync_sema, 30) != 0) {
         kr = suspend_and_restore_page(task, &g_breakpoint_restore);
-        log_err("timed out after 30s waiting to hit breakpoint");
-        err = ATT_FAIL;
+        log_err("timed out after 30s waiting to reach safe point");
+        err = atomic_load(&g_err);
+        if (err == 0) { abort(); }; // bug in concurrency code.
         if (kr != KERN_SUCCESS) {
             err = ATT_UNKNOWN_STATE;
         }
@@ -946,16 +991,15 @@ out:
         log_err("shutdown_signal_thread");
     }
 
-    if (sync_sema) {
-        dispatch_release(sync_sema);
-        sync_sema = NULL;
-    }
-
 restore_mask:
     if ((errno = pthread_sigmask(SIG_SETMASK, &old_mask, NULL))) {
         // We're leaving our process in an inconsistent state. We should die!
         log_err("pthread_sigmask");
         exit(1);
+    }
+    if (sync_sema) {
+        dispatch_release(sync_sema);
+        sync_sema = NULL;
     }
 
     return err;
