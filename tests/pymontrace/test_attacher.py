@@ -35,8 +35,6 @@ def test_attach_and_exec():
 
 
 def test_attach_and_exec__bad_code():
-    if sys.platform == 'darwin':
-        pytest.skip(reason='work in progress')
     from pymontrace import attacher
 
     with subprocess.Popen(
