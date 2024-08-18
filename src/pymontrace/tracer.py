@@ -113,8 +113,14 @@ def get_proc_euid(pid: int):
         return _darwin.get_euid(_darwin.kern_proc_info(pid))
     if sys.platform == 'linux':
         # Will this work if it's in a container ??
-        with open(f'/proc/{pid}/loginuid') as f:
-            return int(f.read().strip())
+        with open(f'/proc/{pid}/status') as f:
+            for line in f:
+                if line.startswith('Uid:'):
+                    # Linux: fs/proc/array.c (or
+                    #        Documentation/filesystems/proc.rst)
+                    # Uid:	uid	euid	suid	fsuid
+                    return int(line.split('\t')[2])
+            return None
     raise NotImplementedError
 
 

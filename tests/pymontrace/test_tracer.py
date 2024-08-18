@@ -58,4 +58,5 @@ def test_get_proc_euid():
     from pymontrace.tracer import get_proc_euid
 
     assert get_proc_euid(os.getpid()) == os.geteuid()
+    # This is probably not always true. e.g. in many linux containers
     assert get_proc_euid(1) == 0
