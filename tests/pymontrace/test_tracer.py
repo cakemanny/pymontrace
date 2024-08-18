@@ -52,3 +52,10 @@ def test_to_remote_path():
 
     assert to_remote_path(1, '/tmp') == '/tmp'
     assert to_remote_path(1, '/proc/1/root/tmp') == '/tmp'
+
+
+def test_get_proc_euid():
+    from pymontrace.tracer import get_proc_euid
+
+    assert get_proc_euid(os.getpid()) == os.geteuid()
+    assert get_proc_euid(1) == 0

@@ -411,7 +411,6 @@ catch_mach_exception_raise_state_identity(
 
         arm_thread_state64_t* state = (arm_thread_state64_t*)new_state;
 
-        // we're gonna die!
         state->__x[0] = cb_addr;
         state->__x[1] = allocated + 16;
         state->__x[16] = fn_addr;

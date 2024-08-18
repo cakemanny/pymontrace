@@ -9,6 +9,7 @@ import sys
 import textwrap
 from tempfile import TemporaryDirectory
 
+from pymontrace import _darwin
 
 def parse_probe(probe_spec):
     probe_name, probe_args = probe_spec.split(':', 1)
@@ -105,25 +106,27 @@ class CommsFile:
             self.localpath = self.remotepath
 
 
-def is_own_process(pid: int):
+def get_proc_euid(pid: int):
+    if sys.platform == 'darwin':
+        # A subprocess alternative would be:
+        #   ps -o uid= -p PID
+        return _darwin.get_euid(_darwin.kern_proc_info(pid))
     if sys.platform == 'linux':
         # Will this work if it's in a container ??
         with open(f'/proc/{pid}/loginuid') as f:
-            target_uid = int(f.read().strip())
-            return target_uid == os.getuid()
-    elif sys.platform == 'darwin':
-        # TODO
-        return False  # because we have to use sudo anyway
-        raise NotImplementedError
-    else:
-        raise NotImplementedError
+            return int(f.read().strip())
+    raise NotImplementedError
+
+
+def is_own_process(pid: int):
+    # euid is the one used to decide on access permissions.
+    return get_proc_euid(pid) == os.geteuid()
 
 
 @contextmanager
 def set_umask(target_pid: int):
-    # TODO: only do this if we're not the owner of the process.
-    # maybe it makes sense to set. (Linux: /proc/pid/loginuid, macos:
-    # sysctl with KERN_PROC, KERN_PROC_UID , ...
+    # A future idea could be to get the gid of the target
+    # and give their group group ownership.
     if not is_own_process(target_pid):
         saved_umask = os.umask(0o000)
         try:
