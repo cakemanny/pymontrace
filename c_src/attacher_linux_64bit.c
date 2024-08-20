@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include <fcntl.h>
+#include <dirent.h>
 #include <sys/errno.h>
 #include <sys/mman.h>
 #include <sys/param.h>
@@ -50,7 +51,7 @@
 #endif
 
 
-#define log_err(fmt, ...) fprintf(stderr, "[error]: " fmt "\n", ##__VA_ARGS__)
+#define log_err(fmt, ...) fprintf(stderr, "attacher: " fmt "\n", ##__VA_ARGS__)
 
 // Always define debug to avoid warnings about use vs non-use.
 #ifdef NDEBUG
@@ -476,6 +477,93 @@ wait_for_stop(pid_t pid, int signo)
     }
 }
 
+struct tgt_thrd {
+    pid_t tid;
+    int wstatus;
+};
+
+static int
+get_threads(pid_t pid, struct tgt_thrd* thrd, int *numthrds)
+{
+    char pathname[80] = {};
+    snprintf(pathname, sizeof pathname, "/proc/%d/task", pid);
+    DIR* dir = opendir(pathname);
+
+    errno = 0;
+    int i = 0;
+    for (struct dirent* ent; (ent = readdir(dir)) != NULL; errno = 0, i++) {
+        int tid = atoi(ent->d_name);
+        if (tid == 0) { --i; continue; }
+        if (*numthrds == 0) {
+            continue;
+        }
+        if (i >= *numthrds) {
+            fprintf(stderr, "too many threads");
+            return 1;
+        }
+        fprintf(stderr, "%s\n", ent->d_name);
+        thrd[i].tid = tid;
+    }
+    if (errno != 0) {
+        perror("readdir"); return 1;
+    }
+    *numthrds = i;
+    return 0;
+}
+
+
+__attribute__((unused))
+static int
+attach_threads(struct tgt_thrd* thrds, int count)
+{
+    int err = 0;
+
+    int i = 0;
+    for (; i < count; i++) {
+        __auto_type t = &thrds[i];
+        if ((err = ptrace(PTRACE_ATTACH, t->tid, 0, 0)) == -1) {
+            perror("ptrace attach");
+            goto error;
+        }
+
+        int err = waitpid(t->tid, &t->wstatus, 0);
+        if (err == -1) {
+            perror("waitpid");
+            goto error;
+        }
+        // TODO: factor in wait_for_stop
+        if (!WIFSTOPPED(t->wstatus) || WSTOPSIG(t->wstatus) != SIGSTOP) {
+            fprintf(stderr, "not SIGSTOP\n"); return 1;
+            err = 1;
+            goto error;
+        }
+
+    }
+    return 0;
+
+error:
+    for (; i > 0; i--) {
+        err = ptrace(PTRACE_DETACH, thrds[i].tid, 0, 0);
+        if (err == -1) {
+            perror("ptrace detach");
+        }
+    }
+    return err;
+}
+
+__attribute__((unused))
+static int
+detach_threads(struct tgt_thrd* thrds, int count)
+{
+    int err = 0;
+    for (int i = 0; i < count; i++) {
+        err = ptrace(PTRACE_DETACH, thrds[i].tid, 0, 0);
+        if (err == -1) {
+            perror("ptrace detach");
+        }
+    }
+    return err;
+}
 
 /*
  * ptrace pokedata takes a machine word, i.e. 64 bits. so we create
@@ -926,6 +1014,17 @@ attach_and_execute(const int pid, const char* python_code)
     int err = 0;
 
     // TODO: check python_code size < page size
+
+    int nthreads = 0;
+    err = get_threads(pid, NULL, &nthreads);
+    if (err != 0) {
+        return ATT_FAIL;
+    }
+    if (nthreads != 1) {
+        log_err("target has %d threads, multiple target threads are not yet "
+                "supported", nthreads);
+        return ATT_FAIL;
+    }
 
     uintptr_t breakpoint_addr = find_pyfn(pid, SAFE_POINT);
     if (breakpoint_addr == 0) {
