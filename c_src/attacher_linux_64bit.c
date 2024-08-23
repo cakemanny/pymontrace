@@ -53,7 +53,7 @@
 
 #define log_err(fmt, ...) fprintf(stderr, "attacher: " fmt "\n", ##__VA_ARGS__)
 
-// Always define debug to avoid warnings about use vs non-use.
+// Always define debug to avoid warnings about non-use.
 #ifdef NDEBUG
 const int debug = 0;
 #else
@@ -307,7 +307,7 @@ find_libc_start(pid_t pid)
 
     FILE* f = fopen(mapspath, "r");
     if (!f) {
-        perror("fopen"); // need mapspath ?
+        log_err("fopen: %s: %s", mapspath, strerror(errno));
         return 0;
     }
 
@@ -359,7 +359,7 @@ in_other_mount_ns(pid_t pid)
     snprintf(rootpath, sizeof rootpath, "/proc/%d/root/", pid);
     struct stat pid_root_stat = {};
     if (stat(rootpath, &pid_root_stat) == -1) {
-        perror("stat");
+        log_err("stat: %s: %s", rootpath, strerror(errno));
         return false;
     }
 
@@ -377,7 +377,7 @@ find_symbol(pid_t pid, const char* symbol, const char* fnsrchstr)
 
     FILE* f = fopen(mapspath, "r");
     if (!f) {
-        perror("fopen"); // need mapspath ?
+        log_err("fopen: %s: %s", mapspath, strerror(errno));
         return 0;
     }
 
@@ -414,8 +414,7 @@ find_symbol(pid_t pid, const char* symbol, const char* fnsrchstr)
             continue;
         }
         if (err != 0) {
-            fprintf(stderr, "attacher: error reading %s (%d)\n",
-                    prefixed_path, err);
+            log_err("error reading %s (%d)", prefixed_path, err);
             continue;
         }
 
@@ -451,26 +450,34 @@ find_pyfn(pid_t pid, const char* symbol)
 
 /* returns -1 on error */
 static pid_t
-wait_for_stop(pid_t pid, int signo)
+wait_for_stop(pid_t pid, int signo, int* pwstatus)
 {
     int wstatus = 0;
+    if (!pwstatus) {
+        pwstatus = &wstatus;
+    }
     for (;;) {
-        // TODO: timeout
+        // TODO: timeout ?
         pid_t tid;
-        if ((tid = waitpid(pid, &wstatus, 0)) == -1) {
+        if ((tid = waitpid(pid, pwstatus, 0)) == -1) {
             int esaved = errno;
-            perror("waitpid");
+            log_err("waitpid: %d: %s", pid, strerror(errno));
             errno = esaved;
             return -1;
         }
 
-        if (!WIFSTOPPED(wstatus)) {
+        if (!WIFSTOPPED(*pwstatus)) {
             fprintf(stderr, "WIFEXITED(wstatus)=%d, WIFSIGNALED(wstatus)=%d\n",
-                    WIFEXITED(wstatus), WIFSIGNALED(wstatus));
+                    WIFEXITED(*pwstatus), WIFSIGNALED(*pwstatus));
             return -1;
         }
-        if (WIFSTOPPED(wstatus) && WSTOPSIG(wstatus) != signo) {
-            ptrace(PTRACE_CONT, tid, 0, WSTOPSIG(wstatus));
+        if (WIFSTOPPED(*pwstatus) && WSTOPSIG(*pwstatus) != signo) {
+            if (ptrace(PTRACE_CONT, tid, 0, WSTOPSIG(*pwstatus)) == -1) {
+                int esaved = errno;
+                log_err("ptrace cont: %d: %s", tid, strerror(errno));
+                errno = esaved;
+                return -1;
+            }
             continue;
         }
         return tid;
@@ -498,21 +505,20 @@ get_threads(pid_t pid, struct tgt_thrd* thrd, int *numthrds)
             continue;
         }
         if (i >= *numthrds) {
-            fprintf(stderr, "too many threads");
+            log_err("too many threads");
             return 1;
         }
-        fprintf(stderr, "%s\n", ent->d_name);
         thrd[i].tid = tid;
     }
     if (errno != 0) {
-        perror("readdir"); return 1;
+        log_err("readdir: %s: ", strerror(errno));
+        return 1;
     }
     *numthrds = i;
     return 0;
 }
 
 
-__attribute__((unused))
 static int
 attach_threads(struct tgt_thrd* thrds, int count)
 {
@@ -521,37 +527,33 @@ attach_threads(struct tgt_thrd* thrds, int count)
     int i = 0;
     for (; i < count; i++) {
         __auto_type t = &thrds[i];
-        if ((err = ptrace(PTRACE_ATTACH, t->tid, 0, 0)) == -1) {
-            perror("ptrace attach");
+        if ((err = ptrace(PTRACE_SEIZE, t->tid, 0, 0)) == -1) {
+            log_err("ptrace attach: tid=%d: %s", t->tid, strerror(errno));
+            goto error;
+        }
+        if ((err = ptrace(PTRACE_INTERRUPT, t->tid, 0, 0)) == -1) {
+            log_err("ptrace interrupt: tid=%d: %s", t->tid, strerror(errno));
             goto error;
         }
 
-        int err = waitpid(t->tid, &t->wstatus, 0);
-        if (err == -1) {
-            perror("waitpid");
+        if ((err = wait_for_stop(t->tid, SIGTRAP, &t->wstatus)) == -1) {
             goto error;
         }
-        // TODO: factor in wait_for_stop
-        if (!WIFSTOPPED(t->wstatus) || WSTOPSIG(t->wstatus) != SIGSTOP) {
-            fprintf(stderr, "not SIGSTOP\n"); return 1;
-            err = 1;
-            goto error;
-        }
-
     }
     return 0;
 
 error:
+    err = ATT_FAIL;
     for (; i > 0; i--) {
-        err = ptrace(PTRACE_DETACH, thrds[i].tid, 0, 0);
-        if (err == -1) {
-            perror("ptrace detach");
+        if (ptrace(PTRACE_DETACH, thrds[i].tid, 0, 0) == -1) {
+            log_err("ptrace detach: tid=%d: %s", thrds[i].tid,
+                    strerror(errno));
+            err = ATT_UNKNOWN_STATE;
         }
     }
     return err;
 }
 
-__attribute__((unused))
 static int
 detach_threads(struct tgt_thrd* thrds, int count)
 {
@@ -559,11 +561,56 @@ detach_threads(struct tgt_thrd* thrds, int count)
     for (int i = 0; i < count; i++) {
         err = ptrace(PTRACE_DETACH, thrds[i].tid, 0, 0);
         if (err == -1) {
-            perror("ptrace detach");
+            fprintf(stderr, "ptrace detach: tid=%d: %s\n", thrds[i].tid,
+                    strerror(errno));
         }
     }
     return err;
 }
+
+static int
+continue_threads(struct tgt_thrd* thrds, int count)
+{
+    int err = 0;
+    for (int i = 0; i < count; i++) {
+        err = ptrace(PTRACE_CONT, thrds[i].tid, 0, 0);
+        if (err == -1) {
+            fprintf(stderr, "ptrace cont: tid=%d: %s\n", thrds[i].tid,
+                    strerror(errno));
+            err = ATT_UNKNOWN_STATE;
+        }
+    }
+    return err;
+}
+
+static int
+interrupt_threads(struct tgt_thrd* thrds, int nthreads)
+{
+    int err = 0;
+    for (int i = 0; i < nthreads; i++) {
+        __auto_type t = &thrds[i];
+        if (ptrace(PTRACE_INTERRUPT, t->tid, 0, 0) == -1) {
+            log_err("ptrace interrupt: tid=%d: %s", t->tid, strerror(errno));
+            return ATT_UNKNOWN_STATE;
+        }
+        if (wait_for_stop(t->tid, SIGTRAP, &t->wstatus) == -1) {
+            return ATT_UNKNOWN_STATE;
+        }
+        if ((t->wstatus >> 8) != ((PTRACE_EVENT_STOP << 8) | SIGTRAP)) {
+            // TODO: this might be our breakpoint and not the event-stop.
+            // If on x86, we may need to roll back the instruction pointer
+            // a byte.
+            log_err("not event-stop!!!");
+            // Maybe we should just kill the target until we've addressed
+            // this TODO.
+            #ifdef __x86_64__
+                return ATT_UNKNOWN_STATE
+            #endif
+        }
+    }
+    return err;
+}
+
 
 /*
  * ptrace pokedata takes a machine word, i.e. 64 bits. so we create
@@ -589,7 +636,7 @@ save_instrs(pid_t pid, word_of_instr_t* psaved, uintptr_t addr)
     };
     if (process_vm_readv(pid, &local, 1, &remote, 1, 0)
             != (ssize_t)remote.iov_len) {
-        perror("process_vm_readv");
+        log_err("process_vm_readv: pid=%d: %s", pid, strerror(errno));
         return ATT_FAIL;
     }
     return 0;
@@ -729,10 +776,12 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t bp_addr, uintptr_t* addr)
         goto restore_instuctions;
     }
 
-    if ((tid = wait_for_stop(pid, SIGTRAP)) == -1) {
+    int stopped_tid = -1;
+    if ((stopped_tid = wait_for_stop(tid, SIGTRAP, NULL)) == -1) {
         err = ATT_UNKNOWN_STATE;
         goto restore_instuctions;
     }
+    if (stopped_tid != tid) { abort(); }
 
     if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_PRSTATUS, &iov_mmap)) {
         perror("ptrace(PTRACE_GETREGSET, ...)");
@@ -744,7 +793,7 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t bp_addr, uintptr_t* addr)
     void* ret = (void*) user_regs_retval(urmmap);
     if ((unsigned long)ret >= -4095UL) {
         errno = -(long)ret;
-        perror("mmap_in_target");
+        perror("mmap in target");
         err = ATT_FAIL;
     }
 
@@ -847,10 +896,12 @@ indirect_call_and_brk2(
         goto restore_instuctions;
     }
 
-    if ((tid = wait_for_stop(pid, SIGTRAP)) == -1) {
+    int stopped_tid = -1;
+    if ((stopped_tid = wait_for_stop(tid, SIGTRAP, NULL)) == -1) {
         err = ATT_UNKNOWN_STATE;
         goto restore_instuctions;
     }
+    if (stopped_tid != tid) { abort(); }
 
     if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_PRSTATUS, &iov_call)) {
         perror("ptrace(PTRACE_GETREGSET,...)");
@@ -921,7 +972,7 @@ call_pyrun_simplestring(
 
 
 static int
-exec_python_code(pid_t pid, pid_t tid, const char* python_code)
+exec_python_code(pid_t pid, pid_t tid, const char* python_code, pid_t* mtid)
 {
     int err;
     // There is a build-id at the start of glibc that we can overwrite
@@ -977,30 +1028,62 @@ exec_python_code(pid_t pid, pid_t tid, const char* python_code)
         log_err("adding pending call in target failed");
         return err;
     }
+    log_dbg("added pending call in target");
 
+    // We resume the thread that stopped, so, they should all be running now.
     if (ptrace(PTRACE_CONT, tid, 0, 0) == -1) {
         perror("ptrace(PTRACE_CONT, ...)");
         return ATT_UNKNOWN_STATE;
     }
 
-    if ((tid = wait_for_stop(pid, SIGTRAP)) == -1) {
-        log_err("wait_for_stop failed");
-        // If this was an EINTR... maybe we could replace the trap with the
-        // ret in order to null out the breakpoint... but we need to improve
-        // the signal handling anyway.
-        return ATT_UNKNOWN_STATE;
+    // tid will now switch to the main thread ID.
+    if ((tid = wait_for_stop(-1, SIGTRAP, NULL)) == -1) {
+        if (errno != EINTR) {
+            log_err("wait_for_stop failed");
+            return ATT_UNKNOWN_STATE;
+        }
+        struct tgt_thrd main_thrd = { .tid = pid, };
+        if ((err = interrupt_threads(&main_thrd, 1)) != 0) {
+            return ATT_UNKNOWN_STATE;
+        }
+        *mtid = pid;
+        // Since this was an EINTR... we replace the trap with the ret in order
+        // to null out the breakpoint...
+        word_of_instr_t ret_and_ret = {
+            #if defined(__aarch64__)
+                .u32s[0] = 0xd65f03c0,
+                .u32s[1] = 0xd65f03c0,  /* ret */
+            #elif defined(__x86_64__)
+                .c_bytes[0] = 0xc3,
+                .c_bytes[1] = 0xc3, /* retq */
+            #elif defined(__riscv)
+                .u32s[0] = 0x00008067,
+                .u32s[1] = 0x00008067,  /* ret (jalr x0,x1,0) */
+            #endif
+        };
+        if (-1 == ptrace(PTRACE_POKETEXT, pid,
+                    (void*)(libc_start_addr + sizeof(void*)),
+                    ret_and_ret.u64)) {
+            perror("ptrace (stubbing out breakpoint)");
+            return ATT_UNKNOWN_STATE;
+        }
+        return ATT_INTERRUPTED;
     }
+    *mtid = tid;
+    log_dbg("main thread stopped, tid=%d", tid);
 
     if ((err = call_pyrun_simplestring(pid, tid, libc_start_addr, mapped_addr))
             != 0) {
         // we need to continue to restore the PC and the overwritten libc
     }
+    log_dbg("have run PyRun_SimpleString");
 
     int err2 = set_pc(tid,
             libc_start_addr + sizeof(void*) + sizeof(DEBUG_TRAP_INSTR), 0);
     if (err == ATT_UNKNOWN_STATE || err2 == -1) {
         return ATT_UNKNOWN_STATE;
     }
+    log_dbg("bumped PC past breakpoint");
 
     // TODO: restore libc+8
 
@@ -1020,36 +1103,47 @@ attach_and_execute(const int pid, const char* python_code)
     if (err != 0) {
         return ATT_FAIL;
     }
-    if (nthreads != 1) {
+    enum { MAX_THRDS = 16 };
+    if (nthreads > MAX_THRDS) {
         log_err("target has %d threads, multiple target threads are not yet "
                 "supported", nthreads);
+        return ATT_FAIL;
+    }
+    if (nthreads > 0) {
+        // Specifically it doesn't work if the main thread doesn't get time
+        // and the tracing doesn't work for non-main on <3.12
+        log_err("target has %d threads, this may not work correctly", nthreads);
+    }
+
+    struct tgt_thrd thrds[MAX_THRDS] = {};
+    err = get_threads(pid, thrds, &nthreads);
+    if (err != 0) {
+        return err;
+    }
+    if (nthreads > MAX_THRDS) {
+        log_err("changing number of threads");
         return ATT_FAIL;
     }
 
     uintptr_t breakpoint_addr = find_pyfn(pid, SAFE_POINT);
     if (breakpoint_addr == 0) {
-        fprintf(stderr, "unable to find %s\n", SAFE_POINT);
+        log_err("unable to find %s", SAFE_POINT);
         return ATT_FAIL;
     }
     log_dbg(SAFE_POINT " = %lx", breakpoint_addr);
 
-    if (-1 == ptrace(PTRACE_ATTACH, pid, 0, 0)) {
-        perror("ptrace");
-        return ATT_FAIL;
-    }
 
-    if (wait_for_stop(pid, SIGSTOP) == -1) {
-        return ATT_UNKNOWN_STATE;
+    err = attach_threads(thrds, nthreads);
+    if (err != 0) {
+        return err;
     }
 
     // TODO: consider setting a hardware breakpoint instead.
 
     word_of_instr_t saved_instrs = {};
     if (save_instrs(pid, &saved_instrs, breakpoint_addr) != 0) {
-        if (ptrace(PTRACE_DETACH, pid, 0, 0) == -1) {
-            return ATT_UNKNOWN_STATE;
-        }
-        return ATT_FAIL;
+        err = ATT_FAIL;
+        goto detach;
     }
 
     // Note aarch64 has 64-bit words but 32-bit instructions so
@@ -1063,41 +1157,43 @@ attach_and_execute(const int pid, const char* python_code)
     if (-1 == ptrace(PTRACE_POKETEXT, pid, breakpoint_addr,
                 breakpoint_instrs.u64)) {
         perror("ptrace(PTRACE_POKETEXT, ...)");
-        return ATT_FAIL;
+        err = ATT_FAIL;
+        goto detach;
     }
 
     // TODO: we need to protect ourselves from signals here
     fprintf(stderr, "Waiting for process to reach safepoint...\n");
-    if (ptrace(PTRACE_CONT, pid, 0, 0) == -1) {
-        perror("ptrace(PTRACE_CONT, ...)");
+
+    // Our safe point is within the GIL, so we're somewhat safe that
+    // only one thread will hit the BP. (unless there are multiple
+    // interpreters or they've disabled the GIL).
+
+    if ((err = continue_threads(thrds, nthreads)) != 0) {
         err = ATT_UNKNOWN_STATE;
         goto detach;
     }
 
     pid_t tid;
-    if ((tid = wait_for_stop(pid, SIGTRAP)) == -1) {
+    if ((tid = wait_for_stop(-1, SIGTRAP, NULL)) == -1) {
         // If this gets interrupted (EINTR), it means the user is impatient.
         // We would be better to remove the trap instruction before leaving.
         fprintf(stderr, "Cancelling...\n");
-        if (kill(pid, SIGSTOP) == -1) {
-            perror("kill");
-            err = ATT_UNKNOWN_STATE;
+
+        if ((err = interrupt_threads(thrds, nthreads)) != 0) {
             goto detach;
         }
-        if ((tid = wait_for_stop(pid, SIGSTOP)) == -1) {
-            err = ATT_UNKNOWN_STATE;
-            goto detach;
-        }
-        if (-1 == ptrace(PTRACE_POKETEXT, tid, breakpoint_addr,
+
+        if (-1 == ptrace(PTRACE_POKETEXT, pid, breakpoint_addr,
                     saved_instrs.u64)) {
             perror("ptrace (restoring instructions at breakpoint)");
             err = ATT_UNKNOWN_STATE;
             goto detach;
         }
         fprintf(stderr, "attacher: cancelled.\n");
-        err = ATT_FAIL;
+        err = ATT_INTERRUPTED;
         goto detach;
     }
+    log_dbg("have a target thread at breakpoint: tid=%d", tid);
 
     // TODO: we should check the PC that it's at (or just after) the
     // breakpoint.
@@ -1124,15 +1220,32 @@ attach_and_execute(const int pid, const char* python_code)
     }
 #endif // defined(__x86_64__)
 
-    if ((err = exec_python_code(pid, tid, python_code)) != 0) {
+    // Main python thread.
+    pid_t mtid = -1;
+    if ((err = exec_python_code(pid, tid, python_code, &mtid)) != 0) {
         // ... actually it's verbose enough
-        goto detach;
+        if (err != ATT_INTERRUPTED) {
+            goto detach;
+        }
+    }
+
+    // stop the non main threads so that they can be detached
+    for (int i = 0; i < nthreads; i++) {
+        __auto_type t = &thrds[i];
+        if (t->tid != mtid) {
+            if (ptrace(PTRACE_INTERRUPT, t->tid, 0, 0) == -1) {
+                perror("ptrace interrupt");
+                continue;
+            }
+            if (wait_for_stop(t->tid, SIGTRAP, &t->wstatus) == -1) {
+                continue;
+            }
+        }
     }
 
 detach:
-    if (-1 == ptrace(PTRACE_DETACH, pid, 0, 0)) {
-        perror("ptrace(PTRACE_DETACH,...)");
-        return ATT_UNKNOWN_STATE;
+    if (detach_threads(thrds, nthreads) != 0) {
+        err = ATT_UNKNOWN_STATE;
     }
     return err;
 }
