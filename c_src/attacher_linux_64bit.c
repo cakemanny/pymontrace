@@ -465,6 +465,10 @@ wait_for_stop(pid_t pid, int signo, int* pwstatus)
             errno = esaved;
             return -1;
         }
+        if (pid > 0 && tid != pid) {
+            fprintf(stderr, "pid > 0 && tid != pid\n");
+            abort();
+        }
 
         if (!WIFSTOPPED(*pwstatus)) {
             fprintf(stderr, "WIFEXITED(wstatus)=%d, WIFSIGNALED(wstatus)=%d\n",
@@ -482,6 +486,16 @@ wait_for_stop(pid_t pid, int signo, int* pwstatus)
         }
         return tid;
     }
+}
+
+static int
+continue_sgl_thread(pid_t tid)
+{
+    if (ptrace(PTRACE_CONT, tid, 0, 0) == -1) {
+        log_err("ptrace cont: tid=%d: %s", tid, strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 struct tgt_thrd {
@@ -575,8 +589,7 @@ continue_threads(struct tgt_thrd* thrds, int count)
     for (int i = 0; i < count; i++) {
         err = ptrace(PTRACE_CONT, thrds[i].tid, 0, 0);
         if (err == -1) {
-            fprintf(stderr, "ptrace cont: tid=%d: %s\n", thrds[i].tid,
-                    strerror(errno));
+            log_err("ptrace cont: tid=%d: %s", thrds[i].tid, strerror(errno));
             err = ATT_UNKNOWN_STATE;
         }
     }
@@ -622,22 +635,78 @@ typedef union {
     uint64_t u64;
 } word_of_instr_t;
 
+typedef struct {
+    word_of_instr_t instrs;
+    uintptr_t addr;
+} saved_instrs_t;
 
 static int
-save_instrs(pid_t pid, word_of_instr_t* psaved, uintptr_t addr)
+save_instrs(pid_t pid, saved_instrs_t* psaved)
 {
     struct iovec local = {
-        .iov_base = psaved->c_bytes,
-        .iov_len = sizeof *psaved,
+        .iov_base = psaved->instrs.c_bytes,
+        .iov_len = sizeof psaved->instrs,
     };
     struct iovec remote = {
-        .iov_base = (void*)addr,
-        .iov_len = sizeof *psaved,
+        .iov_base = (void*)psaved->addr,
+        .iov_len = sizeof psaved->instrs,
     };
     if (process_vm_readv(pid, &local, 1, &remote, 1, 0)
             != (ssize_t)remote.iov_len) {
         log_err("process_vm_readv: pid=%d: %s", pid, strerror(errno));
         return ATT_FAIL;
+    }
+    return 0;
+}
+
+static int
+restore_instrs(pid_t tid, saved_instrs_t* psaved)
+{
+    if (-1 == ptrace(PTRACE_POKETEXT, tid, psaved->addr, psaved->instrs.u64)) {
+        log_err("restore_instrs: ptrace poketext: tid=%d: %s", tid,
+                strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int
+replace_instrs(pid_t tid, uintptr_t addr, word_of_instr_t instrs)
+{
+    if (-1 == ptrace(PTRACE_POKETEXT, tid, addr, instrs.u64)) {
+        log_err("replace_instrs: ptrace poketext: tid=%d: %s", tid,
+                strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+
+static int
+get_user_regs(pid_t tid, struct user_regs_struct* user_regs)
+{
+    struct iovec iov = {.iov_base = user_regs, .iov_len = sizeof *user_regs};
+    if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_PRSTATUS, &iov)) {
+        int esaved = errno;
+        log_err("ptrace getregset: tid=%d: %s", tid, strerror(errno));
+        errno = esaved;
+        return -1;
+    }
+    if (iov.iov_len != sizeof *user_regs) {
+        log_err("iov.iov_len = %lu, sizeof user_regs = %lu",
+                iov.iov_len, sizeof user_regs);
+    }
+    return 0;
+}
+static int
+set_user_regs(pid_t tid, struct user_regs_struct* user_regs)
+{
+    struct iovec iov = {.iov_base = user_regs, .iov_len = sizeof *user_regs};
+    if (-1 == ptrace(PTRACE_SETREGSET, tid, NT_PRSTATUS, &iov)) {
+        int esaved = errno;
+        log_err("ptrace setregset: tid=%d: %s", tid, strerror(errno));
+        errno = esaved;
+        return -1;
     }
     return 0;
 }
@@ -649,9 +718,7 @@ static int
 set_pc(pid_t tid, uintptr_t pc, uintptr_t* oldpc)
 {
     struct user_regs_struct user_regs = {};
-    struct iovec iov = {.iov_base = &user_regs, .iov_len = sizeof user_regs};
-    if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_PRSTATUS, &iov)) {
-        perror("ptrace(PTRACE_GETREGSET,...)");
+    if (-1 == get_user_regs(tid, &user_regs)) {
         return -1;
     }
 #if defined(__aarch64__) || defined(__riscv)
@@ -665,8 +732,7 @@ set_pc(pid_t tid, uintptr_t pc, uintptr_t* oldpc)
     }
     user_regs.rip = pc;
 #endif
-    if (-1 == ptrace(PTRACE_SETREGSET, tid, NT_PRSTATUS, &iov)) {
-        perror("ptrace(PTRACE_SETREGSET,...)");
+    if (-1 == set_user_regs(tid, &user_regs)) {
         return -1;
     }
     return 0;
@@ -707,33 +773,17 @@ prepare_syscall6(
 #endif
 }
 
-
-static int
-call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t bp_addr, uintptr_t* addr)
+static void
+prepare_syscall2(struct user_regs_struct* user_regs, long pc, long num,
+        long arg1, long arg2)
 {
-    int err = 0;
+    prepare_syscall6(user_regs, pc, num, arg1, arg2, 0, 0, 0, 0);
+}
 
-    // If we run into bugs with FP registers we may want to expand this
-    // to also save and restore FP regs
-    // Also, maybe this should be elf_gregset_t ... not sure
-    struct user_regs_struct user_regs = {};
-    struct iovec iov = {.iov_base = &user_regs, .iov_len = sizeof user_regs};
-
-    if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_PRSTATUS, &iov)) {
-        perror("ptrace(PTRACE_GETREGSET,...)");
-        return ATT_FAIL;
-    }
-    if (iov.iov_len != sizeof user_regs) {
-        fprintf(stderr, "iov.iov_len = %lu, sizeof user_regs = %lu\n",
-                iov.iov_len, sizeof user_regs);
-    }
-
-    word_of_instr_t saved_instrs = {};
-    if (save_instrs(pid, &saved_instrs, bp_addr) != 0) {
-        return ATT_FAIL;
-    }
-
-    word_of_instr_t syscall_and_brk = {
+static word_of_instr_t
+syscall_and_brk()
+{
+    word_of_instr_t retval = {
         #if defined(__aarch64__)
             .u32s[0] = 0xd4000001, /* svc	#0 */
             .u32s[1] = DEBUG_TRAP_INSTR,
@@ -747,10 +797,30 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t bp_addr, uintptr_t* addr)
             .u32s[1] = DEBUG_TRAP_INSTR,
         #endif
     };
+    return retval;
+}
 
-    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)bp_addr,
-                syscall_and_brk.u64)) {
-        perror("ptrace(PTRACE_POKETEXT, ...)");
+static int
+call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t bp_addr, size_t length,
+        uintptr_t* addr)
+{
+    int err = 0;
+
+    // If we run into bugs with FP registers we may want to expand this
+    // to also save and restore FP regs
+    // Also, maybe this should be elf_gregset_t ... not sure
+    struct user_regs_struct user_regs = {};
+
+    if (-1 == get_user_regs(tid, &user_regs)) {
+        return ATT_FAIL;
+    }
+
+    saved_instrs_t saved_instrs = { .addr = bp_addr };
+    if (save_instrs(pid, &saved_instrs) != 0) {
+        return ATT_FAIL;
+    }
+
+    if (-1 == replace_instrs(tid, bp_addr, syscall_and_brk())) {
         return ATT_FAIL;
     }
 
@@ -759,37 +829,29 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t bp_addr, uintptr_t* addr)
 
     prepare_syscall6(&urmmap, bp_addr, SYS_mmap,
             0, /* addr */
-            sysconf(_SC_PAGESIZE), PROT_READ | PROT_WRITE,
+            length, PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS,
             -1, /* fd */
             0); /* offset */
 
-
-    struct iovec iov_mmap = {.iov_base = &urmmap, .iov_len = sizeof urmmap};
-
-    if (-1 == ptrace(PTRACE_SETREGSET, tid, NT_PRSTATUS, &iov_mmap)) {
-        perror("ptrace(PTRACE_SETREGSET, ...)");
+    if (-1 == set_user_regs(tid, &urmmap)) {
         err = ATT_UNKNOWN_STATE;
-        goto restore_instuctions;
+        goto restore_instructions;
     }
 
-    if (ptrace(PTRACE_CONT, tid, 0, 0) == -1) {
-        perror("ptrace(PTRACE_CONT, ...)");
+    if (-1 == continue_sgl_thread(tid)) {
         err = ATT_UNKNOWN_STATE;
-        goto restore_instuctions;
+        goto restore_instructions;
     }
 
-    int stopped_tid = -1;
-    if ((stopped_tid = wait_for_stop(tid, SIGTRAP, NULL)) == -1) {
+    if (wait_for_stop(tid, SIGTRAP, NULL) == -1) {
         err = ATT_UNKNOWN_STATE;
-        goto restore_instuctions;
+        goto restore_instructions;
     }
-    if (stopped_tid != tid) { abort(); }
 
-    if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_PRSTATUS, &iov_mmap)) {
-        perror("ptrace(PTRACE_GETREGSET, ...)");
+    if (-1 == get_user_regs(tid, &urmmap)) {
         err = ATT_UNKNOWN_STATE;
-        goto restore_instuctions;
+        goto restore_instructions;
     }
 
     // from linux/tools/include/nolibc/sys.h
@@ -803,20 +865,81 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t bp_addr, uintptr_t* addr)
     *addr = (uintptr_t)ret;
 
 
-restore_instuctions:
+restore_instructions:
 
-    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)bp_addr,
-                saved_instrs.u64)) {
-        perror("ptrace(PTRACE_POKETEXT, ...)");
+    if (-1 == restore_instrs(tid, &saved_instrs)) {
         err = ATT_UNKNOWN_STATE;
         // Intentionally not going to return, in order to restore registers
     }
 
-    if (-1 == ptrace(PTRACE_SETREGSET, tid, NT_PRSTATUS, &iov)) {
-        perror("ptrace(PTRACE_SETREGSET,...)");
+    if (-1 == set_user_regs(tid, &user_regs)) {
         return ATT_UNKNOWN_STATE;
     }
+    return err;
+}
 
+static int
+call_munmap_in_target(pid_t pid, pid_t tid, uintptr_t scratch_addr,
+        uintptr_t addr, size_t length)
+{
+    int err = 0;
+
+    struct user_regs_struct user_regs = {};
+    if (-1 == get_user_regs(tid, &user_regs)) {
+        return ATT_FAIL;
+    }
+
+    saved_instrs_t saved_instrs = { .addr = scratch_addr };
+    if (save_instrs(pid, &saved_instrs) != 0) {
+        return ATT_FAIL;
+    }
+
+    if (-1 == replace_instrs(tid, scratch_addr, syscall_and_brk())) {
+        return ATT_FAIL;
+    }
+
+    // Setup registers for munmap call
+    struct user_regs_struct call_regs = user_regs;
+
+    prepare_syscall2(&call_regs, scratch_addr, SYS_munmap,
+            addr, length);
+
+    if (-1 == set_user_regs(tid, &call_regs)) {
+        err = ATT_UNKNOWN_STATE;
+        goto restore_instructions;
+    }
+
+    if (-1 == continue_sgl_thread(tid)) {
+        err = ATT_UNKNOWN_STATE;
+        goto restore_instructions;
+    }
+
+    if (wait_for_stop(tid, SIGTRAP, NULL) == -1) {
+        err = ATT_UNKNOWN_STATE;
+        goto restore_instructions;
+    }
+
+    if (-1 == get_user_regs(tid, &call_regs)) {
+        err = ATT_UNKNOWN_STATE;
+        goto restore_instructions;
+    }
+
+    long ret = (long)user_regs_retval(call_regs);
+    if (ret < 0) {
+        errno = -(long)ret;
+        perror("munmap in target");
+        err = ATT_FAIL;
+    }
+
+restore_instructions:
+    if (-1 == restore_instrs(tid, &saved_instrs)) {
+        err = ATT_UNKNOWN_STATE;
+        // intentionally fall-through to restore registers
+    }
+
+    if (-1 == set_user_regs(tid, &user_regs)) {
+        return ATT_UNKNOWN_STATE;
+    }
     return err;
 }
 
@@ -831,19 +954,12 @@ indirect_call_and_brk2(
     // to also save and restore FP regs
     // Also, maybe this should be elf_gregset_t ... not sure
     struct user_regs_struct user_regs = {};
-    struct iovec iov = {.iov_base = &user_regs, .iov_len = sizeof user_regs};
-
-    if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_PRSTATUS, &iov)) {
-        perror("ptrace(PTRACE_GETREGSET,...)");
+    if (-1 == get_user_regs(tid, &user_regs)) {
         return ATT_FAIL;
     }
-    if (iov.iov_len != sizeof user_regs) {
-        fprintf(stderr, "iov.iov_len = %lu, sizeof user_regs = %lu\n",
-                iov.iov_len, sizeof user_regs);
-    }
 
-    word_of_instr_t saved_instrs = {};
-    if (save_instrs(pid, &saved_instrs, scratch_addr) != 0) {
+    saved_instrs_t saved_instrs = { .addr = scratch_addr };
+    if (save_instrs(pid, &saved_instrs) != 0) {
         return ATT_FAIL;
     }
 
@@ -859,9 +975,7 @@ indirect_call_and_brk2(
             .u32s[1] = DEBUG_TRAP_INSTR,
         #endif
     };
-    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)scratch_addr,
-                indirect_call_and_brk.u64)) {
-        perror("ptrace(PTRACE_POKETEXT, ...)");
+    if (-1 == replace_instrs(tid, scratch_addr, indirect_call_and_brk)) {
         return ATT_FAIL;
     }
 
@@ -885,48 +999,36 @@ indirect_call_and_brk2(
     urcall.pc = scratch_addr;
 #endif
 
-    struct iovec iov_call = {.iov_base = &urcall, .iov_len = sizeof urcall};
-
-    if (-1 == ptrace(PTRACE_SETREGSET, tid, NT_PRSTATUS, &iov_call)) {
-        perror("ptrace(PTRACE_SETREGSET,...)");
+    if (-1 == set_user_regs(tid, &urcall)) {
         err = ATT_UNKNOWN_STATE;
-        goto restore_instuctions;
+        goto restore_instructions;
     }
 
-    if (ptrace(PTRACE_CONT, tid, 0, 0) == -1) {
-        perror("ptrace(PTRACE_CONT, ...)");
+    if (-1 == continue_sgl_thread(tid)) {
         err = ATT_UNKNOWN_STATE;
-        goto restore_instuctions;
+        goto restore_instructions;
     }
 
-    int stopped_tid = -1;
-    if ((stopped_tid = wait_for_stop(tid, SIGTRAP, NULL)) == -1) {
+    if (wait_for_stop(tid, SIGTRAP, NULL) == -1) {
         err = ATT_UNKNOWN_STATE;
-        goto restore_instuctions;
+        goto restore_instructions;
     }
-    if (stopped_tid != tid) { abort(); }
 
-    if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_PRSTATUS, &iov_call)) {
-        perror("ptrace(PTRACE_GETREGSET,...)");
+    if (-1 == get_user_regs(tid, &urcall)) {
         err = ATT_UNKNOWN_STATE;
-        goto restore_instuctions;
+        goto restore_instructions;
     }
 
     *retval = user_regs_retval(urcall);
 
-restore_instuctions:
-    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)scratch_addr,
-                saved_instrs.u64)) {
-        perror("ptrace(PTRACE_POKETEXT, ...)");
+restore_instructions:
+    if (-1 == restore_instrs(tid, &saved_instrs)) {
         err = ATT_UNKNOWN_STATE;
         // Intentionally not going to return, in order to restore registers
     }
-
-    if (-1 == ptrace(PTRACE_SETREGSET, tid, NT_PRSTATUS, &iov)) {
-        perror("ptrace(PTRACE_SETREGSET,...)");
+    if (-1 == set_user_regs(tid, &user_regs)) {
         return ATT_UNKNOWN_STATE;
     }
-
     return err;
 }
 
@@ -960,16 +1062,18 @@ exec_python_code(pid_t pid, pid_t tid, const char* python_code)
     // temporarily (idea from the readme of kubo/injector)
     uintptr_t libc_start_addr = find_libc_start(pid);
     if (libc_start_addr == 0) {
-        fprintf(stderr, "could not find libc\n");
+        log_err("could not find libc");
         return ATT_FAIL;
     }
-    log_dbg("libc_start_addr = %lx\n", libc_start_addr);
+    log_dbg("libc_start_addr = %lx", libc_start_addr);
 
 
     // This is the point at which we can start to do our work.
     uintptr_t mapped_addr = 0;
-    if ((err = call_mmap_in_target(pid, tid, libc_start_addr, &mapped_addr)) != 0) {
-        fprintf(stderr, "call_mmap_in_target failed\n");
+    size_t length = sysconf(_SC_PAGESIZE);
+    if ((err = call_mmap_in_target(pid, tid, libc_start_addr, length,
+                    &mapped_addr)) != 0) {
+        log_err("call_mmap_in_target failed");
         return err;
     }
 
@@ -980,15 +1084,20 @@ exec_python_code(pid_t pid, pid_t tid, const char* python_code)
     struct iovec remote = { .iov_base = (void*)mapped_addr, .iov_len=len };
     if (process_vm_writev(pid, &local, 1, &remote, 1, 0) != len) {
         perror("process_vm_writev");
-        return ATT_FAIL;
+        err = ATT_FAIL;
+        goto out;
     }
 
     if ((err = call_pyrun_simplestring(pid, tid, libc_start_addr, mapped_addr))
             != 0) {
-        return err;
+        goto out;
     }
 
-    // TODO: munmap
+out:
+    if (call_munmap_in_target(pid, tid, libc_start_addr, mapped_addr, length)
+            != 0) {
+        // This is non-fatal.
+    }
     return err;
 }
 
@@ -1010,7 +1119,7 @@ attach_and_execute(const int pid, const char* python_code)
                 "supported", nthreads);
         return ATT_FAIL;
     }
-    if (nthreads > 0) {
+    if (nthreads > 1) {
         // Specifically it doesn't work if the main thread doesn't get time
         // and the tracing doesn't work for non-main on <3.12
         log_err("target has %d threads, this may not work correctly", nthreads);
@@ -1041,23 +1150,21 @@ attach_and_execute(const int pid, const char* python_code)
 
     // TODO: consider setting a hardware breakpoint instead.
 
-    word_of_instr_t saved_instrs = {};
-    if (save_instrs(pid, &saved_instrs, breakpoint_addr) != 0) {
+    saved_instrs_t saved_instrs = { .addr = breakpoint_addr };
+    if (save_instrs(pid, &saved_instrs) != 0) {
         err = ATT_FAIL;
         goto detach;
     }
 
     // Note aarch64 has 64-bit words but 32-bit instructions so
     // we only write to the first four bytes.
-    word_of_instr_t breakpoint_instrs = saved_instrs;
+    word_of_instr_t breakpoint_instrs = saved_instrs.instrs;
     #if defined(__aarch64__) || defined(__riscv)
         breakpoint_instrs.u32s[0] = DEBUG_TRAP_INSTR;
     #elif defined(__x86_64__)
         breakpoint_instrs.c_bytes[0] = DEBUG_TRAP_INSTR;
     #endif
-    if (-1 == ptrace(PTRACE_POKETEXT, pid, breakpoint_addr,
-                breakpoint_instrs.u64)) {
-        perror("ptrace(PTRACE_POKETEXT, ...)");
+    if (-1 == replace_instrs(pid, breakpoint_addr, breakpoint_instrs)) {
         err = ATT_FAIL;
         goto detach;
     }
@@ -1084,13 +1191,11 @@ attach_and_execute(const int pid, const char* python_code)
             goto detach;
         }
 
-        if (-1 == ptrace(PTRACE_POKETEXT, pid, breakpoint_addr,
-                    saved_instrs.u64)) {
-            perror("ptrace (restoring instructions at breakpoint)");
+        if (-1 == restore_instrs(pid, &saved_instrs)) {
             err = ATT_UNKNOWN_STATE;
             goto detach;
         }
-        fprintf(stderr, "attacher: cancelled.\n");
+        log_err("cancelled.");
         err = ATT_INTERRUPTED;
         goto detach;
     }
@@ -1100,9 +1205,7 @@ attach_and_execute(const int pid, const char* python_code)
     // breakpoint.
 
     // Restore patched code
-    if (-1 == ptrace(PTRACE_POKETEXT, tid, breakpoint_addr,
-                saved_instrs.u64)) {
-        perror("ptrace(PTRACE_POKETEXT, ...)");
+    if (-1 == restore_instrs(tid, &saved_instrs)) {
         err = ATT_UNKNOWN_STATE;
         goto detach;
     }
