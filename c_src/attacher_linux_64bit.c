@@ -604,7 +604,7 @@ interrupt_threads(struct tgt_thrd* thrds, int nthreads)
             // Maybe we should just kill the target until we've addressed
             // this TODO.
             #ifdef __x86_64__
-                return ATT_UNKNOWN_STATE
+                return ATT_UNKNOWN_STATE;
             #endif
         }
     }
@@ -642,6 +642,9 @@ save_instrs(pid_t pid, word_of_instr_t* psaved, uintptr_t addr)
     return 0;
 }
 
+#ifndef __x86_64__
+__attribute__((unused))
+#endif
 static int
 set_pc(pid_t tid, uintptr_t pc, uintptr_t* oldpc)
 {
@@ -684,23 +687,23 @@ prepare_syscall6(
     user_regs->regs[4] = arg5;
     user_regs->regs[5] = arg6;
 #elif defined(__x86_64__)
-    urmmap->rax = num;
-    urmmap->rdi = arg1;
-    urmmap->rsi = arg2;
-    urmmap->rdx = arg3;
-    urmmap->r10 = arg4;
-    urmmap->r8  = arg5;
-    urmmap->r9  = arg6;
-    urmmap->rip = pc;
+    user_regs->rax = num;
+    user_regs->rdi = arg1;
+    user_regs->rsi = arg2;
+    user_regs->rdx = arg3;
+    user_regs->r10 = arg4;
+    user_regs->r8  = arg5;
+    user_regs->r9  = arg6;
+    user_regs->rip = pc;
 #elif defined(__riscv) && __riscv_xlen == 64
-    urmmap->a7 = num;
-    urmmap->a0 = arg1;
-    urmmap->a1 = arg2;
-    urmmap->a2 = arg3;
-    urmmap->a3 = arg4;
-    urmmap->a4 = arg5;
-    urmmap->a5 = arg6;
-    urmmap->pc = pc;
+    user_regs->a7 = num;
+    user_regs->a0 = arg1;
+    user_regs->a1 = arg2;
+    user_regs->a2 = arg3;
+    user_regs->a3 = arg4;
+    user_regs->a4 = arg5;
+    user_regs->a5 = arg6;
+    user_regs->pc = pc;
 #endif
 }
 
@@ -929,28 +932,6 @@ restore_instuctions:
 
 
 static ssize_t
-add_pending_in_target(
-        pid_t pid, pid_t tid, uintptr_t scratch_addr, uintptr_t fn_addr,
-        uintptr_t arg)
-{
-    uintptr_t add_pending_call_addr = find_pyfn(pid, "Py_AddPendingCall");
-
-    if (add_pending_call_addr == 0) {
-        log_err("failed to find symbol Py_AddPendingCall");
-        return ATT_FAIL;
-    }
-
-    uintptr_t retval = 0;
-    int err = indirect_call_and_brk2(pid, tid, scratch_addr,
-            add_pending_call_addr, fn_addr, arg, &retval);
-    if (retval != 0 && err == 0) {
-        log_err("Py_AddPendingCall returned an error");
-        err = ATT_FAIL;
-    }
-    return err;
-}
-
-static ssize_t
 call_pyrun_simplestring(
         pid_t pid, pid_t tid, uintptr_t scratch_addr, uintptr_t buf)
 {
@@ -972,7 +953,7 @@ call_pyrun_simplestring(
 
 
 static int
-exec_python_code(pid_t pid, pid_t tid, const char* python_code, pid_t* mtid)
+exec_python_code(pid_t pid, pid_t tid, const char* python_code)
 {
     int err;
     // There is a build-id at the start of glibc that we can overwrite
@@ -1002,90 +983,10 @@ exec_python_code(pid_t pid, pid_t tid, const char* python_code, pid_t* mtid)
         return ATT_FAIL;
     }
 
-    // We tell Py_AddPendingCall to call into this function that only
-    // does a trap.
-
-    word_of_instr_t brk_and_ret = {
-        #if defined(__aarch64__)
-            .u32s[0] = DEBUG_TRAP_INSTR,
-            .u32s[1] = 0xd65f03c0,  /* ret */
-        #elif defined(__x86_64__)
-            .c_bytes[0] = DEBUG_TRAP_INSTR,
-            .c_bytes[1] = 0xc3, /* retq */
-        #elif defined(__riscv)
-            .u32s[0] = DEBUG_TRAP_INSTR,
-            .u32s[1] = 0x00008067,  /* ret (jalr x0,x1,0) */
-        #endif
-    };
-    if (-1 == ptrace(PTRACE_POKETEXT, tid, (void*)(libc_start_addr + sizeof(void*)),
-                brk_and_ret.u64)) {
-        perror("ptrace(PTRACE_POKETEXT, ...)");
-        return ATT_UNKNOWN_STATE;
-    }
-
-    if ((err = add_pending_in_target(pid, tid, libc_start_addr,
-                    (libc_start_addr + sizeof(void*)), 0)) != 0) {
-        log_err("adding pending call in target failed");
-        return err;
-    }
-    log_dbg("added pending call in target");
-
-    // We resume the thread that stopped, so, they should all be running now.
-    if (ptrace(PTRACE_CONT, tid, 0, 0) == -1) {
-        perror("ptrace(PTRACE_CONT, ...)");
-        return ATT_UNKNOWN_STATE;
-    }
-
-    // tid will now switch to the main thread ID.
-    if ((tid = wait_for_stop(-1, SIGTRAP, NULL)) == -1) {
-        if (errno != EINTR) {
-            log_err("wait_for_stop failed");
-            return ATT_UNKNOWN_STATE;
-        }
-        struct tgt_thrd main_thrd = { .tid = pid, };
-        if ((err = interrupt_threads(&main_thrd, 1)) != 0) {
-            return ATT_UNKNOWN_STATE;
-        }
-        *mtid = pid;
-        // Since this was an EINTR... we replace the trap with the ret in order
-        // to null out the breakpoint...
-        word_of_instr_t ret_and_ret = {
-            #if defined(__aarch64__)
-                .u32s[0] = 0xd65f03c0,
-                .u32s[1] = 0xd65f03c0,  /* ret */
-            #elif defined(__x86_64__)
-                .c_bytes[0] = 0xc3,
-                .c_bytes[1] = 0xc3, /* retq */
-            #elif defined(__riscv)
-                .u32s[0] = 0x00008067,
-                .u32s[1] = 0x00008067,  /* ret (jalr x0,x1,0) */
-            #endif
-        };
-        if (-1 == ptrace(PTRACE_POKETEXT, pid,
-                    (void*)(libc_start_addr + sizeof(void*)),
-                    ret_and_ret.u64)) {
-            perror("ptrace (stubbing out breakpoint)");
-            return ATT_UNKNOWN_STATE;
-        }
-        return ATT_INTERRUPTED;
-    }
-    *mtid = tid;
-    log_dbg("main thread stopped, tid=%d", tid);
-
     if ((err = call_pyrun_simplestring(pid, tid, libc_start_addr, mapped_addr))
             != 0) {
-        // we need to continue to restore the PC and the overwritten libc
+        return err;
     }
-    log_dbg("have run PyRun_SimpleString");
-
-    int err2 = set_pc(tid,
-            libc_start_addr + sizeof(void*) + sizeof(DEBUG_TRAP_INSTR), 0);
-    if (err == ATT_UNKNOWN_STATE || err2 == -1) {
-        return ATT_UNKNOWN_STATE;
-    }
-    log_dbg("bumped PC past breakpoint");
-
-    // TODO: restore libc+8
 
     // TODO: munmap
     return err;
@@ -1212,7 +1113,7 @@ attach_and_execute(const int pid, const char* python_code)
     // but then we'd have to adapt our signal handling code ... Let's compare
     // HW breakpoints before deciding.
 #if defined(__x86_64__)
-    if (-1 == set_pc(tid, breakpoint_addr)) {
+    if (-1 == set_pc(tid, breakpoint_addr, NULL)) {
         err = ATT_UNKNOWN_STATE; /* until we succeed with the next the
                                     instruction pointer, we're in a bad
                                     state */
@@ -1220,19 +1121,15 @@ attach_and_execute(const int pid, const char* python_code)
     }
 #endif // defined(__x86_64__)
 
-    // Main python thread.
-    pid_t mtid = -1;
-    if ((err = exec_python_code(pid, tid, python_code, &mtid)) != 0) {
+    if ((err = exec_python_code(pid, tid, python_code)) != 0) {
         // ... actually it's verbose enough
-        if (err != ATT_INTERRUPTED) {
-            goto detach;
-        }
+        goto detach;
     }
 
     // stop the non main threads so that they can be detached
     for (int i = 0; i < nthreads; i++) {
         __auto_type t = &thrds[i];
-        if (t->tid != mtid) {
+        if (t->tid != tid) {
             if (ptrace(PTRACE_INTERRUPT, t->tid, 0, 0) == -1) {
                 perror("ptrace interrupt");
                 continue;
