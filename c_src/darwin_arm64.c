@@ -128,13 +128,6 @@ log_mach(const char* msg, kern_return_t kr)
     fprintf(stderr, "attacher: %s: %s (%d)\n", msg, mach_error_string(kr), kr);
 }
 
-static void
-fatal_mach(const char* msg, kern_return_t kr)
-{
-    log_mach(msg, kr);
-    exit(1);
-}
-
 static int
 load_and_find_safepoint(const char* sopath, const char* symbol, Dl_info* info)
 {
@@ -462,13 +455,14 @@ exception_server_thread(void *arg)
 
     memset(&g_orig_threadstate, 0, sizeof g_orig_threadstate);
 
-    // IDEA: switch this to mach_msg_server_once and end once some flag is
-    // set (or after a fixed number of exceptions).
-
     /* Handle exceptions on exc_port */
-    if ((kr = mach_msg_server(mach_exc_server, 4096, exc_port, 0))
-            != KERN_SUCCESS) {
-        fatal_mach("mach_msg_server", kr);
+    const int num_expected_break_points = 2;
+    for (int i = 0; i < num_expected_break_points; i++){
+        if ((kr = mach_msg_server_once(mach_exc_server, 4096, exc_port, 0))
+                != KERN_SUCCESS) {
+            log_mach("mach_msg_server", kr);
+            break;
+        }
     }
     return NULL;
 }
@@ -527,8 +521,6 @@ shutdown_signal_thread(pthread_t thread)
     errno = pthread_kill(thread, SIGUSR1);
     return errno;
 }
-
-// Find write or PyRun_SimpleString
 
 struct dyld_image_info_it {
     struct dyld_all_image_infos infos;
@@ -733,7 +725,7 @@ attach_and_execute(const int pid, const char* python_code)
     assert(pagesize != 0);
 
     if (PYTHON_CODE_OFFSET + strlen(python_code) + 1 > pagesize) {
-        log_err("python code exceeds max size: %lu",
+        log_err("python code exceeds max size: %lu\n",
                 pagesize - PYTHON_CODE_OFFSET - 1);
         return ATT_FAIL;
     }
