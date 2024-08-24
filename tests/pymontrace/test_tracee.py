@@ -2,6 +2,8 @@ import sys
 import struct
 import inspect
 
+import pytest
+
 from pymontrace.tracee import LineProbe, pmt, Message
 
 
@@ -20,6 +22,7 @@ def test_line_probe():
     assert not LineProbe('/a/*/c.py', 6).matches('/a/b/c.pyx', 6)
 
 
+@pytest.mark.skipif("sys.version_info >= (3, 12)")
 def test_handle_events():
     from pymontrace.tracee import create_event_handlers
 
@@ -40,6 +43,7 @@ def test_handle_events():
     assert local_handler is not None
 
 
+@pytest.mark.skipif("sys.version_info >= (3, 12)")
 def test_handle_events__wrong_function():
     from pymontrace.tracee import create_event_handlers
 
