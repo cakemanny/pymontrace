@@ -53,7 +53,7 @@ typedef struct {
 
 static page_restore_t g_breakpoint_restore;
 
-static arm_thread_state64_t g_orig_threadstate[2];
+static arm_thread_state64_t g_orig_threadstate;
 static struct {
     vm_address_t addr;
     vm_size_t size;
@@ -61,7 +61,6 @@ static struct {
 
 
 static struct {
-    vm_address_t Py_AddPendingCall;
     vm_address_t PyRun_SimpleString;
 } g_pyfn_addrs;
 
@@ -75,7 +74,6 @@ static vm_address_t find_sysfn(task_t task, void* addr, const char* symbol);
  * x16 must be set to the address of _write
  */
 void injection();
-void inj_callback();
 void end_of_injection();
 __asm__ ("\
 	.global _injection\n\
@@ -84,11 +82,6 @@ _injection:\n\
 	blr	x16\n\
 	brk	#0xf000\n\
 	.global _inj_callback\n\
-_inj_callback:\n\
-	brk	#0xf000\n\
-	ret\n\
-	.p2align	2\n\
-	.global _end_of_injection\n\
 _end_of_injection:\n\
 	b	_injection\n\
 ");
@@ -325,8 +318,6 @@ catch_mach_exception_raise_state_identity(
         mach_msg_type_number_t *new_stateCnt)
 {
     kern_return_t kr;
-    // TODO: CAS a ATT_UNKNOWN_STATE into the g_err to somewhat protect against
-    // cancellation.
 
     log_dbg("in catch_exception_raise_state_identity");
     assert(exception == EXC_BREAKPOINT);
@@ -420,84 +411,38 @@ catch_mach_exception_raise_state_identity(
          * set up call
          */
 
-        vm_address_t fn_addr = g_pyfn_addrs.Py_AddPendingCall;
-        assert(fn_addr);
-
-        vm_address_t cb_addr = allocated + 8;
-        assert(cb_addr);
-
-        g_orig_threadstate[0] = *state;
-
-        state->__x[0] = cb_addr;
-        state->__x[1] = allocated + 16;
-        state->__x[16] = fn_addr;
-        arm_thread_state64_set_pc_fptr(*state, allocated);
-
-    } else if (pc == g_allocated.addr + 8
-            && arm_thread_state64_get_pc(g_orig_threadstate[1]) == 0) {
-        log_dbg("in the pending callback (3rd breakpoint)");
-
-        vm_address_t allocated = g_allocated.addr;
         vm_address_t fn_addr = g_pyfn_addrs.PyRun_SimpleString;
         assert(fn_addr);
 
-        g_orig_threadstate[1] = *state;
+        g_orig_threadstate = *state;
 
         state->__x[0] = allocated + 16;
         state->__x[16] = fn_addr;
         arm_thread_state64_set_pc_fptr(*state, allocated);
 
-    } else if (pc == g_allocated.addr + 8 &&
-            arm_thread_state64_get_pc(g_orig_threadstate[1])
-            == g_allocated.addr + 8) {
-        log_dbg("in the fourth (or fith?) (but final) breakpoint");
-
-        if (false) {
-            // We're done with this memory ... except that our program counter
-            // is in there.
-            kr = vm_deallocate(task, g_allocated.addr, g_allocated.size);
-            if (kr != KERN_SUCCESS) {
-                log_mach("vm_deallocate", kr);
-            }
-            g_allocated.addr = g_allocated.size = 0;
-        }
-
-        uint64_t retval = state->__x[0];
-
-        // The target will crash if the callback passed to Py_AddPendingCall
-        // doesn't return 0 (or set an exception, which we can't do).
-        state->__x[0] = 0;
-
-        arm_thread_state64_set_pc_fptr(*state, g_allocated.addr + 12);
-
-        g_err = (retval == 0) ? ATT_SUCCESS : ATT_FAIL;
-        dispatch_semaphore_signal(sync_sema);
     } else {
         /*
-         * We've come back from Py_AddPendingCall or PyRun_SimpleString
+         * We've come back from PyRun_SimpleString
          */
-        log_dbg("in the second (or fourth?) breakpoint");
-        assert(arm_thread_state64_get_pc(g_orig_threadstate[0]) != 0);
+        log_dbg("in the second breakpoint");
+        assert(arm_thread_state64_get_pc(g_orig_threadstate) != 0);
         assert(g_allocated.addr != 0 && g_allocated.size != 0);
 
         uint64_t retval = state->__x[0];
 
-        if (arm_thread_state64_get_pc(g_orig_threadstate[1]) == 0) {
-            *(arm_thread_state64_t*)new_state = g_orig_threadstate[0];
-            if (retval != 0) {
-                log_err("Py_AddPendingCall failed (%d)", (int)retval);
-                g_err = ATT_FAIL;
-                dispatch_semaphore_signal(sync_sema);
-            }
-        } else {
-            if (retval != 0) {
-                log_err("PyRun_SimpleString failed (%d)", (int)retval);
-            }
-            // We keep the retval PyRun_SimpleString, as that was really
-            // the pending function. But we'll overwrite it in a sec.
-            *(arm_thread_state64_t*)new_state = g_orig_threadstate[1];
-            ((arm_thread_state64_t*)new_state)->__x[0] = retval;
+        *(arm_thread_state64_t*)new_state = g_orig_threadstate;
+
+        kr = vm_deallocate(task, g_allocated.addr, g_allocated.size);
+        if (kr != KERN_SUCCESS) {
+            log_mach("vm_deallocate", kr);
         }
+        g_allocated.addr = g_allocated.size = 0;
+
+        if (retval != 0) {
+            log_err("PyRun_SimpleString failed (%d)", (int)retval);
+        }
+        g_err = (retval == 0) ? ATT_SUCCESS : ATT_FAIL;
+        dispatch_semaphore_signal(sync_sema);
     }
 
     return KERN_SUCCESS;
@@ -515,7 +460,7 @@ exception_server_thread(void *arg)
     // Signal thread started.
     dispatch_semaphore_signal(sync_sema);
 
-    memset(g_orig_threadstate, 0, sizeof g_orig_threadstate);
+    memset(&g_orig_threadstate, 0, sizeof g_orig_threadstate);
 
     // IDEA: switch this to mach_msg_server_once and end once some flag is
     // set (or after a fixed number of exceptions).
@@ -727,12 +672,6 @@ find_pyfn(task_t task, const char* symbol)
 static int
 find_needed_python_funcs(task_t task)
 {
-    g_pyfn_addrs.Py_AddPendingCall = find_pyfn(task, "Py_AddPendingCall");
-    if (!g_pyfn_addrs.Py_AddPendingCall) {
-        log_err("could not find %s in shared libs", "Py_AddPendingCall");
-        return ATT_FAIL;
-    }
-
     g_pyfn_addrs.PyRun_SimpleString = find_pyfn(task, "PyRun_SimpleString");
     if (!g_pyfn_addrs.PyRun_SimpleString) {
         log_err("could not find %s in shared libs", "PyRun_SimpleString");
@@ -975,7 +914,7 @@ attach_and_execute(const int pid, const char* python_code)
 
 out:
     // uninstall exception handlers
-    for (int i = 0; i < old_exc_ports.count; i++) {
+    for (int i = 0; i < (int)old_exc_ports.count; i++) {
         kr = task_set_exception_ports(task,
                 old_exc_ports.masks[i],
                 old_exc_ports.ports[i],

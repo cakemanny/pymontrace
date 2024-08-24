@@ -7,7 +7,7 @@ In priority order:
 - [x] Tracer / tracee communication. i.e. the tool should be there primarily
       for observing behaviour. Want to see it in pymontrace stdout.
 - [x] Trace target which has not had pymontrace already pip installed.
-- [ ] Make darwin attach signal handling race-free
+- [x] Make darwin attach signal handling race-free
 - [ ] Make linux attach code signal resistant
 - [o] Clean up C code (specific TODOs are within)
 - [ ] Add command to list probes (maybe `sys.modules` can help)
@@ -15,6 +15,8 @@ In priority order:
 - [x] Add veneer around PyRun_SimpleString so that we
       1. don't crash the interpreter on error
       2. know whether there was an error (trap after call)
+
+- [o] multithreaded processes on linux
 
 - [ ] Make attach_and_execute re-entrant.
       We could use thread local storage. On darwin, the returning of the
