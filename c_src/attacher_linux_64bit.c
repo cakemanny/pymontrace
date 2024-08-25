@@ -698,6 +698,7 @@ get_user_regs(pid_t tid, struct user_regs_struct* user_regs)
     }
     return 0;
 }
+
 static int
 set_user_regs(pid_t tid, struct user_regs_struct* user_regs)
 {
@@ -710,6 +711,39 @@ set_user_regs(pid_t tid, struct user_regs_struct* user_regs)
     }
     return 0;
 }
+
+#ifndef __x86_64__
+__attribute__((unused))
+#endif
+static int
+get_fpregs(pid_t tid, struct user_fpregs_struct* fpregs)
+{
+    struct iovec iov = { .iov_base = fpregs, .iov_len = sizeof *fpregs };
+    if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_PRFPREG, &iov)) {
+        int esaved = errno;
+        log_err("ptrace getregset fpregs: tid=%d: %s", tid, strerror(errno));
+        errno = esaved;
+        return -1;
+    }
+    return 0;
+}
+
+#ifndef __x86_64__
+__attribute__((unused))
+#endif
+static int
+set_fpregs(pid_t tid, struct user_fpregs_struct* fpregs)
+{
+    struct iovec iov = { .iov_base = fpregs, .iov_len = sizeof *fpregs };
+    if (-1 == ptrace(PTRACE_SETREGSET, tid, NT_PRFPREG, &iov)) {
+        int esaved = errno;
+        log_err("ptrace setregset fpregs: tid=%d: %s", tid, strerror(errno));
+        errno = esaved;
+        return -1;
+    }
+    return 0;
+}
+
 
 #ifndef __x86_64__
 __attribute__((unused))
@@ -810,10 +844,15 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t bp_addr, size_t length,
     // to also save and restore FP regs
     // Also, maybe this should be elf_gregset_t ... not sure
     struct user_regs_struct user_regs = {};
-
     if (-1 == get_user_regs(tid, &user_regs)) {
         return ATT_FAIL;
     }
+#ifdef __x86_64__
+    struct user_fpregs_struct fpregs = {};
+    if (-1 == get_fpregs(tid, &fpregs)) {
+        return ATT_FAIL;
+    }
+#endif
 
     saved_instrs_t saved_instrs = { .addr = bp_addr };
     if (save_instrs(pid, &saved_instrs) != 0) {
@@ -872,6 +911,13 @@ restore_instructions:
         // Intentionally not going to return, in order to restore registers
     }
 
+#ifdef __x86_64__
+    if (-1 == set_fpregs(tid, &fpregs)) {
+        err = ATT_UNKNOWN_STATE;
+        // fall-through to try restore general purpose registers
+    }
+#endif // __x86_64__
+
     if (-1 == set_user_regs(tid, &user_regs)) {
         return ATT_UNKNOWN_STATE;
     }
@@ -888,6 +934,13 @@ call_munmap_in_target(pid_t pid, pid_t tid, uintptr_t scratch_addr,
     if (-1 == get_user_regs(tid, &user_regs)) {
         return ATT_FAIL;
     }
+#ifdef __x86_64__
+    struct user_fpregs_struct fpregs = {};
+    if (-1 == get_fpregs(tid, &fpregs)) {
+        return ATT_FAIL;
+    }
+#endif
+
 
     saved_instrs_t saved_instrs = { .addr = scratch_addr };
     if (save_instrs(pid, &saved_instrs) != 0) {
@@ -937,6 +990,13 @@ restore_instructions:
         // intentionally fall-through to restore registers
     }
 
+#ifdef __x86_64__
+    if (-1 == set_fpregs(tid, &fpregs)) {
+        err = ATT_UNKNOWN_STATE;
+        // fall-through to try restore general purpose registers
+    }
+#endif // __x86_64__
+
     if (-1 == set_user_regs(tid, &user_regs)) {
         return ATT_UNKNOWN_STATE;
     }
@@ -957,6 +1017,12 @@ indirect_call_and_brk2(
     if (-1 == get_user_regs(tid, &user_regs)) {
         return ATT_FAIL;
     }
+#ifdef __x86_64__
+    struct user_fpregs_struct fpregs = {};
+    if (-1 == get_fpregs(tid, &fpregs)) {
+        return ATT_FAIL;
+    }
+#endif
 
     saved_instrs_t saved_instrs = { .addr = scratch_addr };
     if (save_instrs(pid, &saved_instrs) != 0) {
@@ -992,6 +1058,7 @@ indirect_call_and_brk2(
     urcall.rsi = arg2;
     urcall.rax = fn_addr;
     urcall.rip = scratch_addr;
+    urcall.rsp &= -16LL; // 16-byte align stack, required for xmm0 reg use
 #elif defined(__riscv)
     urcall.a0 = arg1;
     urcall.a1 = arg2;
@@ -1026,6 +1093,14 @@ restore_instructions:
         err = ATT_UNKNOWN_STATE;
         // Intentionally not going to return, in order to restore registers
     }
+
+#ifdef __x86_64__
+    if (-1 == set_fpregs(tid, &fpregs)) {
+        err = ATT_UNKNOWN_STATE;
+        // fall-through to try restore general purpose registers
+    }
+#endif // __x86_64__
+
     if (-1 == set_user_regs(tid, &user_regs)) {
         return ATT_UNKNOWN_STATE;
     }
