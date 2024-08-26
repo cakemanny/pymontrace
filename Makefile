@@ -16,7 +16,9 @@ lint:
 .PHONY: check
 check:
 	./hack/bash-aarch64.sh -c 'cc -fsyntax-only -Wall -Werror c_src/attacher_linux_64bit.c'
-	./hack/bash-amd64.sh -c 'cc -fsyntax-only -Wall -Werror c_src/attacher_linux_64bit.c'
+	./hack/bash-aarch64.sh -c 'apt update; apt install --yes gcc-x86-64-linux-gnu; x86_64-linux-gnu-gcc -fsyntax-only -Wall -Werror c_src/attacher_linux_64bit.c'
+	./hack/bash-aarch64.sh -c 'apt update; apt install --yes gcc-riscv64-linux-gnu; riscv64-linux-gnu-gcc -fsyntax-only -Wall -Werror c_src/attacher_linux_64bit.c'
+	#./hack/bash-amd64.sh -c 'cc -fsyntax-only -Wall -Werror c_src/attacher_linux_64bit.c'
 
 
 # Note, it's not possible to do the amd64 test with docker on mac because
