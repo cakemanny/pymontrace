@@ -15,6 +15,7 @@ lint:
 # Pre-flight the linux code when working on mac
 .PHONY: check
 check:
+	cc -target x86_64-apple-macos10.13 -fsyntax-only -Wall c_src/darwin_64bit.c
 	./hack/bash-aarch64.sh -c 'cc -fsyntax-only -Wall -Werror c_src/attacher_linux_64bit.c'
 	./hack/bash-aarch64.sh -c 'apt update; apt install --yes gcc-x86-64-linux-gnu; x86_64-linux-gnu-gcc -fsyntax-only -Wall -Werror c_src/attacher_linux_64bit.c'
 	./hack/bash-aarch64.sh -c 'apt update; apt install --yes gcc-riscv64-linux-gnu; riscv64-linux-gnu-gcc -fsyntax-only -Wall -Werror c_src/attacher_linux_64bit.c'

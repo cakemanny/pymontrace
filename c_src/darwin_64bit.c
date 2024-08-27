@@ -21,7 +21,7 @@
 
 #include "attacher.h"
 
-#if !defined(__arm64__)
+#if !defined(__arm64__) && !defined(__x86_64__)
 #error "Platform not yet supported"
 #endif
 
@@ -36,7 +36,11 @@ const bool debug = false;
 
 // this is what clang gives for __builtin_debugtrap()
 //	brk	#0xf000
+#if defined(__arm64__)
 #define DEBUG_TRAP_INSTR    ((uint32_t)0xd43e0000)
+#elif defined(__x86_64__)
+#define DEBUG_TRAP_INSTR    ((uint8_t)0xcc)
+#endif
 
 static dispatch_semaphore_t sync_sema;
 
@@ -53,7 +57,13 @@ typedef struct {
 
 static page_restore_t g_breakpoint_restore;
 
-static arm_thread_state64_t g_orig_threadstate;
+#if defined(__arm64__)
+typedef arm_thread_state64_t att_threadstate_t;
+#elif defined(__x86_64__)
+typedef x86_thread_state64_t att_threadstate_t;
+#endif
+
+static att_threadstate_t g_orig_threadstate;
 static struct {
     vm_address_t addr;
     vm_size_t size;
@@ -75,6 +85,7 @@ static vm_address_t find_sysfn(task_t task, void* addr, const char* symbol);
  */
 void injection();
 void end_of_injection();
+#if defined(__arm64__)
 __asm__ ("\
 	.global _injection\n\
 	.p2align	2\n\
@@ -85,6 +96,18 @@ _injection:\n\
 _end_of_injection:\n\
 	b	_injection\n\
 ");
+#elif defined(__x86_64__)
+__asm__ ("\
+	.global _injection\n\
+	.p2align	2\n\
+_injection:\n\
+	callq	*%rax\n\
+	int3\n\
+	.global _inj_callback\n\
+_end_of_injection:\n\
+	jmp	_injection\n\
+");
+#endif // __arm64__
 
 __attribute__((format(printf, 1, 2)))
 static void
@@ -257,10 +280,18 @@ setup_exception_handling(task_t target_task, mach_port_t* exc_port)
         return ATT_FAIL;
     }
 
+    task_flavor_t flavor =
+#if defined(__arm64__)
+        ARM_THREAD_STATE64
+#elif defined(__x86_64__)
+        x86_THREAD_STATE64
+#endif
+        ;
+
     /* set the new exception ports */
     if ((kr = task_set_exception_ports(target_task, mask, *exc_port,
                     EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES,
-                    ARM_THREAD_STATE64)) != KERN_SUCCESS) {
+                    flavor)) != KERN_SUCCESS) {
         log_mach("task_set_exception_ports", kr);
         return ATT_FAIL;
     }
@@ -314,22 +345,32 @@ catch_mach_exception_raise_state_identity(
 
     log_dbg("in catch_exception_raise_state_identity");
     assert(exception == EXC_BREAKPOINT);
-    assert(*flavor == ARM_THREAD_STATE64);
-    assert(old_stateCnt == ARM_THREAD_STATE64_COUNT);
+    #if defined(__arm64__)
+        assert(*flavor == ARM_THREAD_STATE64);
+        assert(old_stateCnt == ARM_THREAD_STATE64_COUNT);
+    #elif defined(__x86_64__)
+        assert(*flavor == x86_THREAD_STATE64);
+        assert(old_stateCnt == x86_THREAD_STATE64_COUNT);
+    #endif
 
     if (debug) {
-        __builtin_dump_struct((arm_thread_state64_t*)old_state, log_dbg);
+        __builtin_dump_struct((att_threadstate_t*)old_state, log_dbg);
     }
 
     // Copy old state to new state!
     memcpy(new_state, old_state, old_stateCnt * sizeof(natural_t));
     *new_stateCnt = old_stateCnt;
 
-    arm_thread_state64_t* state = (arm_thread_state64_t*)new_state;
+    att_threadstate_t* state = (att_threadstate_t*)new_state;
 
     __auto_type r = &g_breakpoint_restore;
 
-    uint64_t pc = arm_thread_state64_get_pc(*state);
+    uint64_t pc =
+        #if defined(__arm64__)
+            arm_thread_state64_get_pc(*state);
+        #elif defined(__x86_64__)
+            state->__rip;
+        #endif
     if (pc >= r->page_addr && pc < r->page_addr + r->pagesize) {
         /*
          * Restore overwritten instruction
@@ -409,21 +450,43 @@ catch_mach_exception_raise_state_identity(
 
         g_orig_threadstate = *state;
 
-        state->__x[0] = allocated + 16;
-        state->__x[16] = fn_addr;
-        arm_thread_state64_set_pc_fptr(*state, allocated);
+        #if defined(__arm64__)
+            state->__x[0] = allocated + 16;
+            state->__x[16] = fn_addr;
+            arm_thread_state64_set_pc_fptr(*state, allocated);
+        #elif defined(__x86_64__)
+            state->__rdi = allocated + 16;
+            state->__rax = fn_addr;
+            state->__rip = allocated;
+            state->__rsp &= -16LL; // 16-byte align stack
+        #endif
 
     } else {
         /*
          * We've come back from PyRun_SimpleString
          */
         log_dbg("in the second breakpoint");
-        assert(arm_thread_state64_get_pc(g_orig_threadstate) != 0);
+        #if defined(__arm64__)
+            assert(arm_thread_state64_get_pc(g_orig_threadstate) != 0);
+        #elif defined(__x86_64__)
+            assert(g_orig_threadstate.__rip != 0);
+        #endif
         assert(g_allocated.addr != 0 && g_allocated.size != 0);
 
-        uint64_t retval = state->__x[0];
+        uint64_t retval =
+            #if defined(__arm64__)
+                state->__x[0];
+            #elif defined(__x86_64__)
+                state->__rax;
+            #endif
 
-        *(arm_thread_state64_t*)new_state = g_orig_threadstate;
+        *(att_threadstate_t*)new_state = g_orig_threadstate;
+        #ifdef __x86_64__
+            // 0xcc on x86 progresses the instruction pointer to the
+            // instruction after the trap instruction. But since we
+            // replaced it, we need to go back and execute it.
+            ((att_threadstate_t*)new_state)->__rip -= 1;
+        #endif
 
         kr = vm_deallocate(task, g_allocated.addr, g_allocated.size);
         if (kr != KERN_SUCCESS) {
@@ -770,7 +833,11 @@ attach_and_execute(const int pid, const char* python_code)
     log_dbg("instr at BP: %8x\n", saved_instruction);
 
     /* write the breakpoint */
+#if defined(__arm64__)
     *(uint32_t*)local_bp_addr = DEBUG_TRAP_INSTR;
+#else
+    *(uint8_t*)local_bp_addr = DEBUG_TRAP_INSTR;
+#endif
 
 
     int protection;

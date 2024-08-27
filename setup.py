@@ -2,7 +2,7 @@ import sys
 from setuptools import Extension, setup
 
 DARWIN_SOURCES = [
-    "c_src/darwin_arm64.c",
+    "c_src/darwin_64bit.c",
     "c_src/mach_excServer.c",
 ]
 
