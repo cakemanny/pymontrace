@@ -8,10 +8,10 @@ dependencies = []
 [project.optional-dependencies]
 test = [
   "pytest       ~= 7.0",
+  "flake8       ~= 7.0",
 ]
 dev = [
   "black        ==23.12.1",
-  "flake8       ~= 7.0",
   "isort        ~= 5.0",
 #  "maturin",
 ]

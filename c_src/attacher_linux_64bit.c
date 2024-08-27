@@ -1129,12 +1129,9 @@ attach_and_execute(const int pid, const char* python_code)
     }
 
     struct tgt_thrd thrds[MAX_THRDS] = {};
+    nthreads = MAX_THRDS; // number of threads can change from first check.
     err = get_threads(pid, thrds, &nthreads);
     if (err != 0) {
-        return err;
-    }
-    if (nthreads > MAX_THRDS) {
-        log_err("changing number of threads");
         return ATT_FAIL;
     }
 
@@ -1150,6 +1147,8 @@ attach_and_execute(const int pid, const char* python_code)
     if (err != 0) {
         return err;
     }
+    // TODO: check all threads are stopped (i.e. some have not been spawned
+    // while we were stopping them.)
 
     // TODO: consider setting a hardware breakpoint instead.
 

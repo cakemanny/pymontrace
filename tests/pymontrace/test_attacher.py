@@ -23,51 +23,63 @@ def func_body_to_script_text(func):
     return textwrap.dedent(''.join(lines_wanted))
 
 
-def test_attach_and_exec():
-    from pymontrace import attacher
+# Note: we use os.write instead of print, as print seems to write the \n
+# separately
+single_threaded_program = """\
+import time
+import os
+os.write(1, b'started\\n')
+start = time.time()
+while time.time() < (start + 5.0):
+    time.sleep(0.1)
+"""
 
+
+@pytest.fixture
+def single_threaded_subprocess():
     with subprocess.Popen(
-        ['python3', '-u', '-c', 'import time\nwhile True: time.sleep(0.1)'],
+        [sys.executable, '-u', '-c', single_threaded_program],
         stdout=subprocess.PIPE,
     ) as p:
         try:
-            time.sleep(0.01)
-
-            attacher.attach_and_exec(p.pid, 'for _ in range(3): print("hello")')
-
             assert p.stdout
-            stdout = os.read(p.stdout.fileno(), 10)
-            assert b'hello' in stdout
+            stdout = os.read(p.stdout.fileno(), len('started\n'))  # blocks until start
+            assert stdout == b'started\n'
+
+            yield p
         finally:
             # This seems to be necessary on macos, to avoid hanging
             p.terminate()
 
 
-def test_attach_and_exec__bad_code():
+def test_attach_and_exec(single_threaded_subprocess):
     from pymontrace import attacher
 
-    with subprocess.Popen(
-        ['python3', '-u', '-c', 'import time\nwhile True: time.sleep(0.1)'],
-        stdout=subprocess.PIPE,
-    ) as p:
-        try:
-            time.sleep(0.01)
+    p = single_threaded_subprocess
 
-            with pytest.raises(Exception):
-                attacher.attach_and_exec(p.pid, 'pppprint("oh noh typoh")')
+    attacher.attach_and_exec(p.pid, 'for _ in range(3): print("hello")')
 
-        finally:
-            # This seems to be necessary on macos, to avoid hanging
-            p.terminate()
+    stdout = os.read(p.stdout.fileno(), 10)
+    assert b'hello' in stdout
+
+
+def test_attach_and_exec__bad_code(single_threaded_subprocess):
+    from pymontrace import attacher
+
+    p = single_threaded_subprocess
+    with pytest.raises(Exception):
+        attacher.attach_and_exec(p.pid, 'pppprint("oh noh typoh")')
 
 
 multithreaded_program = """\
 import os
 import threading
 import time
+
 start = time.time()
 
 def task():
+    os.write(1, b'started\\n')
     while time.time() < (start + 5.0):
         time.sleep(0.01)
     os._exit(1)  # avoid giving control back to the main thread.
@@ -82,11 +94,13 @@ def test_attach_to_multithreaded_program():
     from pymontrace import attacher
 
     with subprocess.Popen(
-        ['python3', '-u', '-c', multithreaded_program],
+        [sys.executable, '-u', '-c', multithreaded_program],
         stdout=subprocess.PIPE,
     ) as p:
         try:
-            time.sleep(0.1)
+            assert p.stdout
+            stdout = os.read(p.stdout.fileno(), len('started\n'))  # blocks until start
+            assert stdout == b'started\n'
 
             attacher.attach_and_exec(p.pid, 'for _ in range(3): print("hello")')
 

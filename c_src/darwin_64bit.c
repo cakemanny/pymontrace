@@ -110,7 +110,7 @@ _end_of_injection:\n\
 #endif // __arm64__
 
 __attribute__((format(printf, 1, 2)))
-static void
+static int
 log_dbg(const char* fmt, ...)
 {
     va_list valist;
@@ -125,6 +125,8 @@ log_dbg(const char* fmt, ...)
     }
 
     va_end(valist);
+    return 0;  // we only return int to satisfy __builtin_dump_struct on
+               // ventura
 }
 
 __attribute__((format(printf, 1, 2)))
@@ -244,6 +246,11 @@ get_region_protection(task_t task, vm_address_t page_addr, int* protection)
     return kr;
 }
 
+// backport for macOS < 14
+#ifndef TASK_MAX_EXCEPTION_PORT_COUNT
+#define TASK_MAX_EXCEPTION_PORT_COUNT EXC_TYPES_COUNT
+#endif // TASK_MAX_EXCEPTION_PORT_COUNT
+
 // Adapted from https://gist.github.com/rodionovd/01fff61927a665d78ecf
 static struct {
     mach_msg_type_number_t count;
@@ -354,7 +361,7 @@ catch_mach_exception_raise_state_identity(
     #endif
 
     if (debug) {
-        __builtin_dump_struct((att_threadstate_t*)old_state, log_dbg);
+        __builtin_dump_struct((att_threadstate_t*)old_state, &log_dbg);
     }
 
     // Copy old state to new state!
@@ -705,6 +712,7 @@ find_pyfn(task_t task, const char* symbol)
         char bn[1024];
         memcpy(bn, it.filepath, 1024);
         if (strcmp(basename(bn), PYTHON_SO_BASENAME) == 0) {
+            log_dbg("looking in %s", it.filepath);
 
             Dl_info dlinfo = {};
             if (load_and_find_safepoint(it.filepath, symbol, &dlinfo) != 0) {
@@ -715,7 +723,9 @@ find_pyfn(task_t task, const char* symbol)
 
             fn_addr =
                 (vm_address_t)it.info.imageLoadAddress + breakpoint_offset;
-            break;
+            if (!debug) {
+                break;
+            }
         }
 
     }
@@ -729,7 +739,7 @@ find_needed_python_funcs(task_t task)
 {
     g_pyfn_addrs.PyRun_SimpleString = find_pyfn(task, "PyRun_SimpleString");
     if (!g_pyfn_addrs.PyRun_SimpleString) {
-        log_err("could not find %s in shared libs", "PyRun_SimpleString");
+        log_err("could not find %s in shared libs\n", "PyRun_SimpleString");
         return ATT_FAIL;
     }
     return 0;
