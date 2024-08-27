@@ -11,6 +11,7 @@ from tempfile import TemporaryDirectory
 
 from pymontrace import _darwin
 
+
 def parse_probe(probe_spec):
     probe_name, probe_args = probe_spec.split(':', 1)
     if probe_name == 'line':
