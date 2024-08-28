@@ -1,4 +1,4 @@
-
+OS = $(shell uname)
 
 .PHONY: dev-setup
 dev-setup:
@@ -12,15 +12,28 @@ lint:
 	flake8 src
 
 
-# Pre-flight the linux code when working on mac
 .PHONY: check
+ifeq "$(OS)" "Darwin"
+# Pre-flight the linux code when working on mac
 check:
-	cc -target x86_64-apple-macos10.13 -fsyntax-only -Wall c_src/darwin_64bit.c
-	./hack/bash-aarch64.sh -c 'cc -fsyntax-only -Wall -Werror c_src/attacher_linux_64bit.c'
-	./hack/bash-aarch64.sh -c 'apt update; apt install --yes gcc-x86-64-linux-gnu; x86_64-linux-gnu-gcc -fsyntax-only -Wall -Werror c_src/attacher_linux_64bit.c'
-	./hack/bash-aarch64.sh -c 'apt update; apt install --yes gcc-riscv64-linux-gnu; riscv64-linux-gnu-gcc -fsyntax-only -Wall -Werror c_src/attacher_linux_64bit.c'
-	#./hack/bash-amd64.sh -c 'cc -fsyntax-only -Wall -Werror c_src/attacher_linux_64bit.c'
+	cc -c -target x86_64-apple-macos10.13 -Wall -Werror -o /dev/null c_src/darwin_64bit.c
+	./hack/bash-aarch64.sh -c 'make check'
 
+else
+
+CFLAGS = -Wall -Wextra -Wvla -Werror
+check:
+	$(CC) -fsyntax-only $(CFLAGS) c_src/attacher_linux_64bit.c
+	apt update
+	apt install --yes \
+		gcc-aarch64-linux-gnu \
+		gcc-x86-64-linux-gnu \
+		gcc-riscv64-linux-gnu
+	aarch64-linux-gnu-gcc -fsyntax-only $(CFLAGS) c_src/attacher_linux_64bit.c
+	x86_64-linux-gnu-gcc -fsyntax-only $(CFLAGS) c_src/attacher_linux_64bit.c
+	riscv64-linux-gnu-gcc -fsyntax-only $(CFLAGS) c_src/attacher_linux_64bit.c
+
+endif # OS eq Darwin
 
 # Note, it's not possible to do the amd64 test with docker on mac because
 # qemu runs in user space in an arm64 VM there.
