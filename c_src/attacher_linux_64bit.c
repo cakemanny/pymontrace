@@ -1109,7 +1109,7 @@ out:
 // we should not do this, it's re-entrant ...
 static volatile sig_atomic_t g_got_signal;
 static void
-signal_handler(int signo)
+signal_handler(/*int signo*/)
 {
     g_got_signal = 1;
 }
