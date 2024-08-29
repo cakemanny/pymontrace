@@ -1,5 +1,6 @@
 import inspect
 import os
+import signal
 import subprocess
 import sys
 import textwrap
@@ -110,3 +111,40 @@ def test_attach_to_multithreaded_program():
         finally:
             # This seems to be necessary on macos, to avoid hanging
             p.terminate()
+
+
+def test_receiving_signal_during_attach():
+
+    slow_program = textwrap.dedent("""\
+    import time
+    import os
+    os.write(1, b'started\\n')
+    start = time.time()
+    time.sleep(1)
+    time.sleep(1)
+    """)
+
+    p0 = subprocess.Popen([sys.executable, '-u', '-c', slow_program],
+                          stdout=subprocess.PIPE)
+    assert p0.stdout
+    stdout = os.read(p0.stdout.fileno(), len('started\n'))
+    assert stdout == b'started\n'
+
+    attach_program = textwrap.dedent(f"""\
+    from pymontrace import attacher
+
+    attacher.attach_and_exec({p0.pid}, 'print("hello")')
+    """)
+    attach_proc = subprocess.Popen([sys.executable, '-u', '-c', attach_program])
+
+    time.sleep(0.3)
+
+    os.kill(attach_proc.pid, signal.SIGTERM)
+
+    attach_return_code = attach_proc.wait()
+    assert attach_return_code != 0
+
+    # i.e. p0 should survive until it ends naturally
+    assert p0.wait() == 0
+
+    p0.terminate()

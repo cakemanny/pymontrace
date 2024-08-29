@@ -18,16 +18,18 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#if defined(__riscv) && __riscv_xlen == 64
-    // struct user_regs_struct isn't defined properly without this
-    #include <linux/ptrace.h>
-#endif
+// struct user_regs_struct isn't defined properly on riscv without this
+// and it gives us user_hwdebug_state
+#include <linux/ptrace.h>
+
 #include <linux/elf.h>
 #include <sys/uio.h>
 
 #include <assert.h>
 
 #include "attacher.h"
+
+#define NELEMS(A)   (sizeof(A) / sizeof(A[0]))
 
 #define SAFE_POINT  "PyEval_SaveThread"
 
@@ -1104,6 +1106,55 @@ out:
     return err;
 }
 
+// we should not do this, it's re-entrant ...
+static volatile sig_atomic_t g_got_signal;
+static void
+signal_handler(int signo)
+{
+    g_got_signal = 1;
+}
+
+const int handled_signums[4] = {
+    SIGHUP,
+    SIGINT,
+    SIGTERM,
+    SIGQUIT
+};
+typedef struct {
+    struct sigaction ss_act[4];
+} saved_sigaction_t;
+
+static void
+install_signal_handler(saved_sigaction_t* oldactions)
+{
+    g_got_signal = 0; // reset global flag
+
+    struct sigaction new_sigaction = { .sa_handler = &signal_handler, };
+
+    const int num_signals = NELEMS(handled_signums);
+    for (int i = 0; i < num_signals; i++) {
+        int signo = handled_signums[i];
+        if (-1 == sigaction(signo, &new_sigaction, &oldactions->ss_act[i])) {
+            perror("sigaction");
+            abort(); // All sigaction errors are programming errors
+        }
+    }
+}
+
+static void
+remove_signal_handler(saved_sigaction_t* oldactions)
+{
+    const int num_signals = NELEMS(handled_signums);
+
+    for (int i = 0; i < num_signals; i++) {
+        int signo = handled_signums[i];
+        if (-1 == sigaction(signo, &oldactions->ss_act[i], NULL)) {
+            log_err("sigaction");
+            abort();
+        }
+    }
+}
+
 int
 attach_and_execute(const int pid, const char* python_code)
 {
@@ -1151,6 +1202,9 @@ attach_and_execute(const int pid, const char* python_code)
     // while we were stopping them.)
 
     // TODO: consider setting a hardware breakpoint instead.
+
+    saved_sigaction_t saved_sigactions = {};
+    install_signal_handler(&saved_sigactions);
 
     saved_instrs_t saved_instrs = { .addr = breakpoint_addr };
     if (save_instrs(pid, &saved_instrs) != 0) {
@@ -1246,6 +1300,8 @@ attach_and_execute(const int pid, const char* python_code)
     }
 
 detach:
+    remove_signal_handler(&saved_sigactions);
+
     if (detach_threads(thrds, nthreads) != 0) {
         err = ATT_UNKNOWN_STATE;
     }
