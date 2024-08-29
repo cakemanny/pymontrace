@@ -6,6 +6,7 @@ import socket
 import struct
 import sys
 import textwrap
+import threading
 import traceback
 from typing import Union
 from types import CodeType, FrameType
@@ -178,9 +179,11 @@ def settrace(user_break, user_python_snippet, comm_file):
         probe = LineProbe(user_break[0], user_break[1])
 
         if sys.version_info < (3, 12):
-            sys.settrace(create_event_handlers(
+            event_handlers = create_event_handlers(
                 probe, user_python_obj, user_python_snippet
-            ))
+            )
+            sys.settrace(event_handlers)
+            threading.settrace(event_handlers)
         else:
 
             def handle_line(code: CodeType, line_number: int):
@@ -216,6 +219,7 @@ def unsettrace():
     # This can fail if installing probes failed.
     try:
         if sys.version_info < (3, 12):
+            threading.settrace(None)  # type: ignore  # bug in typeshed.
             sys.settrace(None)
         else:
             sys.monitoring.register_callback(
