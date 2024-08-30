@@ -1012,3 +1012,10 @@ restore_mask:
 
     return err;
 }
+
+int
+execute_in_threads(
+        int pid, uint64_t* tids, int count_tids, const char* python_code)
+{
+    return -1; /* not implemented */
+}

@@ -10,6 +10,7 @@ import textwrap
 from tempfile import TemporaryDirectory
 
 from pymontrace import _darwin
+from pymontrace import attacher
 
 
 def parse_probe(probe_spec):
@@ -77,7 +78,8 @@ def format_bootstrap_snippet(parsed_probe, action, comm_file, site_extension):
 
     settrace_snippet = textwrap.dedent(
         f"""
-        pymontrace.tracee.settrace({user_break!r}, {action!r}, {comm_file!r})
+        pymontrace.tracee.connect({comm_file!r})
+        pymontrace.tracee.settrace({user_break!r}, {action!r})
         """
     )
 
@@ -152,13 +154,42 @@ def create_and_bind_socket(comms: CommsFile, pid: int) -> socket.socket:
     return ss
 
 
+def get_peer_pid(s: socket.socket):
+    if sys.platform == 'darwin':
+        # See: sys/un.h
+        SOL_LOCAL = 0
+        LOCAL_PEERPID = 0x002
+        peer_pid_buf = s.getsockopt(SOL_LOCAL, LOCAL_PEERPID, 4)
+        return int.from_bytes(peer_pid_buf, sys.byteorder)
+    if sys.platform == 'linux':
+        ucred_buf = s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        (pid, uid, gid) = struct.unpack('iii', ucred_buf)
+        return pid
+    raise NotImplementedError
+
+
 def decode_and_print_forever(s: socket.socket):
+    from pymontrace.tracee import Message
+
     header_fmt = struct.Struct('HH')
     while True:
-        header = s.recv(4)
+        header = s.recv(header_fmt.size)
         if header == b'':
             break
         (kind, size) = header_fmt.unpack(header)
-        line = s.recv(size)
-        out = (sys.stderr if kind == 2 else sys.stdout)
-        out.write(line.decode())
+        body = s.recv(size)
+        if kind in (Message.PRINT, Message.ERROR,):
+            line = body
+            out = (sys.stderr if kind == Message.ERROR else sys.stdout)
+            out.write(line.decode())
+        elif kind == Message.THREADS:
+            count_threads = size // struct.calcsize('Q')
+            thread_ids = struct.unpack(count_threads * 'Q', body)
+            print('additional threads to trace:', thread_ids,
+                  file=sys.stderr)
+            if 1 == 0:
+                # This may not be the correct value if the target has forked
+                pid = get_peer_pid(s)
+                attacher.exec_in_threads(pid, thread_ids, '')
+        else:
+            print('unknown message kind:', kind, file=sys.stderr)

@@ -53,6 +53,7 @@ class LineProbe:
 class Message:
     PRINT = 1
     ERROR = 2
+    THREADS = 3  # Additional threads the tracer must attach to
 
 
 class pmt:
@@ -61,8 +62,8 @@ class pmt:
     the system and returning data to the tracer.
     """
 
-    # TODO: we need to come up with a message type and encoding format
-    # so that we can buffer and also send other kinds of data
+    # TODO: we should either use datagrams, or lock access to
+    # this since we use it from multiple threads.
     comm_fh: Union[socket.socket, None] = None
 
     @staticmethod
@@ -76,7 +77,7 @@ class pmt:
         print(*args, **kwargs)
 
         to_write = buf.getvalue().encode()
-        return struct.pack('BH', message_type, len(to_write)) + to_write
+        return struct.pack('HH', message_type, len(to_write)) + to_write
 
     @staticmethod
     def print(*args, **kwargs):
@@ -96,6 +97,22 @@ class pmt:
             except Exception:
                 pass
             pmt.comm_fh = None
+
+    @staticmethod
+    def _notify_threads(tids):
+        """
+        Notify the tracer about additional threads that may need a
+        settrace call.
+        """
+        count = len(tids)
+        fmt = 'HH' + (count * 'Q')
+        body_size = struct.calcsize((count * 'Q'))
+        encoded = struct.pack(fmt, Message.THREADS, body_size, *tids)
+        if pmt.comm_fh is not None:
+            try:
+                pmt.comm_fh.sendall(encoded)
+            except BrokenPipeError:
+                pmt._force_close()
 
 
 def safe_eval(action: CodeType, frame: FrameType, snippet: str):
@@ -154,25 +171,23 @@ def create_event_handlers(probe: LineProbe, action: CodeType, snippet: str):
     return handle_call
 
 
-# The function called inside the target to start tracing
-def settrace(user_break, user_python_snippet, comm_file):
-
-    try:
-        if pmt.comm_fh is not None:
-            # Maybe a previous settrace failed half-way through
+def connect(comm_file):
+    """
+    Connect back to the tracer.
+    Called by the tracer when attaching to the target.
+    """
+    if pmt.comm_fh is not None:
+        # Maybe a previous settrace failed half-way through
+        try:
             pmt.comm_fh.close()
-        pmt.comm_fh = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        pmt.comm_fh.connect(comm_file)
-    except Exception:
-        # Once we are more stable, we should avoid this printing inside the
-        # tracee. Or we could have a flag to enable it.
-        # On mac this tends to happen when ctrl-c'ing while waiting
-        # to attach.
-        # Once we've ported the latest attacher changes over to linux
-        # we can stop catching this again
-        print(f'{__name__}.settrace failed', file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-        return
+        except Exception:
+            pass
+    pmt.comm_fh = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    pmt.comm_fh.connect(comm_file)
+
+
+# The function called inside the target to start tracing
+def settrace(user_break, user_python_snippet, is_initial=True):
 
     try:
         user_python_obj = compile(user_python_snippet, '<pymontrace expr>', 'exec')
@@ -183,7 +198,16 @@ def settrace(user_break, user_python_snippet, comm_file):
                 probe, user_python_obj, user_python_snippet
             )
             sys.settrace(event_handlers)
-            threading.settrace(event_handlers)
+            if is_initial:
+                threading.settrace(event_handlers)
+                own_tid = threading.get_native_id()
+                additional_tids = [
+                    thread.native_id for thread in threading.enumerate()
+                    if (thread.native_id != own_tid
+                        and thread.native_id is not None)
+                ]
+                if additional_tids:
+                    pmt._notify_threads(additional_tids)
         else:
 
             def handle_line(code: CodeType, line_number: int):
@@ -209,7 +233,7 @@ def settrace(user_break, user_python_snippet, comm_file):
         except Exception:
             print(f'{__name__}.settrace failed:', repr(e), file=sys.stderr)
         try:
-            pmt.comm_fh.close()
+            pmt.comm_fh.close()  # type: ignore  # we catch the exception
             pmt.comm_fh = None
         except Exception:
             pass
