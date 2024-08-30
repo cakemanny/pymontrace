@@ -6,7 +6,7 @@
  * For supporting a small number of background or worker threads, not
  * something like a threaded http server.
  */
-enum { MAX_THREADS = 8 };
+enum { MAX_THREADS = 16 };
 
 static PyObject *
 attacher_attach_and_exec(PyObject *self, PyObject *args)
@@ -32,7 +32,7 @@ attacher_attach_and_exec(PyObject *self, PyObject *args)
 }
 
 static int
-convert_tids(PyObject *arg, int* tids)
+convert_tids(PyObject *arg, uint64_t* tids)
 {
     if (!PySequence_Check(arg)) {
         PyErr_SetString(PyExc_TypeError, "'tids' must be sequence of ints");
@@ -41,7 +41,7 @@ convert_tids(PyObject *arg, int* tids)
     ssize_t len = PySequence_Length(arg);
     if (len > MAX_THREADS) {
         PyErr_SetString(PyExc_ValueError,
-                "Number of tids cannot exceed 8" /* MAX_THREADS */ );
+                "Number of tids cannot exceed 16" /* MAX_THREADS */ );
         return 0;
     }
     for (int i = 0; i < len; i++) {
@@ -69,17 +69,19 @@ attacher_exec_in_threads(PyObject *self, PyObject *args)
     int err;
     uint64_t tids[MAX_THREADS] = {};
 
-
     if (!PyArg_ParseTuple(args, "iO&s:exec_in_threads", &pid, &convert_tids,
                 tids, &command)) {
         return NULL;
     }
 
     int count_tids = 0;
-    for (int i = 0; i < MAX_THREADS && tids[i] != 0;
-            i++, count_tids++) { }
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (tids[i] != 0) { count_tids += 1; }
+    }
 
+    Py_BEGIN_ALLOW_THREADS
     err = execute_in_threads(pid, tids, count_tids, command);
+    Py_END_ALLOW_THREADS
     if (err < 0) {
         PyErr_SetNone(PyExc_NotImplementedError);
         return NULL;

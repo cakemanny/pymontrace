@@ -3,10 +3,12 @@ import inspect
 import os
 import pathlib
 import shutil
+import signal
 import socket
 import struct
 import sys
 import textwrap
+import threading
 from tempfile import TemporaryDirectory
 
 from pymontrace import _darwin
@@ -84,6 +86,10 @@ def format_bootstrap_snippet(parsed_probe, action, comm_file, site_extension):
     )
 
     return '\n'.join([import_snippet, settrace_snippet])
+
+
+def format_additional_thread_snippet():
+    return 'import pymontrace.tracee; pymontrace.tracee.synctrace()'
 
 
 def format_untrace_snippet():
@@ -168,28 +174,58 @@ def get_peer_pid(s: socket.socket):
     raise NotImplementedError
 
 
+def settrace_in_threads(pid: int, thread_ids: tuple[int]):
+    attacher.exec_in_threads(
+        pid, thread_ids, format_additional_thread_snippet()
+    )
+
+
+def signal_handler(signo: int, frame):
+    # We implement the default behaviour, i.e. terminating. But
+    # we raise SystemExit so that finally blocks are run and atexit.
+    raise SystemExit(128 + signo)
+
+
+def install_signal_handler():
+    for signo in [
+            signal.SIGHUP,
+            signal.SIGTERM,
+            signal.SIGQUIT
+    ]:
+        signal.signal(signo, signal_handler)
+
+
 def decode_and_print_forever(s: socket.socket):
     from pymontrace.tracee import Message
 
-    header_fmt = struct.Struct('HH')
-    while True:
-        header = s.recv(header_fmt.size)
-        if header == b'':
-            break
-        (kind, size) = header_fmt.unpack(header)
-        body = s.recv(size)
-        if kind in (Message.PRINT, Message.ERROR,):
-            line = body
-            out = (sys.stderr if kind == Message.ERROR else sys.stdout)
-            out.write(line.decode())
-        elif kind == Message.THREADS:
-            count_threads = size // struct.calcsize('Q')
-            thread_ids = struct.unpack(count_threads * 'Q', body)
-            print('additional threads to trace:', thread_ids,
-                  file=sys.stderr)
-            if 1 == 0:
-                # This may not be the correct value if the target has forked
-                pid = get_peer_pid(s)
-                attacher.exec_in_threads(pid, thread_ids, '')
-        else:
-            print('unknown message kind:', kind, file=sys.stderr)
+    install_signal_handler()
+
+    t = None
+    try:
+        header_fmt = struct.Struct('=HH')
+        while True:
+            header = s.recv(header_fmt.size)
+            if header == b'':
+                break
+            (kind, size) = header_fmt.unpack(header)
+            body = s.recv(size)
+            if kind in (Message.PRINT, Message.ERROR,):
+                line = body
+                out = (sys.stderr if kind == Message.ERROR else sys.stdout)
+                out.write(line.decode())
+            elif kind == Message.THREADS:
+                count_threads = size // struct.calcsize('=Q')
+                thread_ids = struct.unpack('=' + (count_threads * 'Q'), body)
+                if sys.platform == 'linux' and os.uname().machine == 'aarch64':
+                    # This may not be the correct value if the target has forked
+                    pid = get_peer_pid(s)
+                    t = threading.Thread(target=settrace_in_threads,
+                                         args=(pid, thread_ids))
+                    t.start()
+            else:
+                print('unknown message kind:', kind, file=sys.stderr)
+    finally:
+        # But maybe we need to kill it...
+        if t is not None:
+            signal.pthread_kill(t.ident, signal.SIGINT)
+            t.join()

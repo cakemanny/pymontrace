@@ -10,7 +10,8 @@ import pytest
     ((1, "wrong", "print('hi')"), TypeError, ),
     ((1, ["wrong"], "print('hi')"), TypeError,),
     ((1, [1, "wrong"], "print('hi')"), TypeError,),
-    ((1, [1, 2, 3, 4, 5, 6, 7, 8, 9], "print('hi')"), ValueError,),
+    ((1, [1, 2, 3, 4, 5, 6, 7, 8,
+          9, 10, 11, 12, 13, 14, 15, 16, 17], "print('hi')"), ValueError,),
     ((1, [-5], "print('hi')"), OverflowError,),
 ])
 def test_exec_in_threads(args, exc_type):

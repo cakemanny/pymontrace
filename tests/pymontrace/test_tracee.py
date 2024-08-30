@@ -72,7 +72,7 @@ def test_pmt_print():
 
     assert encoded == b'\x01\x00\x08\x00a 1 b 2\n'
 
-    assert struct.unpack('HH', encoded[:4]) == (Message.PRINT, 8,)
+    assert struct.unpack('=HH', encoded[:4]) == (Message.PRINT, 8,)
     assert len(encoded[4:]) == 8
 
     assert pmt._encode_print('a', 1, 'b', 2, sep='-', end='') \
@@ -85,3 +85,15 @@ def test_pmt_print_error():
 
     assert encoded == b'\x02\x00\x04\x00xxx\n'
     assert encoded[0] == Message.ERROR
+
+
+def test_pmt_encode_threads():
+
+    encoded = pmt._encode_threads([7841, 7843])
+
+    assert encoded == (
+        b'\x03\x00'
+        b'\x10\x00'
+        b'\xa1\x1e\x00\x00\x00\x00\x00\x00'
+        b'\xa3\x1e\x00\x00\x00\x00\x00\x00'
+    )

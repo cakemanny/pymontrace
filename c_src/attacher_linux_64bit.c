@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 
 #include <fcntl.h>
@@ -58,7 +59,7 @@
 // Always define debug to avoid warnings about non-use.
 #ifdef NDEBUG
 const int debug = 0;
-#else
+#else // !NDEBUG
 const int debug = 1;
 #endif // NDEBUG
 #define log_dbg(fmt, ...) do { \
@@ -503,6 +504,9 @@ continue_sgl_thread(pid_t tid)
 struct tgt_thrd {
     pid_t tid;
     int wstatus;
+    int attached    : 1,
+        hw_bp_set   : 1,
+        running     : 1;
 };
 
 static int
@@ -547,14 +551,16 @@ attach_threads(struct tgt_thrd* thrds, int count)
             log_err("ptrace attach: tid=%d: %s", t->tid, strerror(errno));
             goto error;
         }
+        t->attached = 1;
+        t->running = 1;
         if ((err = ptrace(PTRACE_INTERRUPT, t->tid, 0, 0)) == -1) {
             log_err("ptrace interrupt: tid=%d: %s", t->tid, strerror(errno));
             goto error;
         }
-
         if ((err = wait_for_stop(t->tid, SIGTRAP, &t->wstatus)) == -1) {
             goto error;
         }
+        t->running = 0;
     }
     return 0;
 
@@ -566,6 +572,7 @@ error:
                     strerror(errno));
             err = ATT_UNKNOWN_STATE;
         }
+        thrds[i].attached = 0;
     }
     return err;
 }
@@ -577,9 +584,10 @@ detach_threads(struct tgt_thrd* thrds, int count)
     for (int i = 0; i < count; i++) {
         err = ptrace(PTRACE_DETACH, thrds[i].tid, 0, 0);
         if (err == -1) {
-            fprintf(stderr, "ptrace detach: tid=%d: %s\n", thrds[i].tid,
+            log_err("ptrace detach: tid=%d: %s\n", thrds[i].tid,
                     strerror(errno));
         }
+        thrds[i].attached = 0;
     }
     return err;
 }
@@ -594,6 +602,7 @@ continue_threads(struct tgt_thrd* thrds, int count)
             log_err("ptrace cont: tid=%d: %s", thrds[i].tid, strerror(errno));
             err = ATT_UNKNOWN_STATE;
         }
+        thrds[i].running = 1;
     }
     return err;
 }
@@ -624,6 +633,40 @@ interrupt_threads(struct tgt_thrd* thrds, int nthreads)
         }
     }
     return err;
+}
+
+static int
+count_attached_threads(struct tgt_thrd* thrds, int nthreads)
+{
+    int count = 0;
+    for (int i = 0; i < nthreads; i++) {
+        if (thrds[i].attached) {
+            count += 1;
+        }
+    }
+    log_dbg("%s:%d count = %d", __FILE__, __LINE__, count);
+    return count;
+}
+
+static int
+find_thread_idx(struct tgt_thrd* thrds, int nthreads, pid_t tid)
+{
+    for (int i = 0; i < nthreads; i++) {
+        if (thrds[i].tid == tid) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static struct tgt_thrd*
+find_thread(struct tgt_thrd* thrds, int nthreads, pid_t tid)
+{
+    int idx = find_thread_idx(thrds, nthreads, tid);
+    if (idx == -1) {
+        return NULL;
+    }
+    return &thrds[idx];
 }
 
 
@@ -683,6 +726,100 @@ replace_instrs(pid_t tid, uintptr_t addr, word_of_instr_t instrs)
     return 0;
 }
 
+#if defined(__aarch64__)
+
+typedef struct {
+    struct user_hwdebug_state state;
+} hw_bp_ctx_t;
+
+static int
+__set_hw_breakpoint(pid_t tid, struct user_hwdebug_state* state)
+{
+    // It's not permitted to write back more than the available number of
+    // regs. Thank you
+    // https://aarzilli.github.io/debugger-bibliography/hwbreak.html
+    size_t count_dbg_regs = (state->dbg_info & 0xff);
+    size_t len = offsetof(struct user_hwdebug_state, dbg_regs[count_dbg_regs]);
+    struct iovec iov = {
+        .iov_base = state,
+        .iov_len = len,
+    };
+    return ptrace(PTRACE_SETREGSET, tid, NT_ARM_HW_BREAK, &iov);
+}
+
+static void
+hw_bp_print_ctl(uint32_t ctrl)
+{
+    // https://developer.arm.com/documentation/101111/0101/AArch64-Debug-registers/DBGBCRn-EL1--Debug-Breakpoint-Control-Registers--EL1
+    char bits[33] = {};
+    for (int i = 0; i < 32; i++) {
+        bits[31-i] = '0' + !!(ctrl & (1 << i));
+    }
+    if (bits[32] != 0) abort();
+    log_dbg("ctrl = %s", bits);
+    log_dbg("       %s", "        ^~~~^~~~^~^    ^~~~  ^~^");
+    log_dbg("       %s", "        BT  LBN | |    BAS   | E");
+    log_dbg("       %s", "              SSC HMC       PMC ");
+}
+
+static int
+set_hw_breakpoint(pid_t tid, uintptr_t bp_addr, hw_bp_ctx_t* oldctx)
+{
+    struct iovec iov = {
+        .iov_base = &oldctx->state,
+        .iov_len = sizeof oldctx->state,
+    };
+    if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_ARM_HW_BREAK, &iov)) {
+        log_err("%s:%d:set_hw_breakpoint: ptrace getregset: tid=%d: %s",
+                __FILE__, __LINE__, tid, strerror(errno));
+        return -1;
+    }
+    struct user_hwdebug_state hdb_regs = oldctx->state;
+
+    int count_dbg_regs = (oldctx->state.dbg_info & 0xff);
+
+    int reg_idx = -1;
+    for (int i = 0; i < count_dbg_regs; i++) {
+        if (hdb_regs.dbg_regs[i].addr == 0) {
+            reg_idx = i;
+        }
+    }
+    if (reg_idx == -1) {
+        log_err("no free hardware debug registers");
+        return -1;
+    }
+
+    hw_bp_print_ctl(hdb_regs.dbg_regs[reg_idx].ctrl);
+
+    uint32_t ctrl = 0;
+    ctrl |= (0xf << 5); /* BAS: match A64 / A32 instruction */
+    ctrl |= (0b10 << 1); /* PMC: Select EL0 only */
+    ctrl |= 1; /* Enable breakpoint */
+
+    hdb_regs.dbg_regs[reg_idx].ctrl = ctrl;
+    hdb_regs.dbg_regs[reg_idx].addr = bp_addr;
+
+
+    if (-1 == __set_hw_breakpoint(tid, &hdb_regs)) {
+        log_err("%s:%d:set_hw_breakpoint: ptrace setregset: tid=%d: %s",
+                __FILE__, __LINE__, tid, strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+static int
+remove_hw_breakpoint(pid_t tid, hw_bp_ctx_t* oldctx)
+{
+    if (-1 == __set_hw_breakpoint(tid, &oldctx->state)) {
+        log_err("remove_hw_breakpoint: ptrace setregset: tid=%d: %s", tid,
+                strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+#endif // defined(__aarch64__)
 
 static int
 get_user_regs(pid_t tid, struct user_regs_struct* user_regs)
@@ -1109,7 +1246,7 @@ out:
 // we should not do this, it's re-entrant ...
 static volatile sig_atomic_t g_got_signal;
 static void
-signal_handler(int signo)
+signal_handler(/*int signo*/)
 {
     g_got_signal = 1;
 }
@@ -1225,7 +1362,6 @@ attach_and_execute(const int pid, const char* python_code)
         goto detach;
     }
 
-    // TODO: we need to protect ourselves from signals here
     fprintf(stderr, "Waiting for process to reach safepoint...\n");
 
     // Our safe point is within the GIL, so we're somewhat safe that
@@ -1257,6 +1393,12 @@ attach_and_execute(const int pid, const char* python_code)
     }
     log_dbg("have a target thread at breakpoint: tid=%d", tid);
 
+    for (int i = 0; i < nthreads; i++) {
+        if (thrds[i].tid == tid) {
+            thrds[i].running = 0;
+        }
+    }
+
     // TODO: we should check the PC that it's at (or just after) the
     // breakpoint.
 
@@ -1282,13 +1424,13 @@ attach_and_execute(const int pid, const char* python_code)
 
     if ((err = exec_python_code(pid, tid, python_code)) != 0) {
         // ... actually it's verbose enough
-        goto detach;
     }
 
-    // stop the non main threads so that they can be detached
+    // stop the running threads so that they can be detached
     for (int i = 0; i < nthreads; i++) {
         __auto_type t = &thrds[i];
         if (t->tid != tid) {
+            assert(t->running);
             if (ptrace(PTRACE_INTERRUPT, t->tid, 0, 0) == -1) {
                 perror("ptrace interrupt");
                 continue;
@@ -1296,6 +1438,7 @@ attach_and_execute(const int pid, const char* python_code)
             if (wait_for_stop(t->tid, SIGTRAP, &t->wstatus) == -1) {
                 continue;
             }
+            t->running = 0;
         }
     }
 
@@ -1312,5 +1455,151 @@ int
 execute_in_threads(
         int pid, uint64_t* tids, int count_tids, const char* python_code)
 {
+#ifdef __aarch64__
+    int err = 0;
+    enum { MAX_THRDS = 16 };
+    struct tgt_thrd thrds[MAX_THRDS] = {};
+
+    if (count_tids > MAX_THRDS) {
+        log_err("too many tids");
+        return ATT_FAIL;
+    }
+
+    for (int i = 0; i < count_tids; i++) {
+        thrds[i].tid = (pid_t)tids[i];
+    }
+    uintptr_t breakpoint_addr = find_pyfn(pid, SAFE_POINT);
+    if (breakpoint_addr == 0) {
+        log_err("unable to find %s", SAFE_POINT);
+        return ATT_FAIL;
+    }
+
+    // TODO: maybe we need to tolerate not all threads still being there.
+    if ((err = attach_threads(thrds, count_tids)) != 0) {
+        return err;
+    }
+
+    hw_bp_ctx_t saved_dbg_state[MAX_THRDS] = {};
+    for (int i = 0; i < count_tids; i++) {
+        __auto_type t = &thrds[i];
+        if (set_hw_breakpoint(t->tid, breakpoint_addr, &saved_dbg_state[i])) {
+            err = ATT_UNKNOWN_STATE;
+            goto out;
+        }
+        t->hw_bp_set = 1;
+    }
+
+    if ((err = continue_threads(thrds, count_tids)) != 0) {
+        goto out;
+    }
+
+    /* We can't use wait_for_stop here because we should tolerate threads
+       exiting I think. */
+    /* Actually we could use wait_for_stop, if it doesn't print anything */
+    while (count_attached_threads(thrds, count_tids) > 0) {
+        int status;
+        errno = 0;
+        log_dbg("waiting for bp hit");
+        pid_t tid = (tid = waitpid(-1, &status, 0));
+        if (-1 == tid && errno != EINTR) {
+            log_err("waitpid: %s", strerror(errno));
+            err = ATT_UNKNOWN_STATE;
+            goto out;
+        }
+        if (errno == EINTR) {
+            log_dbg("interrupted: %s", strerror(errno));
+            // set ATT_INTERRUPTED ?
+            goto out;
+        }
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            __auto_type t = find_thread(thrds, count_tids, tid);
+            if (t == NULL) {
+                log_err("unknown child: tid=%d", tid);
+                continue;
+            }
+            log_dbg("thread died/exited: tid=%d", t->tid);
+            t->attached = 0;
+            t->running = 0;
+            continue;
+        }
+        if (WIFSTOPPED(status) && WSTOPSIG(status) != SIGTRAP) {
+            if (-1 == ptrace(PTRACE_CONT, tid, 0, WSTOPSIG(status))) {
+                log_err("ptrace cont: %d: %s", tid, strerror(errno));
+                err = ATT_UNKNOWN_STATE;
+                goto out;
+            }
+        }
+        if (!WIFSTOPPED(status)) {
+            log_err("unexpected child status: %x", status);
+            continue;
+        }
+        __auto_type t = find_thread(thrds, count_tids, tid);
+        if (t == NULL) {
+            log_err("unknown child: tid=%d", tid);
+            ptrace(PTRACE_CONT, tid, 0, WSTOPSIG(status));
+            continue;
+        }
+        t->running = 0;
+
+        int tidx = find_thread_idx(thrds, count_tids, tid);
+
+        if (-1 == remove_hw_breakpoint(tid, &saved_dbg_state[tidx])) {
+            err = ATT_UNKNOWN_STATE;
+            goto out;
+        }
+        t->hw_bp_set = 0;
+
+        err = exec_python_code(pid, tid, python_code);
+        if (err != 0) {
+            log_err("failed to install probes in thread: %d", tid);
+        }
+        log_dbg("executed python code (tid=%d)", tid);
+
+        if (-1 == detach_threads(&thrds[tidx], 1)) {
+            err = ATT_UNKNOWN_STATE;
+            goto out;
+        }
+        t->attached = 0;
+        log_dbg("detached (tid=%d)", tid);
+    }
+
+out:
+
+    for (int i = 0; i < count_tids; i++) {
+        __auto_type t = &thrds[i];
+        if (!t->attached) {
+            continue;
+        }
+        if (t->running) {
+            int err2 = interrupt_threads(&thrds[i], 1);
+            if (err2 != 0) {
+                err = err2;
+                continue;
+            }
+            t->running = 0;
+        }
+        if (t->hw_bp_set) {
+            if (-1 == remove_hw_breakpoint(t->tid, &saved_dbg_state[i])) {
+                err = ATT_UNKNOWN_STATE;
+            } else {
+                t->hw_bp_set = 0;
+            }
+        }
+        if (-1 == detach_threads(&thrds[i], 1)) {
+            err = ATT_UNKNOWN_STATE;
+            continue;
+        }
+        t->attached = 0;
+    }
+
+    return err;
+#else /* !__aarch64__ */
+
+    if (pid) {}; /* unused */
+    if (tids) {}; /* unused */
+    if (count_tids) {}; /* unused */
+    if (python_code) {}; /* unused */
+
     return -1; /* not implemented */
+#endif /* __aarch64__ */
 }

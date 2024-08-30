@@ -77,7 +77,7 @@ class pmt:
         print(*args, **kwargs)
 
         to_write = buf.getvalue().encode()
-        return struct.pack('HH', message_type, len(to_write)) + to_write
+        return struct.pack('=HH', message_type, len(to_write)) + to_write
 
     @staticmethod
     def print(*args, **kwargs):
@@ -99,18 +99,22 @@ class pmt:
             pmt.comm_fh = None
 
     @staticmethod
+    def _encode_threads(tids):
+        count = len(tids)
+        fmt = '=HH' + (count * 'Q')
+        body_size = struct.calcsize((count * 'Q'))
+        return struct.pack(fmt, Message.THREADS, body_size, *tids)
+
+    @staticmethod
     def _notify_threads(tids):
         """
         Notify the tracer about additional threads that may need a
         settrace call.
         """
-        count = len(tids)
-        fmt = 'HH' + (count * 'Q')
-        body_size = struct.calcsize((count * 'Q'))
-        encoded = struct.pack(fmt, Message.THREADS, body_size, *tids)
         if pmt.comm_fh is not None:
             try:
-                pmt.comm_fh.sendall(encoded)
+                to_write = pmt._encode_threads(tids)
+                pmt.comm_fh.sendall(to_write)
             except BrokenPipeError:
                 pmt._force_close()
 
@@ -188,7 +192,6 @@ def connect(comm_file):
 
 # The function called inside the target to start tracing
 def settrace(user_break, user_python_snippet, is_initial=True):
-
     try:
         user_python_obj = compile(user_python_snippet, '<pymontrace expr>', 'exec')
         probe = LineProbe(user_break[0], user_break[1])
@@ -237,6 +240,19 @@ def settrace(user_break, user_python_snippet, is_initial=True):
             pmt.comm_fh = None
         except Exception:
             pass
+
+
+def synctrace():
+    """
+    Called in each additional thread by the tracer.
+    """
+    # sys.settrace must be called in each thread that wants tracing
+    if sys.version_info < (3, 10):
+        sys.settrace(threading._trace_hook)
+    elif sys.version_info < (3, 12):
+        sys.settrace(threading.gettrace())
+    else:
+        pass  # sys.monitoring should already have all threads covered.
 
 
 def unsettrace():
