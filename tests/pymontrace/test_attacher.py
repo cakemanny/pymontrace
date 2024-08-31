@@ -148,3 +148,56 @@ def test_receiving_signal_during_attach():
     assert p0.wait() == 0
 
     p0.terminate()
+
+
+def test_exec_in_threads():
+    if sys.platform != 'linux':
+        pytest.skip('per thread exec only implemented on linux so far')
+    # TODO: exclude riscv
+
+    from pymontrace import attacher
+
+    program_text = textwrap.dedent("""\
+    import os
+    import threading
+    import time
+
+    start = time.time()
+
+    def task():
+        os.write(1, (str(threading.get_native_id()) + '\\n').encode())
+        while time.time() < (start + 5.0):
+            time.sleep(0.01)
+
+    t = threading.Thread(target=task)
+    t.start()
+    task()
+    t.join()
+    """)
+
+    p = subprocess.Popen(
+        [sys.executable, '-u', '-c', program_text], stdout=subprocess.PIPE,
+    )
+    try:
+        tid0 = int(p.stdout.readline().decode().strip())
+        tid1 = int(p.stdout.readline().decode().strip())
+        assert tid0 != 0
+        assert tid1 != 0
+
+        attacher.exec_in_threads(
+            p.pid,
+            (tid0, tid1),
+            'import threading;\n'
+            'tid = threading.get_native_id()\n'
+            'print(f"hello{tid}\\n", end="", flush=True)\n'
+        )
+        p.terminate()
+        line0 = p.stdout.readline().decode().strip()
+        line1 = p.stdout.readline().decode().strip()
+
+        assert [line0, line1] in (
+            [f"hello{tid0}", f"hello{tid1}"],
+            [f"hello{tid1}", f"hello{tid0}"],
+        )
+    finally:
+        p.terminate()

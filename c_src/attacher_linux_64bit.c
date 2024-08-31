@@ -819,6 +819,100 @@ remove_hw_breakpoint(pid_t tid, hw_bp_ctx_t* oldctx)
     }
     return 0;
 }
+
+#elif defined(__x86_64__)
+
+typedef struct {
+    int reg_idx;
+    uint64_t ctrl;
+} hw_bp_ctx_t;
+
+static int
+set_hw_breakpoint(pid_t tid, uintptr_t bp_addr, hw_bp_ctx_t* oldctx)
+{
+    // Look for a free debug register in DR0-3
+    // (DR4 and DR5 are reserved for the kernel)
+    int dr_idx = -1;
+    for (int i = 0; i < 4; i++) {
+        uintptr_t drv = 0;
+        if (-1 == ptrace(PTRACE_PEEKUSER, tid,
+                    offsetof(struct user, u_debugreg[i]), &drv)) {
+            log_err("ptrace peekuser: tid=%d: dr%d %s", tid, i,
+                    strerror(errno));
+            return -1;
+        }
+        if (drv == 0) {
+            dr_idx = i;
+            break;
+        }
+    }
+    if (-1 == dr_idx) {
+        log_err("no free hw breakpoints: tid=%d\n", tid);
+        return -1;
+    }
+
+    // DR7 is the control register
+    uint64_t ctrl = 0;
+    if (-1 == ptrace(PTRACE_PEEKUSER, tid,
+                offsetof(struct user, u_debugreg[7]), &ctrl)) {
+        log_err("ptrace peekuser: dr7 (tid=%d): %s", tid, strerror(errno));
+        return -1;
+    }
+
+    oldctx->ctrl = ctrl;
+
+    // The first four even numbered bits enable/disable a process local
+    // breakpoint
+    ctrl |= (1 << (2 * dr_idx));
+
+    // R/W bits and LEN bits should all be zero for an intstruction execution
+    // breakpoint.
+    ctrl &= ~((0b1111 << (dr_idx * 4)) << 16);
+
+    if (-1 == ptrace(PTRACE_POKEUSER, tid,
+                offsetof(struct user, u_debugreg[dr_idx]), bp_addr)) {
+        log_err("ptrace pokeuser: dr%d: %s", dr_idx, strerror(errno));
+        return -1;
+    }
+    if (-1 == ptrace(PTRACE_POKEUSER, tid,
+                offsetof(struct user, u_debugreg[7]), ctrl)) {
+        log_err("ptrace pokeuser: dr7: %s", strerror(errno));
+        // Unset addr
+        ptrace(PTRACE_POKEUSER, tid,
+                    offsetof(struct user, u_debugreg[dr_idx]), 0UL);
+        return -1;
+    }
+    return -1;
+}
+
+static int
+remove_hw_breakpoint(pid_t tid, hw_bp_ctx_t* oldctx)
+{
+    int dr_idx = oldctx->reg_idx;
+
+    uint64_t ctrl = 0;
+    if (-1 == ptrace(PTRACE_PEEKUSER, tid,
+                offsetof(struct user, u_debugreg[7]), &ctrl)) {
+        log_err("ptrace peekuser: dr7 (tid=%d): %s", tid, strerror(errno));
+        return -1;
+    }
+    // Clear DR0-3 local enable bit.
+    ctrl &= ~(1 << (2 * dr_idx));
+    // Don't bother with restoring the settings.
+
+    if (-1 == ptrace(PTRACE_POKEUSER, tid,
+                offsetof(struct user, u_debugreg[dr_idx]), 0UL)) {
+        log_err("ptrace pokeuser: dr%d (tid=%d): %s", dr_idx, tid,
+                strerror(errno));
+        return -1;
+    }
+    if (-1 == ptrace(PTRACE_POKEUSER, tid,
+                offsetof(struct user, u_debugreg[7]), ctrl)) {
+        log_err("ptrace pokeuser: dr7 (tid=%d): %s", tid, strerror(errno));
+        return -1;
+    }
+}
+
 #endif // defined(__aarch64__)
 
 static int
@@ -1455,7 +1549,7 @@ int
 execute_in_threads(
         int pid, uint64_t* tids, int count_tids, const char* python_code)
 {
-#ifdef __aarch64__
+#if defined(__aarch64__) || defined(__x86_64__)
     int err = 0;
     enum { MAX_THRDS = 16 };
     struct tgt_thrd thrds[MAX_THRDS] = {};
