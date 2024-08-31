@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
+#include <stdarg.h>
 
 #include <fcntl.h>
 #include <dirent.h>
@@ -54,7 +55,29 @@
 #endif
 
 
-#define log_err(fmt, ...) fprintf(stderr, "attacher: " fmt "\n", ##__VA_ARGS__)
+__attribute__((format(printf, 1, 0)))
+static void
+vlog_err(const char* fmt, va_list valist)
+{
+    int esaved = errno;
+    fprintf(stderr, "attacher: ");
+    vfprintf(stderr, fmt, valist);
+
+    if (fmt[0] != '\0' && fmt[strlen(fmt) - 1] != '\n') {
+        fprintf(stderr, ": %s\n", strerror(esaved));
+    }
+    errno = esaved;
+}
+
+__attribute__((format(printf, 1, 2)))
+static void
+log_err(const char* fmt, ...)
+{
+    va_list valist;
+    va_start(valist, fmt);
+    vlog_err(fmt, valist);
+    va_end(valist);
+}
 
 // Always define debug to avoid warnings about non-use.
 #ifdef NDEBUG
@@ -310,7 +333,7 @@ find_libc_start(pid_t pid)
 
     FILE* f = fopen(mapspath, "r");
     if (!f) {
-        log_err("fopen: %s: %s", mapspath, strerror(errno));
+        log_err("fopen: %s", mapspath);
         return 0;
     }
 
@@ -319,7 +342,7 @@ find_libc_start(pid_t pid)
     while (getline(&line, &len, f) != -1) {
         proc_map_t map;
         if (parse_proc_map(line, &map) != 0) {
-            log_err("failed parsing a procmap line");
+            log_err("failed parsing a procmap line\n");
             continue;
         }
         // We only care about code
@@ -362,7 +385,7 @@ in_other_mount_ns(pid_t pid)
     snprintf(rootpath, sizeof rootpath, "/proc/%d/root/", pid);
     struct stat pid_root_stat = {};
     if (stat(rootpath, &pid_root_stat) == -1) {
-        log_err("stat: %s: %s", rootpath, strerror(errno));
+        log_err("stat: %s", rootpath);
         return false;
     }
 
@@ -380,7 +403,7 @@ find_symbol(pid_t pid, const char* symbol, const char* fnsrchstr)
 
     FILE* f = fopen(mapspath, "r");
     if (!f) {
-        log_err("fopen: %s: %s", mapspath, strerror(errno));
+        log_err("fopen: %s", mapspath);
         return 0;
     }
 
@@ -392,7 +415,7 @@ find_symbol(pid_t pid, const char* symbol, const char* fnsrchstr)
         }
         proc_map_t map;
         if (parse_proc_map(line, &map) != 0) {
-            log_err("failed parsing a procmap line");
+            log_err("failed parsing a procmap line\n");
             continue;
         }
         // We only care about code
@@ -464,7 +487,7 @@ wait_for_stop(pid_t pid, int signo, int* pwstatus)
         pid_t tid;
         if ((tid = waitpid(pid, pwstatus, 0)) == -1) {
             int esaved = errno;
-            log_err("waitpid: %d: %s", pid, strerror(errno));
+            log_err("waitpid: %d", pid);
             errno = esaved;
             return -1;
         }
@@ -474,14 +497,21 @@ wait_for_stop(pid_t pid, int signo, int* pwstatus)
         }
 
         if (!WIFSTOPPED(*pwstatus)) {
-            fprintf(stderr, "WIFEXITED(wstatus)=%d, WIFSIGNALED(wstatus)=%d\n",
-                    WIFEXITED(*pwstatus), WIFSIGNALED(*pwstatus));
+            if (WIFEXITED(*pwstatus)) {
+                log_err("target %d (tid=%d) exited with status %d\n", pid, tid,
+                        WEXITSTATUS(*pwstatus));
+            }
+            if (WIFSIGNALED(*pwstatus)) {
+                int signum = WTERMSIG(*pwstatus);
+                log_err("target %d (tid=%d) killed by signal: %s (%d)\n", pid,
+                        tid, strsignal(signum), signum);
+            }
             return -1;
         }
         if (WIFSTOPPED(*pwstatus) && WSTOPSIG(*pwstatus) != signo) {
             if (ptrace(PTRACE_CONT, tid, 0, WSTOPSIG(*pwstatus)) == -1) {
                 int esaved = errno;
-                log_err("ptrace cont: %d: %s", tid, strerror(errno));
+                log_err("ptrace cont: %d", tid);
                 errno = esaved;
                 return -1;
             }
@@ -495,7 +525,7 @@ static int
 continue_sgl_thread(pid_t tid)
 {
     if (ptrace(PTRACE_CONT, tid, 0, 0) == -1) {
-        log_err("ptrace cont: tid=%d: %s", tid, strerror(errno));
+        log_err("ptrace cont: tid=%d", tid);
         return -1;
     }
     return 0;
@@ -516,7 +546,7 @@ get_threads(pid_t pid, struct tgt_thrd* thrd, int *numthrds)
     snprintf(pathname, sizeof pathname, "/proc/%d/task", pid);
     DIR* dir = opendir(pathname);
     if (dir == NULL) {
-        log_err("opendir: %s: %s", pathname, strerror(errno));
+        log_err("opendir: %s", pathname);
         return 1;
     }
 
@@ -529,13 +559,13 @@ get_threads(pid_t pid, struct tgt_thrd* thrd, int *numthrds)
             continue;
         }
         if (i >= *numthrds) {
-            log_err("too many threads");
+            log_err("too many threads\n");
             return 1;
         }
         thrd[i].tid = tid;
     }
     if (errno != 0) {
-        log_err("readdir: %s: ", strerror(errno));
+        log_err("readdir");
         return 1;
     }
     *numthrds = i;
@@ -552,13 +582,13 @@ attach_threads(struct tgt_thrd* thrds, int count)
     for (; i < count; i++) {
         __auto_type t = &thrds[i];
         if ((err = ptrace(PTRACE_SEIZE, t->tid, 0, 0)) == -1) {
-            log_err("ptrace attach: tid=%d: %s", t->tid, strerror(errno));
+            log_err("ptrace attach: tid=%d", t->tid);
             goto error;
         }
         t->attached = 1;
         t->running = 1;
         if ((err = ptrace(PTRACE_INTERRUPT, t->tid, 0, 0)) == -1) {
-            log_err("ptrace interrupt: tid=%d: %s", t->tid, strerror(errno));
+            log_err("ptrace interrupt: tid=%d", t->tid);
             goto error;
         }
         if ((err = wait_for_stop(t->tid, SIGTRAP, &t->wstatus)) == -1) {
@@ -572,8 +602,7 @@ error:
     err = ATT_FAIL;
     for (; i > 0; i--) {
         if (ptrace(PTRACE_DETACH, thrds[i].tid, 0, 0) == -1) {
-            log_err("ptrace detach: tid=%d: %s", thrds[i].tid,
-                    strerror(errno));
+            log_err("ptrace detach: tid=%d", thrds[i].tid);
             err = ATT_UNKNOWN_STATE;
         }
         thrds[i].attached = 0;
@@ -588,8 +617,7 @@ detach_threads(struct tgt_thrd* thrds, int count)
     for (int i = 0; i < count; i++) {
         err = ptrace(PTRACE_DETACH, thrds[i].tid, 0, 0);
         if (err == -1) {
-            log_err("ptrace detach: tid=%d: %s\n", thrds[i].tid,
-                    strerror(errno));
+            log_err("ptrace detach: tid=%d", thrds[i].tid);
         }
         thrds[i].attached = 0;
     }
@@ -603,7 +631,7 @@ continue_threads(struct tgt_thrd* thrds, int count)
     for (int i = 0; i < count; i++) {
         err = ptrace(PTRACE_CONT, thrds[i].tid, 0, 0);
         if (err == -1) {
-            log_err("ptrace cont: tid=%d: %s", thrds[i].tid, strerror(errno));
+            log_err("ptrace cont: tid=%d", thrds[i].tid);
             err = ATT_UNKNOWN_STATE;
         }
         thrds[i].running = 1;
@@ -618,7 +646,7 @@ interrupt_threads(struct tgt_thrd* thrds, int nthreads)
     for (int i = 0; i < nthreads; i++) {
         __auto_type t = &thrds[i];
         if (ptrace(PTRACE_INTERRUPT, t->tid, 0, 0) == -1) {
-            log_err("ptrace interrupt: tid=%d: %s", t->tid, strerror(errno));
+            log_err("ptrace interrupt: tid=%d", t->tid);
             return ATT_UNKNOWN_STATE;
         }
         if (wait_for_stop(t->tid, SIGTRAP, &t->wstatus) == -1) {
@@ -628,7 +656,7 @@ interrupt_threads(struct tgt_thrd* thrds, int nthreads)
             // TODO: this might be our breakpoint and not the event-stop.
             // If on x86, we may need to roll back the instruction pointer
             // a byte.
-            log_err("not event-stop!!!");
+            log_err("not event-stop!!!\n");
             // Maybe we should just kill the target until we've addressed
             // this TODO.
             #ifdef __x86_64__
@@ -702,7 +730,7 @@ save_instrs(pid_t pid, saved_instrs_t* psaved)
     };
     if (process_vm_readv(pid, &local, 1, &remote, 1, 0)
             != (ssize_t)remote.iov_len) {
-        log_err("process_vm_readv: pid=%d: %s", pid, strerror(errno));
+        log_err("process_vm_readv: pid=%d", pid);
         return ATT_FAIL;
     }
     return 0;
@@ -712,8 +740,7 @@ static int
 restore_instrs(pid_t tid, saved_instrs_t* psaved)
 {
     if (-1 == ptrace(PTRACE_POKETEXT, tid, psaved->addr, psaved->instrs.u64)) {
-        log_err("restore_instrs: ptrace poketext: tid=%d: %s", tid,
-                strerror(errno));
+        log_err("restore_instrs: ptrace poketext: tid=%d", tid);
         return -1;
     }
     return 0;
@@ -723,8 +750,7 @@ static int
 replace_instrs(pid_t tid, uintptr_t addr, word_of_instr_t instrs)
 {
     if (-1 == ptrace(PTRACE_POKETEXT, tid, addr, instrs.u64)) {
-        log_err("replace_instrs: ptrace poketext: tid=%d: %s", tid,
-                strerror(errno));
+        log_err("replace_instrs: ptrace poketext: tid=%d", tid);
         return -1;
     }
     return 0;
@@ -774,8 +800,7 @@ set_hw_breakpoint(pid_t tid, uintptr_t bp_addr, hw_bp_ctx_t* oldctx)
         .iov_len = sizeof oldctx->state,
     };
     if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_ARM_HW_BREAK, &iov)) {
-        log_err("%s:%d:set_hw_breakpoint: ptrace getregset: tid=%d: %s",
-                __FILE__, __LINE__, tid, strerror(errno));
+        log_err("set_hw_breakpoint: ptrace getregset: tid=%d", tid);
         return -1;
     }
     struct user_hwdebug_state hdb_regs = oldctx->state;
@@ -789,7 +814,7 @@ set_hw_breakpoint(pid_t tid, uintptr_t bp_addr, hw_bp_ctx_t* oldctx)
         }
     }
     if (reg_idx == -1) {
-        log_err("no free hardware debug registers");
+        log_err("no free hardware debug registers\n");
         return -1;
     }
 
@@ -805,8 +830,7 @@ set_hw_breakpoint(pid_t tid, uintptr_t bp_addr, hw_bp_ctx_t* oldctx)
 
 
     if (-1 == __set_hw_breakpoint(tid, &hdb_regs)) {
-        log_err("%s:%d:set_hw_breakpoint: ptrace setregset: tid=%d: %s",
-                __FILE__, __LINE__, tid, strerror(errno));
+        log_err("set_hw_breakpoint: ptrace setregset: tid=%d", tid);
         return -1;
     }
 
@@ -817,8 +841,7 @@ static int
 remove_hw_breakpoint(pid_t tid, hw_bp_ctx_t* oldctx)
 {
     if (-1 == __set_hw_breakpoint(tid, &oldctx->state)) {
-        log_err("remove_hw_breakpoint: ptrace setregset: tid=%d: %s", tid,
-                strerror(errno));
+        log_err("remove_hw_breakpoint: ptrace setregset: tid=%d", tid);
         return -1;
     }
     return 0;
@@ -831,6 +854,29 @@ typedef struct {
     uint64_t ctrl;
 } hw_bp_ctx_t;
 
+#define CR_IDX  7   /* control register index */
+
+static int
+read_dbg_reg(pid_t tid, int regidx, uint64_t* value)
+{
+    long err;
+    errno = 0;
+    err = ptrace(PTRACE_PEEKUSER, tid,
+            offsetof(struct user,u_debugreg[regidx]), 0);
+    if (-1 == err && errno != 0) {
+        return -1;
+    }
+    *value = (uint64_t)err;
+    return 0;
+}
+
+static int
+write_dbg_reg(pid_t tid, int regidx, uint64_t value)
+{
+    return ptrace(PTRACE_POKEUSER, tid,
+                offsetof(struct user, u_debugreg[regidx]), value);
+}
+
 static int
 set_hw_breakpoint(pid_t tid, uintptr_t bp_addr, hw_bp_ctx_t* oldctx)
 {
@@ -838,14 +884,11 @@ set_hw_breakpoint(pid_t tid, uintptr_t bp_addr, hw_bp_ctx_t* oldctx)
     // (DR4 and DR5 are reserved for the kernel)
     int dr_idx = -1;
     for (int i = 0; i < 4; i++) {
-        long err;
-        if (-1 == (err = ptrace(PTRACE_PEEKUSER, tid,
-                        offsetof(struct user, u_debugreg[i]), 0))) {
-            log_err("ptrace peekuser: tid=%d: dr%d %s", tid, i,
-                    strerror(errno));
+        uintptr_t drv;
+        if (-1 == read_dbg_reg(tid, i, &drv)) {
+            log_err("ptrace peekuser: tid=%d: dr%d", tid, i);
             return -1;
         }
-        uintptr_t drv = (uintptr_t)err;
         if (drv == 0) {
             dr_idx = i;
             break;
@@ -856,14 +899,11 @@ set_hw_breakpoint(pid_t tid, uintptr_t bp_addr, hw_bp_ctx_t* oldctx)
         return -1;
     }
 
-    // DR7 is the control register
-    long err;
-    if (-1 == (err = ptrace(PTRACE_PEEKUSER, tid,
-                    offsetof(struct user, u_debugreg[7]), 0))) {
-        log_err("ptrace peekuser: dr7 (tid=%d): %s", tid, strerror(errno));
+    uint64_t ctrl = 0;
+    if (-1 == read_dbg_reg(tid, CR_IDX, &ctrl)) {
+        log_err("ptrace peekuser: dr7 (tid=%d)", tid);
         return -1;
     }
-    uint64_t ctrl = (uint64_t)err;
 
     oldctx->ctrl = ctrl;
 
@@ -875,17 +915,13 @@ set_hw_breakpoint(pid_t tid, uintptr_t bp_addr, hw_bp_ctx_t* oldctx)
     // breakpoint.
     ctrl &= ~((0b1111 << (dr_idx * 4)) << 16);
 
-    if (-1 == ptrace(PTRACE_POKEUSER, tid,
-                offsetof(struct user, u_debugreg[dr_idx]), bp_addr)) {
-        log_err("ptrace pokeuser: dr%d: %s", dr_idx, strerror(errno));
+    if (-1 == write_dbg_reg(tid, dr_idx, bp_addr)) {
+        log_err("ptrace pokeuser: dr%d", dr_idx);
         return -1;
     }
-    if (-1 == ptrace(PTRACE_POKEUSER, tid,
-                offsetof(struct user, u_debugreg[7]), ctrl)) {
-        log_err("ptrace pokeuser: dr7: %s", strerror(errno));
-        // Unset addr
-        ptrace(PTRACE_POKEUSER, tid,
-                    offsetof(struct user, u_debugreg[dr_idx]), 0UL);
+    if (-1 == write_dbg_reg(tid, CR_IDX, ctrl)) {
+        log_err("ptrace pokeuser: dr7");
+        write_dbg_reg(tid, dr_idx, 0UL); /* unset addr */
         return -1;
     }
     return 0;
@@ -896,27 +932,22 @@ remove_hw_breakpoint(pid_t tid, hw_bp_ctx_t* oldctx)
 {
     int dr_idx = oldctx->reg_idx;
 
-    long err;
-    if (-1 == (err = ptrace(PTRACE_PEEKUSER, tid,
-                    offsetof(struct user, u_debugreg[7]), 0))) {
-        log_err("ptrace peekuser: dr7 (tid=%d): %s", tid, strerror(errno));
+    uint64_t ctrl = 0;
+    if (-1 == read_dbg_reg(tid, CR_IDX, &ctrl)) {
+        log_err("ptrace peekuser: dr7 (tid=%d)", tid);
         return -1;
     }
-    uint64_t ctrl = (uint64_t)err;
 
     // Clear DR0-3 local enable bit.
     ctrl &= ~(1 << (2 * dr_idx));
     // Don't bother with restoring the settings.
 
-    if (-1 == ptrace(PTRACE_POKEUSER, tid,
-                offsetof(struct user, u_debugreg[dr_idx]), 0UL)) {
-        log_err("ptrace pokeuser: dr%d (tid=%d): %s", dr_idx, tid,
-                strerror(errno));
+    if (-1 == write_dbg_reg(tid, dr_idx, 0UL)) {
+        log_err("ptrace pokeuser: dr%d (tid=%d)", dr_idx, tid);
         return -1;
     }
-    if (-1 == ptrace(PTRACE_POKEUSER, tid,
-                offsetof(struct user, u_debugreg[7]), ctrl)) {
-        log_err("ptrace pokeuser: dr7 (tid=%d): %s", tid, strerror(errno));
+    if (-1 == write_dbg_reg(tid, CR_IDX, ctrl)) {
+        log_err("ptrace pokeuser: dr7 (tid=%d)", tid);
         return -1;
     }
     return 0;
@@ -930,12 +961,12 @@ get_user_regs(pid_t tid, struct user_regs_struct* user_regs)
     struct iovec iov = {.iov_base = user_regs, .iov_len = sizeof *user_regs};
     if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_PRSTATUS, &iov)) {
         int esaved = errno;
-        log_err("ptrace getregset: tid=%d: %s", tid, strerror(errno));
+        log_err("ptrace getregset: tid=%d", tid);
         errno = esaved;
         return -1;
     }
     if (iov.iov_len != sizeof *user_regs) {
-        log_err("iov.iov_len = %lu, sizeof user_regs = %lu",
+        log_err("iov.iov_len = %lu, sizeof user_regs = %lu\n",
                 iov.iov_len, sizeof user_regs);
     }
     return 0;
@@ -947,7 +978,7 @@ set_user_regs(pid_t tid, struct user_regs_struct* user_regs)
     struct iovec iov = {.iov_base = user_regs, .iov_len = sizeof *user_regs};
     if (-1 == ptrace(PTRACE_SETREGSET, tid, NT_PRSTATUS, &iov)) {
         int esaved = errno;
-        log_err("ptrace setregset: tid=%d: %s", tid, strerror(errno));
+        log_err("ptrace setregset: tid=%d", tid);
         errno = esaved;
         return -1;
     }
@@ -1284,7 +1315,7 @@ call_pyrun_simplestring(
 {
     uint64_t PyRun_SimpleString = find_pyfn(pid, "PyRun_SimpleString");
     if (PyRun_SimpleString == 0) {
-        fprintf(stderr, "unable to find %s\n", "PyRun_SimpleString");
+        log_err("unable to find %s\n", "PyRun_SimpleString");
         return ATT_FAIL;
     }
 
@@ -1292,7 +1323,7 @@ call_pyrun_simplestring(
     int err = indirect_call_and_brk2(pid, tid, scratch_addr,
             PyRun_SimpleString, buf, 0, &retval);
     if (retval != 0 && err == 0) {
-        log_err("PyRun_SimpleString returned an error");
+        log_err("PyRun_SimpleString returned an error\n");
         err = ATT_FAIL;
     }
     return err;
@@ -1307,7 +1338,7 @@ exec_python_code(pid_t pid, pid_t tid, const char* python_code)
     // temporarily (idea from the readme of kubo/injector)
     uintptr_t libc_start_addr = find_libc_start(pid);
     if (libc_start_addr == 0) {
-        log_err("could not find libc");
+        log_err("could not find libc\n");
         return ATT_FAIL;
     }
     log_dbg("libc_start_addr = %lx", libc_start_addr);
@@ -1375,7 +1406,7 @@ install_signal_handler(saved_sigaction_t* oldactions)
     for (int i = 0; i < num_signals; i++) {
         int signo = handled_signums[i];
         if (-1 == sigaction(signo, &new_sigaction, &oldactions->ss_act[i])) {
-            perror("sigaction");
+            log_err("sigaction");
             abort(); // All sigaction errors are programming errors
         }
     }
@@ -1410,13 +1441,13 @@ attach_and_execute(const int pid, const char* python_code)
     enum { MAX_THRDS = 16 };
     if (nthreads > MAX_THRDS) {
         log_err("target has %d threads, multiple target threads are not yet "
-                "supported", nthreads);
+                "supported\n", nthreads);
         return ATT_FAIL;
     }
     if (nthreads > 1) {
         // Specifically it doesn't work if the main thread doesn't get time
         // and the tracing doesn't work for non-main on <3.12
-        log_err("target has %d threads, this may not work correctly", nthreads);
+        log_err("target has %d threads, this may not work correctly\n", nthreads);
     }
 
     struct tgt_thrd thrds[MAX_THRDS] = {};
@@ -1428,7 +1459,7 @@ attach_and_execute(const int pid, const char* python_code)
 
     uintptr_t breakpoint_addr = find_pyfn(pid, SAFE_POINT);
     if (breakpoint_addr == 0) {
-        log_err("unable to find %s", SAFE_POINT);
+        log_err("unable to find %s\n", SAFE_POINT);
         return ATT_FAIL;
     }
     log_dbg(SAFE_POINT " = %lx", breakpoint_addr);
@@ -1490,7 +1521,7 @@ attach_and_execute(const int pid, const char* python_code)
             err = ATT_UNKNOWN_STATE;
             goto detach;
         }
-        log_err("cancelled.");
+        log_err("cancelled.\n");
         err = ATT_INTERRUPTED;
         goto detach;
     }
@@ -1564,7 +1595,7 @@ execute_in_threads(
     struct tgt_thrd thrds[MAX_THRDS] = {};
 
     if (count_tids > MAX_THRDS) {
-        log_err("too many tids");
+        log_err("too many tids\n");
         return ATT_FAIL;
     }
 
@@ -1573,7 +1604,7 @@ execute_in_threads(
     }
     uintptr_t breakpoint_addr = find_pyfn(pid, SAFE_POINT);
     if (breakpoint_addr == 0) {
-        log_err("unable to find %s", SAFE_POINT);
+        log_err("unable to find %s\n", SAFE_POINT);
         return ATT_FAIL;
     }
 
@@ -1607,7 +1638,7 @@ execute_in_threads(
         log_dbg("waiting for bp hit");
         pid_t tid = (tid = waitpid(-1, &status, 0));
         if (-1 == tid && errno != EINTR) {
-            log_err("waitpid: %s", strerror(errno));
+            log_err("waitpid");
             err = ATT_UNKNOWN_STATE;
             goto out;
         }
@@ -1619,7 +1650,7 @@ execute_in_threads(
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
             __auto_type t = find_thread(thrds, count_tids, tid);
             if (t == NULL) {
-                log_err("unknown child: tid=%d", tid);
+                log_err("unknown child: tid=%d\n", tid);
                 continue;
             }
             log_dbg("thread died/exited: tid=%d", t->tid);
@@ -1629,22 +1660,25 @@ execute_in_threads(
         }
         if (WIFSTOPPED(status) && WSTOPSIG(status) != SIGTRAP) {
             if (-1 == ptrace(PTRACE_CONT, tid, 0, WSTOPSIG(status))) {
-                log_err("ptrace cont: %d: %s", tid, strerror(errno));
+                log_err("ptrace cont: %d", tid);
                 err = ATT_UNKNOWN_STATE;
                 goto out;
             }
         }
         if (!WIFSTOPPED(status)) {
-            log_err("unexpected child status: %x", status);
+            log_err("unexpected child status: %x\n", status);
             continue;
         }
         __auto_type t = find_thread(thrds, count_tids, tid);
         if (t == NULL) {
-            log_err("unknown child: tid=%d", tid);
+            log_err("unknown child: tid=%d\n", tid);
             ptrace(PTRACE_CONT, tid, 0, WSTOPSIG(status));
             continue;
         }
         t->running = 0;
+
+        // TODO: we should verify that it was our breakpoint that caused the
+        // trap... (on x86 this mean checking and resetting DR6).
 
         int tidx = find_thread_idx(thrds, count_tids, tid);
 
@@ -1656,7 +1690,7 @@ execute_in_threads(
 
         err = exec_python_code(pid, tid, python_code);
         if (err != 0) {
-            log_err("failed to install probes in thread: %d", tid);
+            log_err("failed to install probes in thread: %d\n", tid);
         }
         log_dbg("executed python code (tid=%d)", tid);
 

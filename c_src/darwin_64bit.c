@@ -117,10 +117,10 @@ log_dbg(const char* fmt, ...)
     va_start(valist, fmt);
 
     if (debug) {
-        fputs("[debug]: ", stderr);
+        fprintf(stderr, "[debug]: ");
         vfprintf(stderr, fmt, valist);
         if (fmt[strlen(fmt) - 1] != '\n') {
-            fputs("\n", stderr);
+            fprintf(stderr, "\n");
         }
     }
 
@@ -137,7 +137,7 @@ log_err(const char* fmt, ...)
     va_start(valist, fmt);
     int esaved = errno;
 
-    fputs("attacher: ", stderr);
+    fprintf(stderr, "attacher: ");
     vfprintf(stderr, fmt, valist);
 
     if (fmt[strlen(fmt) - 1] != '\n') {
