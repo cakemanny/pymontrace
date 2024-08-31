@@ -216,7 +216,8 @@ def decode_and_print_forever(s: socket.socket):
             elif kind == Message.THREADS:
                 count_threads = size // struct.calcsize('=Q')
                 thread_ids = struct.unpack('=' + (count_threads * 'Q'), body)
-                if sys.platform == 'linux' and os.uname().machine == 'aarch64':
+                if (sys.platform == 'linux'
+                        and os.uname().machine in ('aarch64', 'x86_64')):
                     # This may not be the correct value if the target has forked
                     pid = get_peer_pid(s)
                     t = threading.Thread(target=settrace_in_threads,

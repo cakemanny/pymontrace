@@ -838,13 +838,14 @@ set_hw_breakpoint(pid_t tid, uintptr_t bp_addr, hw_bp_ctx_t* oldctx)
     // (DR4 and DR5 are reserved for the kernel)
     int dr_idx = -1;
     for (int i = 0; i < 4; i++) {
-        uintptr_t drv = 0;
-        if (-1 == ptrace(PTRACE_PEEKUSER, tid,
-                    offsetof(struct user, u_debugreg[i]), &drv)) {
+        long err;
+        if (-1 == (err = ptrace(PTRACE_PEEKUSER, tid,
+                        offsetof(struct user, u_debugreg[i]), 0))) {
             log_err("ptrace peekuser: tid=%d: dr%d %s", tid, i,
                     strerror(errno));
             return -1;
         }
+        uintptr_t drv = (uintptr_t)err;
         if (drv == 0) {
             dr_idx = i;
             break;
@@ -856,12 +857,13 @@ set_hw_breakpoint(pid_t tid, uintptr_t bp_addr, hw_bp_ctx_t* oldctx)
     }
 
     // DR7 is the control register
-    uint64_t ctrl = 0;
-    if (-1 == ptrace(PTRACE_PEEKUSER, tid,
-                offsetof(struct user, u_debugreg[7]), &ctrl)) {
+    long err;
+    if (-1 == (err = ptrace(PTRACE_PEEKUSER, tid,
+                    offsetof(struct user, u_debugreg[7]), 0))) {
         log_err("ptrace peekuser: dr7 (tid=%d): %s", tid, strerror(errno));
         return -1;
     }
+    uint64_t ctrl = (uint64_t)err;
 
     oldctx->ctrl = ctrl;
 
@@ -886,7 +888,7 @@ set_hw_breakpoint(pid_t tid, uintptr_t bp_addr, hw_bp_ctx_t* oldctx)
                     offsetof(struct user, u_debugreg[dr_idx]), 0UL);
         return -1;
     }
-    return -1;
+    return 0;
 }
 
 static int
@@ -894,12 +896,14 @@ remove_hw_breakpoint(pid_t tid, hw_bp_ctx_t* oldctx)
 {
     int dr_idx = oldctx->reg_idx;
 
-    uint64_t ctrl = 0;
-    if (-1 == ptrace(PTRACE_PEEKUSER, tid,
-                offsetof(struct user, u_debugreg[7]), &ctrl)) {
+    long err;
+    if (-1 == (err = ptrace(PTRACE_PEEKUSER, tid,
+                    offsetof(struct user, u_debugreg[7]), 0))) {
         log_err("ptrace peekuser: dr7 (tid=%d): %s", tid, strerror(errno));
         return -1;
     }
+    uint64_t ctrl = (uint64_t)err;
+
     // Clear DR0-3 local enable bit.
     ctrl &= ~(1 << (2 * dr_idx));
     // Don't bother with restoring the settings.
@@ -1577,11 +1581,13 @@ execute_in_threads(
     if ((err = attach_threads(thrds, count_tids)) != 0) {
         return err;
     }
+    log_dbg("attached to %d threads", count_tids);
 
     hw_bp_ctx_t saved_dbg_state[MAX_THRDS] = {};
     for (int i = 0; i < count_tids; i++) {
         __auto_type t = &thrds[i];
-        if (set_hw_breakpoint(t->tid, breakpoint_addr, &saved_dbg_state[i])) {
+        if (set_hw_breakpoint(t->tid, breakpoint_addr,
+                    &saved_dbg_state[i]) != 0) {
             err = ATT_UNKNOWN_STATE;
             goto out;
         }
