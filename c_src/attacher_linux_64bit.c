@@ -515,6 +515,10 @@ get_threads(pid_t pid, struct tgt_thrd* thrd, int *numthrds)
     char pathname[80] = {};
     snprintf(pathname, sizeof pathname, "/proc/%d/task", pid);
     DIR* dir = opendir(pathname);
+    if (dir == NULL) {
+        log_err("opendir: %s: %s", pathname, strerror(errno));
+        return 1;
+    }
 
     errno = 0;
     int i = 0;
@@ -911,6 +915,7 @@ remove_hw_breakpoint(pid_t tid, hw_bp_ctx_t* oldctx)
         log_err("ptrace pokeuser: dr7 (tid=%d): %s", tid, strerror(errno));
         return -1;
     }
+    return 0;
 }
 
 #endif // defined(__aarch64__)
