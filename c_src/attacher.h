@@ -9,5 +9,8 @@
 
 int attach_and_execute(int pid, const char* python_code);
 
+int execute_in_threads(int pid, uint64_t* tids, int count_tids,
+        const char* python_code);
+
 
 #endif /* ATTACHER_H */

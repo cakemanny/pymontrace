@@ -73,6 +73,7 @@ def tracepid(pid: int, probe, action: str):
 
         # TODO: this needs a timeout
         s, _ = ss.accept()
+        # TODO: verify the connected party is pid
         os.unlink(comms.localpath)
 
         receive_and_print_until_interrupted(s)
@@ -86,12 +87,13 @@ def subprocess_entry(progpath, probe, action):
     import runpy
     import time
 
-    from pymontrace.tracee import settrace
+    from pymontrace.tracee import settrace, connect
 
     comm_file = CommsFile(os.getpid()).remotepath
     while not os.path.exists(comm_file):
         time.sleep(1)
-    settrace(probe[1:], action, comm_file)
+    connect(comm_file)
+    settrace(probe[1:], action)
 
     runpy.run_path(progpath, run_name='__main__')
 

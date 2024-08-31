@@ -27,7 +27,10 @@ def test_format_bootstrap_snippet():
     )
 
     assert formatted.endswith(
-        "pymontrace.tracee.settrace(('path/to/filename.py', 56), 'print(\"a\", a, \"b\", b)', '/tmp/pymontrace-654')\n"
+        "pymontrace.tracee.connect('/tmp/pymontrace-654')\n"
+
+        "pymontrace.tracee.settrace(('path/to/filename.py', 56), "
+        "'print(\"a\", a, \"b\", b)')\n"
     )
 
     # This will error if we introduce a syntax error

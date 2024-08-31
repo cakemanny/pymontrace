@@ -8,7 +8,7 @@ In priority order:
       for observing behaviour. Want to see it in pymontrace stdout.
 - [x] Trace target which has not had pymontrace already pip installed.
 - [x] Make darwin attach signal handling race-free
-- [ ] Make linux attach code signal resistant
+- [x] Make linux attach code signal resistant
 - [o] Clean up C code (specific TODOs are within)
 - [ ] Add command to list probes (maybe `sys.modules` can help)
 - [x] Use Py_AddPendingCall on Darwin too

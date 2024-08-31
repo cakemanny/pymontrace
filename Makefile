@@ -24,11 +24,12 @@ else
 CFLAGS = -Wall -Wextra -Wvla -Werror
 check:
 	$(CC) -fsyntax-only $(CFLAGS) c_src/attacher_linux_64bit.c
-	apt update
-	apt install --yes \
-		gcc-aarch64-linux-gnu \
-		gcc-x86-64-linux-gnu \
-		gcc-riscv64-linux-gnu
+	type riscv64-linux-gnu-gcc || apt update
+	type riscv64-linux-gnu-gcc || \
+		apt install --yes \
+			gcc-aarch64-linux-gnu \
+			gcc-x86-64-linux-gnu \
+			gcc-riscv64-linux-gnu
 	aarch64-linux-gnu-gcc -fsyntax-only $(CFLAGS) c_src/attacher_linux_64bit.c
 	x86_64-linux-gnu-gcc -fsyntax-only $(CFLAGS) c_src/attacher_linux_64bit.c
 	riscv64-linux-gnu-gcc -fsyntax-only $(CFLAGS) c_src/attacher_linux_64bit.c

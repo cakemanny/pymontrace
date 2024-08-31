@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=54.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name        = "pymontrace"
 description = "production safe low impact tracing"
