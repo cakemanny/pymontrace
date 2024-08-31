@@ -174,7 +174,7 @@ def get_peer_pid(s: socket.socket):
     raise NotImplementedError
 
 
-def settrace_in_threads(pid: int, thread_ids: tuple[int]):
+def settrace_in_threads(pid: int, thread_ids: 'tuple[int]'):
     attacher.exec_in_threads(
         pid, thread_ids, format_additional_thread_snippet()
     )
