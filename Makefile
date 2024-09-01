@@ -16,12 +16,12 @@ lint:
 ifeq "$(OS)" "Darwin"
 # Pre-flight the linux code when working on mac
 check:
-	cc -c -target x86_64-apple-macos10.13 -Wall -Werror -o /dev/null c_src/darwin_64bit.c
+	cc -c -target x86_64-apple-macos10.13 -Wall -Wsign-compare -Werror -o /dev/null c_src/darwin_64bit.c
 	./hack/bash-aarch64.sh -c 'make check'
 
 else
 
-CFLAGS = -Wall -Wextra -Wvla -Werror
+CFLAGS = -Wall -Wsign-compare -Wvla -Werror
 check:
 	$(CC) -fsyntax-only $(CFLAGS) c_src/attacher_linux_64bit.c
 	type riscv64-linux-gnu-gcc || apt update

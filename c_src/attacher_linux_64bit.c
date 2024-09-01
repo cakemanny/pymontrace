@@ -532,11 +532,11 @@ continue_sgl_thread(pid_t tid)
 }
 
 struct tgt_thrd {
-    pid_t tid;
-    int wstatus;
-    int attached    : 1,
-        hw_bp_set   : 1,
-        running     : 1;
+    pid_t       tid;
+    int         wstatus;
+    unsigned    attached    : 1,
+                hw_bp_set   : 1,
+                running     : 1;
 };
 
 static int
@@ -672,9 +672,7 @@ count_attached_threads(struct tgt_thrd* thrds, int nthreads)
 {
     int count = 0;
     for (int i = 0; i < nthreads; i++) {
-        if (thrds[i].attached) {
-            count += 1;
-        }
+        count += thrds[i].attached;
     }
     log_dbg("%s:%d count = %d", __FILE__, __LINE__, count);
     return count;

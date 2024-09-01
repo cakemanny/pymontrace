@@ -89,7 +89,15 @@ def format_bootstrap_snippet(parsed_probe, action, comm_file, site_extension):
 
 
 def format_additional_thread_snippet():
-    return 'import pymontrace.tracee; pymontrace.tracee.synctrace()'
+    return textwrap.dedent(
+        """
+        try:
+            import pymontrace.tracee
+            pymontrace.tracee.synctrace()
+        except Exception:
+            pass
+        """
+    )
 
 
 def format_untrace_snippet():
@@ -175,9 +183,15 @@ def get_peer_pid(s: socket.socket):
 
 
 def settrace_in_threads(pid: int, thread_ids: 'tuple[int]'):
-    attacher.exec_in_threads(
-        pid, thread_ids, format_additional_thread_snippet()
-    )
+    try:
+        attacher.exec_in_threads(
+            pid, thread_ids, format_additional_thread_snippet()
+        )
+    except NotImplementedError:
+        print(
+            f'There are an additional {len(thread_ids)} threads '
+            'that are not able to be traced', sys.stderr,
+        )
 
 
 def signal_handler(signo: int, frame):
@@ -216,17 +230,18 @@ def decode_and_print_forever(s: socket.socket):
             elif kind == Message.THREADS:
                 count_threads = size // struct.calcsize('=Q')
                 thread_ids = struct.unpack('=' + (count_threads * 'Q'), body)
-                if (sys.platform == 'linux'
-                        and os.uname().machine in ('aarch64', 'x86_64')):
-                    # This may not be the correct value if the target has forked
-                    pid = get_peer_pid(s)
-                    t = threading.Thread(target=settrace_in_threads,
-                                         args=(pid, thread_ids))
-                    t.start()
+                # This may not be the correct value if the target has forked
+                pid = get_peer_pid(s)
+                t = threading.Thread(target=settrace_in_threads,
+                                     args=(pid, thread_ids))
+                t.start()
             else:
                 print('unknown message kind:', kind, file=sys.stderr)
     finally:
         # But maybe we need to kill it...
-        if t is not None:
-            signal.pthread_kill(t.ident, signal.SIGINT)
+        if t is not None and t.ident:
+            try:
+                signal.pthread_kill(t.ident, signal.SIGINT)
+            except ProcessLookupError:
+                pass  # It may have finished.
             t.join()
