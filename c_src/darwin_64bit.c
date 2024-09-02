@@ -45,21 +45,9 @@ const bool debug = false;
 #define DEBUG_TRAP_INSTR    ((uint8_t)0xcc)
 #endif
 
-static semaphore_t sync_sema;
-
 // Note we don't use atomic routines to set this when setting it
 // just before using the semaphore.
 static _Atomic int g_err; /* failure state from exc handler */
-
-/*
- * In order to have more than one exception handler behaviour,
- * we have this flag. (Perhaps there is another way, checking the exception
- * state or debug state?)
- */
-static __thread enum {
-    HANDLE_SOFTWARE = 0,
-    HANDLE_HARDWARE = 1 ,
-} exc_handler_type;
 
 typedef struct {
     vm_address_t    page_addr;
@@ -68,15 +56,11 @@ typedef struct {
     vm_prot_t       protection;
 } page_restore_t;
 
-static page_restore_t g_breakpoint_restore; // FIXME
-
 #if defined(__arm64__)
 typedef arm_thread_state64_t att_threadstate_t;
 #elif defined(__x86_64__)
 typedef x86_thread_state64_t att_threadstate_t;
 #endif
-
-static thread_act_t g_last_completed; // FIXME !!!
 
 struct allocation {
     vm_address_t addr;
@@ -87,19 +71,47 @@ struct allocation {
  * Private data for the exception handler to maintain state between
  * exceptions.
  */
-static struct state_slot {
+static __thread struct state_slot {
     thread_act_t thread;
     struct allocation allocation; /* page allocated to inject code into */
     att_threadstate_t orig_threadstate;
-} g_threadstate[16]; // XXX
+} t_threadstate[16];
 
 
-static struct {
+struct pyfn_addrs {
+    vm_address_t breakpoint_addr;
     vm_address_t PyRun_SimpleString;
-} g_pyfn_addrs;
+};
 
-static const char* g_python_code;
 #define PYTHON_CODE_OFFSET  16
+
+/*
+ * Data passed to the exception handler thread.
+ * All borrowed.
+ */
+struct handler_args {
+    enum {
+        HANDLE_SOFTWARE = 0,
+        HANDLE_HARDWARE = 1 ,
+    } exc_type;
+    char* python_code;        /* code to execute */
+    struct pyfn_addrs pyfn_addrs;
+    page_restore_t breakpoint_restore;
+    int count_threads;
+    mach_port_t exc_port;
+    semaphore_t started;    /* signaled when the handler thread starts */
+    semaphore_t completed;  /* signaled once after each injection */ // TODO
+    struct {
+        thread_act_t act;
+        _Atomic int refcount; /**/
+    }* last_completed;
+};
+
+/*
+ * The handler thread keeps it's own threadlocal copy of it's args
+ * in order to pass across the mach_msg_server boundary
+ */
+static __thread struct handler_args t_handler_args;
 
 /*
  * Each field is an array to simplify the usage.
@@ -117,7 +129,6 @@ struct tgt_thread {
     mach_port_t         exception_port;
     uint32_t            running     : 1,
                         hw_bp_set   : 1,
-                        exc_port_set: 1,
                         /*
                          * What we actually mean is that we're still hoping
                          * the code will execute. We'll set this to 0 also
@@ -386,7 +397,7 @@ static struct {
     exception_handler_t   ports[TASK_MAX_EXCEPTION_PORT_COUNT];
     exception_behavior_t  behaviors[TASK_MAX_EXCEPTION_PORT_COUNT];
     thread_state_flavor_t flavors[TASK_MAX_EXCEPTION_PORT_COUNT];
-} old_exc_ports;
+} old_exc_ports; // FIXME: don't use static
 
 static int
 prepare_exc_port(mach_port_t* exc_port)
@@ -448,9 +459,7 @@ setup_exception_handling(task_t target_task, mach_port_t* exc_port)
     return ATT_SUCCESS;
 }
 
-#ifdef __x86_64__
 __attribute__((unused))
-#endif // __x86_64__
 static int
 setup_thread_exc_handling(thread_act_t thread, mach_port_t* exc_port,
         struct old_exc_port* old)
@@ -478,9 +487,7 @@ setup_thread_exc_handling(thread_act_t thread, mach_port_t* exc_port,
     return ATT_SUCCESS;
 }
 
-#ifdef __x86_64__
 __attribute__((unused))
-#endif // __x86_64__
 static int
 restore_thread_exc_handlers(thread_act_t thread, struct old_exc_port* old)
 {
@@ -500,16 +507,16 @@ restore_thread_exc_handlers(thread_act_t thread, struct old_exc_port* old)
 static struct state_slot*
 find_state_slot(mach_port_t thread)
 {
-    int n = NELEMS(g_threadstate);
+    int n = NELEMS(t_threadstate);
     for (int i = 0; i < n; i++) {
-        if (g_threadstate[i].thread == thread) {
-            return &g_threadstate[i];
+        if (t_threadstate[i].thread == thread) {
+            return &t_threadstate[i];
         }
     }
     for (int i = 0; i < n; i++) {
-        if (g_threadstate[i].thread == 0) {
-            g_threadstate[i].thread = thread;
-            return &g_threadstate[i];
+        if (t_threadstate[i].thread == 0) {
+            t_threadstate[i].thread = thread;
+            return &t_threadstate[i];
         }
     }
     return NULL;
@@ -592,7 +599,7 @@ catch_mach_exception_raise_state_identity(
         abort();
     }
 
-    __auto_type r = &g_breakpoint_restore;
+    struct handler_args* handler = &t_handler_args;
 
     uint64_t pc =
         #if defined(__arm64__)
@@ -600,27 +607,33 @@ catch_mach_exception_raise_state_identity(
         #elif defined(__x86_64__)
             state->__rip;
         #endif
-    if (pc >= r->page_addr && pc < r->page_addr + r->pagesize) {
-        if (exc_handler_type == HANDLE_SOFTWARE) {
+    __auto_type bp_addr = handler->pyfn_addrs.breakpoint_addr;
+    if (pc >= bp_addr && pc < bp_addr + 2) { // it's a range because of x86
+        if (handler->exc_type == HANDLE_SOFTWARE) {
+            if (handler->breakpoint_restore.page_addr == 0) {
+                abort();
+            }
             /*
              * Restore overwritten instruction
              */
-            kr = restore_page(task, &g_breakpoint_restore);
+            kr = restore_page(task, &handler->breakpoint_restore);
             if (kr != KERN_SUCCESS) {
                 log_mach("restore_page", kr);
                 atomic_store(&g_err , ATT_UNKNOWN_STATE);
-                semaphore_signal(sync_sema); // XXX: err handling
+                handler->last_completed->act = thread;
+                semaphore_signal(handler->completed); // XXX: err handling
                 return KERN_FAILURE; /* I think it'll die anyway */
             }
         } else {
             #if defined(__arm64__)
-                assert(exc_handler_type == HANDLE_HARDWARE);
+                assert(handler->exc_type == HANDLE_HARDWARE);
 
                 struct tgt_thread thrd = { .act = thread, };
                 int err = remove_hw_breakpoint(&thrd);
                 if (err != 0) {
                     atomic_store(&g_err, ATT_UNKNOWN_STATE);
-                    semaphore_signal(sync_sema); // XXX: err handling
+                    handler->last_completed->act = thread;
+                    semaphore_signal(handler->completed); // XXX: err handling
                     return KERN_FAILURE;
                 }
             #elif defined(__x86_64__)
@@ -647,7 +660,8 @@ catch_mach_exception_raise_state_identity(
         if (kr != KERN_SUCCESS) {
             log_mach("vm_allocate", kr);
             g_err = ATT_FAIL; // technically we're leaking memory...
-            semaphore_signal(sync_sema); // XXX: err handling
+            handler->last_completed->act = thread;
+            semaphore_signal(handler->completed); // XXX: err handling
             return KERN_SUCCESS;
         }
         /* save so we can deallocate at the end */
@@ -661,7 +675,8 @@ catch_mach_exception_raise_state_identity(
                 != KERN_SUCCESS) {
             log_mach("vm_read", kr);
             g_err = ATT_FAIL;
-            semaphore_signal(sync_sema);
+            handler->last_completed->act = thread;
+            semaphore_signal(handler->completed); // XXX: err handling
             return KERN_SUCCESS;
         }
         assert(dataCnt == pagesize);
@@ -670,7 +685,7 @@ catch_mach_exception_raise_state_identity(
         assert(inj_len <= PYTHON_CODE_OFFSET);
         memcpy((void*)data, injection, inj_len);
 
-        const char* arg = g_python_code;
+        const char* arg = handler->python_code;
         size_t len = strlen(arg) + 1;
         assert(PYTHON_CODE_OFFSET + len <= pagesize);
         memcpy((char*)data + PYTHON_CODE_OFFSET, arg, len);
@@ -684,7 +699,8 @@ catch_mach_exception_raise_state_identity(
         if ((kr = restore_page(task, &page_restore)) != KERN_SUCCESS) {
             log_mach("restore_page", kr);
             g_err = ATT_FAIL;
-            semaphore_signal(sync_sema);
+            handler->last_completed->act = thread;
+            semaphore_signal(handler->completed);
             return KERN_SUCCESS;
         }
 
@@ -692,7 +708,7 @@ catch_mach_exception_raise_state_identity(
          * set up call
          */
 
-        vm_address_t fn_addr = g_pyfn_addrs.PyRun_SimpleString;
+        vm_address_t fn_addr = handler->pyfn_addrs.PyRun_SimpleString;
         assert(fn_addr);
 
         state_slot->orig_threadstate = *state;
@@ -755,8 +771,8 @@ catch_mach_exception_raise_state_identity(
             log_err("PyRun_SimpleString failed (%d)", (int)retval);
         }
         g_err = (retval == 0) ? ATT_SUCCESS : ATT_FAIL;
-        g_last_completed = thread;
-        semaphore_signal(sync_sema);
+        handler->last_completed->act = thread;
+        semaphore_signal(handler->completed);
     }
 
     return KERN_SUCCESS;
@@ -768,60 +784,44 @@ catch_mach_exception_raise_state_identity(
 extern boolean_t mach_exc_server(mach_msg_header_t *, mach_msg_header_t *);
 
 static void *
-exception_server_thread(void *arg)
+exception_server_thread(void* arg)
 {
     kern_return_t kr;
-    mach_port_t exc_port = *(mach_port_t *)arg;
 
-    // Signal thread started.
-    semaphore_signal(sync_sema);
+    /* copy the args into our thread local space */
+    t_handler_args = *(struct handler_args *)arg;
+    struct handler_args* args = &t_handler_args;
 
-    /* Handle exceptions on exc_port */
-    const int num_expected_break_points = 2;
-    for (int i = 0; i < num_expected_break_points; i++){
-        if ((kr = mach_msg_server_once(mach_exc_server, MACH_MSG_SIZE_RELIABLE,
-                        exc_port, 0))
-                != KERN_SUCCESS) {
-            log_mach("mach_msg_server", kr);
-            break;
-        }
+    /* duplicate the python code in case we outlive our parent thread */
+    args->python_code = strdup(args->python_code);
+    if (!args->python_code) {
+        log_err("strdup");
+        return NULL;
     }
-    return NULL;
-}
 
-/*
- * Exception handler thread for the exec_in_threads function.
- * It differs, in that rather that only 2 breakpoints, it continues
- * until all threads have executed the payload code.
- */
-#ifdef __x86_64__
-__attribute__((unused))
-#endif // __x86_64__
-static void *
-threads_exception_server_thread(void* arg)
-{
-    kern_return_t kr;
-    exc_handler_type = HANDLE_HARDWARE;
+    atomic_fetch_add(&args->last_completed->refcount, 1);
 
-    struct {
-        struct tgt_thread* thrds;
-        mach_port_t exc_port;
-    } *x = arg;
-    // Future idea, we stash thrds in a thread local that we can
-    // modify inside the handler
 
-    semaphore_signal(sync_sema);
+    semaphore_signal(args->started);
 
-    for (int i = 0; i < 16 * 2; i++) { // FIXME
+    // It would perhaps be better to have the main thread signal when all is
+    // done?
+    const int breakpoints_per_thread = 2;
+    for (int i = 0; i < args->count_threads * breakpoints_per_thread; i++) {
         if ((kr = mach_msg_server_once(mach_exc_server,
-                        MACH_MSG_SIZE_RELIABLE, x->exc_port, 0))
+                        MACH_MSG_SIZE_RELIABLE, args->exc_port, 0))
                 != KERN_SUCCESS) {
-            log_mach("mach_msg_server", kr);
+            log_mach("mach_msg_server_once", kr);
             break;
         }
-        log_dbg("g_last_completed = %d", g_last_completed);
     }
 
+    if (1 == atomic_fetch_sub(&args->last_completed->refcount, 1)) {
+        free(args->last_completed);
+        args->last_completed = NULL;
+    }
+    free(args->python_code);
+    args->python_code = NULL;
     return NULL;
 }
 
@@ -842,13 +842,14 @@ static void *
 signal_handler_thread(void *arg)
 {
     sigset_t mask = init_signal_mask();
+    semaphore_t sync_sema = *(semaphore_t*)arg;
 
     for (;;) {
         int signo;
         errno = sigwait(&mask, &signo);
         if (errno != 0) {
-            log_err("sigwait");
-            exit(1);
+            log_err("BUG: sigwait");
+            abort();  // only known error is EINVAL - so it's a bug.
         }
         if (signo == SIGUSR1) {
             // Used internally to shut down this thread.
@@ -1023,10 +1024,15 @@ find_pyfn(task_t task, const char* symbol)
 
 
 static int
-find_needed_python_funcs(task_t task)
+find_needed_python_funcs(task_t task, struct pyfn_addrs* addrs)
 {
-    g_pyfn_addrs.PyRun_SimpleString = find_pyfn(task, "PyRun_SimpleString");
-    if (!g_pyfn_addrs.PyRun_SimpleString) {
+    addrs->breakpoint_addr = find_pyfn(task, SAFE_POINT);
+    if (!addrs->breakpoint_addr) {
+        log_err("could not find %s in shared libs\n", SAFE_POINT);
+        return ATT_FAIL;
+    }
+    addrs->PyRun_SimpleString = find_pyfn(task, "PyRun_SimpleString");
+    if (!addrs->PyRun_SimpleString) {
         log_err("could not find %s in shared libs\n", "PyRun_SimpleString");
         return ATT_FAIL;
     }
@@ -1084,10 +1090,60 @@ get_task(int pid, task_t* task)
 
 
 int
+init_handler_args(struct handler_args* args)
+{
+    kern_return_t kr;
+    task_t me = mach_task_self();
+    kr = semaphore_create(me, &args->started, SYNC_POLICY_FIFO, 0);
+    if (kr != KERN_SUCCESS) {
+        log_mach("semaphore_create", kr);
+        return ATT_FAIL;
+    }
+    kr = semaphore_create(me, &args->completed, SYNC_POLICY_FIFO, 0);
+    if (kr != KERN_SUCCESS) {
+        log_mach("semaphore_create", kr);
+        return ATT_FAIL;
+    }
+
+    args->last_completed = calloc(1, sizeof *args->last_completed);
+    if (args->last_completed == NULL) {
+        log_err("calloc");
+        return ATT_FAIL;
+    }
+    atomic_fetch_add(&args->last_completed->refcount, 1);
+    return 0;
+}
+
+void
+deinit_handler_args(struct handler_args* args)
+{
+    kern_return_t kr;
+    if (1 == atomic_fetch_sub(&args->last_completed->refcount, 1)) {
+        free(args->last_completed);
+        args->last_completed = NULL;
+    }
+    task_t me = mach_task_self();
+    if (args->completed) {
+        if ((kr = semaphore_destroy(me, args->completed)) != KERN_SUCCESS) {
+            log_mach("semaphore_destroy", kr);
+        }
+        args->completed = 0;
+    }
+    if (args->started) {
+        if ((kr = semaphore_destroy(me, args->started)) != KERN_SUCCESS) {
+            log_mach("semaphore_destroy", kr);
+        }
+        args->started = 0;
+    }
+}
+
+
+int
 attach_and_execute(const int pid, const char* python_code)
 {
     int err = 0;
     kern_return_t kr;
+    struct handler_args args = {};
 
     // TODO: This code is hilariously non-reentrant. Find a way to
     // protect it. or make it reentrant.
@@ -1109,15 +1165,12 @@ attach_and_execute(const int pid, const char* python_code)
 
     // Find some python fn addresses in advance of playing around with
     // setting breakpoints.
-    if (find_needed_python_funcs(task) != 0) {
+    struct pyfn_addrs pyfn_addrs = {};
+    if (find_needed_python_funcs(task, &pyfn_addrs) != 0) {
         return ATT_FAIL;
     }
 
-    vm_address_t breakpoint_addr = find_pyfn(task, SAFE_POINT);
-    if (breakpoint_addr == 0) {
-        log_err("%s not found in target libraries\n", SAFE_POINT);
-        return ATT_FAIL;
-    }
+    vm_address_t breakpoint_addr = pyfn_addrs.breakpoint_addr;
     log_dbg(SAFE_POINT " is at %p in process %d\n",
             (void*)breakpoint_addr, pid);
 
@@ -1167,10 +1220,8 @@ attach_and_execute(const int pid, const char* python_code)
         log_dbg("region.protection = %s", prot_str);
     }
 
-
-    kr = semaphore_create(mach_task_self(), &sync_sema, SYNC_POLICY_FIFO, 0);
-    if (kr != KERN_SUCCESS) {
-        log_mach("semaphore_create", kr);
+    if (init_handler_args(&args) != 0) {
+        deinit_handler_args(&args);
         return ATT_FAIL;
     }
 
@@ -1188,7 +1239,7 @@ attach_and_execute(const int pid, const char* python_code)
     }
     pthread_t t_sig_handler;
     if ((errno = pthread_create(&t_sig_handler, NULL, signal_handler_thread,
-                    0)) != 0) {
+                    &args.completed)) != 0) {
         log_err("pthread_create");
         err = ATT_FAIL;
         goto restore_mask;
@@ -1212,10 +1263,6 @@ attach_and_execute(const int pid, const char* python_code)
      */
     *(uint32_t*)local_bp_addr = saved_instruction;
 
-    /* Set global before creating the exc thread, means no need to sync */
-    g_breakpoint_restore = page_restore;
-    g_python_code = python_code;
-
     mach_port_t exception_port = MACH_PORT_NULL;
 
     if (setup_exception_handling(task, &exception_port) != 0) {
@@ -1226,10 +1273,16 @@ attach_and_execute(const int pid, const char* python_code)
         goto restore_mask;
     }
 
+    args.exc_type = HANDLE_SOFTWARE;
+    args.python_code = (char*)python_code;
+    args.pyfn_addrs = pyfn_addrs;
+    args.breakpoint_restore = page_restore;
+    args.count_threads = 1;
+    args.exc_port = exception_port;
 
     pthread_t s_exc_thread;
     if (pthread_create(&s_exc_thread, NULL, exception_server_thread,
-            &exception_port) != 0) {
+            &args) != 0) {
         log_err("pthread_create");
         err = ATT_FAIL;
         if (restore_page(task, &page_restore) != KERN_SUCCESS) {
@@ -1238,7 +1291,7 @@ attach_and_execute(const int pid, const char* python_code)
         goto out;
     }
 
-    if ((kr = semaphore_wait(sync_sema)) != KERN_SUCCESS) {
+    if ((kr = semaphore_wait(args.started)) != KERN_SUCCESS) {
         log_mach("waiting for pthread_create", kr);
         err = ATT_FAIL;
         if (restore_page(task, &page_restore) != KERN_SUCCESS) {
@@ -1257,8 +1310,8 @@ attach_and_execute(const int pid, const char* python_code)
         goto out;
     }
 
-    if ((kr = wait_for_probe_installation(sync_sema, 30)) != 0) {
-        int kr2 = suspend_and_restore_page(task, &g_breakpoint_restore);
+    if ((kr = wait_for_probe_installation(args.completed, 30)) != 0) {
+        int kr2 = suspend_and_restore_page(task, &page_restore);
         if (kr == KERN_OPERATION_TIMED_OUT) {
             log_err("timed out after 30s waiting to reach safe point");
         }
@@ -1278,7 +1331,7 @@ attach_and_execute(const int pid, const char* python_code)
     err = g_err;
 
     if (err == ATT_INTERRUPTED) {
-        kr = suspend_and_restore_page(task, &g_breakpoint_restore);
+        kr = suspend_and_restore_page(task, &page_restore);
         if (kr != KERN_SUCCESS) {
             err = ATT_UNKNOWN_STATE;
         } else {
@@ -1306,15 +1359,10 @@ out:
 
 restore_mask:
     if ((errno = pthread_sigmask(SIG_SETMASK, &old_mask, NULL))) {
-        // We're leaving our process in an inconsistent state. We should die!
-        log_err("pthread_sigmask");
-        exit(1);
+        log_err("BUG: pthread_sigmask");
+        abort();  // can only be EINVAL
     }
-    if (sync_sema) {
-        if ((kr = semaphore_destroy(task, sync_sema)) != KERN_SUCCESS) {
-            log_mach("semaphore_destroy", kr);
-        }
-    }
+    deinit_handler_args(&args);
 
     return err;
 }
@@ -1344,6 +1392,7 @@ execute_in_threads(
     struct tgt_thread thrds[MAX_THREADS] = {};
     mach_port_t exception_port = MACH_PORT_NULL;
     int found_threads = 0;
+    struct handler_args args = {};
 
     if (count_tids < 0) {
         return ATT_FAIL;
@@ -1360,15 +1409,12 @@ execute_in_threads(
         return err;
     }
 
-    if (find_needed_python_funcs(task) != 0) {
+    struct pyfn_addrs pyfn_addrs = {};
+    if (find_needed_python_funcs(task, &pyfn_addrs) != 0) {
         return ATT_FAIL;
     }
 
-    vm_address_t breakpoint_addr = find_pyfn(task, SAFE_POINT);
-    if (breakpoint_addr == 0) {
-        log_err("%s not found in target libraries\n", SAFE_POINT);
-        return ATT_FAIL;
-    }
+    vm_address_t breakpoint_addr = pyfn_addrs.breakpoint_addr;
 
     for (int i = 0; i < count_tids; i++) {
         log_dbg("tids[i] = %"PRIu64"\n", tids[i]);
@@ -1422,50 +1468,34 @@ execute_in_threads(
         }
     }
 
-    if ((false)) { // Doesn't work for some reason...
-        if ((err = prepare_exc_port(&exception_port)) != 0) {
-            goto out;
-        }
-        for (int i = 0; i < found_threads; i++) {
-            if ((err = setup_thread_exc_handling(thrds[i].act,
-                            &exception_port,
-                            &thrds[i].old_exc_port)) != 0) {
-                goto out;
-            }
-            thrds[i].exc_port_set = 1;
-        }
-    } else {
-        if (setup_exception_handling(task, &exception_port) != 0) {
-            err = ATT_FAIL;
-            goto out;
-        }
-    }
-
-    kr = semaphore_create(mach_task_self(), &sync_sema, SYNC_POLICY_FIFO, 0);
-    if (kr != KERN_SUCCESS) {
-        log_mach("semaphore_create", kr);
+    if (setup_exception_handling(task, &exception_port) != 0) {
         err = ATT_FAIL;
         goto out;
     }
 
-    struct {
-        struct tgt_thread* thrds;
-        mach_port_t exc_port;
-    } arg = {
-        .thrds = thrds,
+    args = (struct handler_args) {
+        .exc_type = HANDLE_HARDWARE,
+        .python_code = (char*)python_code,
+        .pyfn_addrs = pyfn_addrs,
+        .count_threads = found_threads,
         .exc_port = exception_port,
     };
-    g_python_code = python_code; // FIXME: validate the code
+    if (init_handler_args(&args) != 0) {
+        err = ATT_FAIL;
+        goto out;
+    }
+
+    // TODO: validate python code length
 
     pthread_t s_exc_thread;
-    if (pthread_create(&s_exc_thread, NULL, threads_exception_server_thread,
-            &arg) != 0) {
+    if (pthread_create(&s_exc_thread, NULL, exception_server_thread,
+            &args) != 0) {
         log_err("pthread_create");
         err = ATT_FAIL;
         goto out;
     }
 
-    if ((kr = semaphore_wait(sync_sema)) != KERN_SUCCESS) {
+    if ((kr = semaphore_wait(args.started)) != KERN_SUCCESS) {
         log_mach("waiting for pthread_create", kr);
         err = ATT_FAIL;
         goto out;
@@ -1492,7 +1522,7 @@ execute_in_threads(
             break;
         }
 
-        if (wait_for_probe_installation(sync_sema, 30) != 0) {
+        if (wait_for_probe_installation(args.completed, 30) != 0) {
             if (kr == KERN_OPERATION_TIMED_OUT) {
                 log_err("timed out after 30s waiting to reach safe point");
             }
@@ -1500,14 +1530,16 @@ execute_in_threads(
             if (err == 0) { abort(); }; // bug in concurrency code.
             goto out;
         }
-        log_dbg("g_last_completed = %d", g_last_completed);
+        log_dbg("last_completed = %d", args.last_completed->act);
         err = g_err;
         for (int i = 0; i < found_threads; i++) {
-            if (thrds[i].act == g_last_completed) {
+            if (thrds[i].act == args.last_completed->act) { // XXX: RACE
                 thrds[i].attached = 0;
                 thrds[i].hw_bp_set = 0;
             }
         }
+        // XXX: we should have some sort of signaling back to the exc thread
+        // here that it can continue or not
         if (err) {
             goto out;
         }
@@ -1550,18 +1582,6 @@ out:
     }
 
     for (int i = 0; i < found_threads; i++) {
-        if (!thrds[i].exc_port_set) {
-            continue;
-        }
-        if ((false)) { // XXX
-            if (restore_thread_exc_handlers(thrds[i].act, &thrds[i].old_exc_port)
-                    != 0) {
-                err = ATT_UNKNOWN_STATE;
-            }
-        }
-    }
-
-    for (int i = 0; i < found_threads; i++) {
         if (thrds[i].running) {
             continue;
         }
@@ -1572,11 +1592,11 @@ out:
         thrds[i].running = 1;
     }
 
-    if (sync_sema) {
-        if ((kr = semaphore_destroy(task, sync_sema)) != KERN_SUCCESS) {
-            log_mach("semaphore_destroy", kr);
-        }
-    }
+    /*
+     * We clear up resources shared with the handler thread at the end, now
+     * we hopefully have the thread up and running again and out of danger.
+     */
+    deinit_handler_args(&args);
 
     return err;
 #else /* __x86_64__ */

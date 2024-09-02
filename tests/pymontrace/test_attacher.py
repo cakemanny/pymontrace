@@ -151,7 +151,8 @@ def test_receiving_signal_during_attach():
 
 
 def test_exec_in_threads():
-    if sys.platform != 'linux':
+    if sys.platform != 'linux' and not (sys.platform == 'darwin'
+                                        and os.uname().machine == 'arm64'):
         pytest.skip('per thread exec only implemented on linux so far')
     # TODO: exclude riscv
 
