@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name        = "pymontrace"
 description = "dynamic python tracing"
-version     = "0.1.0-dev"
+version     = "0.1.0-dev1"
 requires-python = ">=3.8"
 authors     = [
   {name = "Daniel Golding"}
@@ -14,8 +14,13 @@ readme = {file = "README", content-type = "text/plain" }
 keywords    = ["tracing"]
 license     = {file = "LICENSE.txt"}
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Software Development :: Debuggers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.8",
@@ -23,7 +28,6 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Development Status :: 3 - Alpha",
 ]
 dependencies = []
 
