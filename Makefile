@@ -41,3 +41,17 @@ endif # OS eq Darwin
 .PHONY: test
 test:
 	./hack/bash-aarch64.sh -c 'pip install .; python3 examples/script_to_debug.py & sleep 1; ./hack/example.sh'
+
+
+.PHONY: build
+build:
+	pip install --upgrade build twine
+	python3 -m build
+
+.PHONY: publish
+publish: build
+	twine upload dist/*
+
+.PHONY: clean
+clean:
+	$(RM) dist/ src/pymontrace.egg-info/
