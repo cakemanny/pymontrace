@@ -391,13 +391,13 @@ remove_hw_breakpoint(struct tgt_thread* thrd)
 #endif // TASK_MAX_EXCEPTION_PORT_COUNT
 
 // Adapted from https://gist.github.com/rodionovd/01fff61927a665d78ecf
-static struct {
+struct old_exc_ports {
     mach_msg_type_number_t count;
     exception_mask_t      masks[TASK_MAX_EXCEPTION_PORT_COUNT];
     exception_handler_t   ports[TASK_MAX_EXCEPTION_PORT_COUNT];
     exception_behavior_t  behaviors[TASK_MAX_EXCEPTION_PORT_COUNT];
     thread_state_flavor_t flavors[TASK_MAX_EXCEPTION_PORT_COUNT];
-} old_exc_ports; // FIXME: don't use static
+};
 
 static int
 prepare_exc_port(mach_port_t* exc_port)
@@ -418,7 +418,8 @@ prepare_exc_port(mach_port_t* exc_port)
 }
 
 static int
-setup_exception_handling(task_t target_task, mach_port_t* exc_port)
+setup_exception_handling(
+        task_t target_task, mach_port_t* exc_port, struct old_exc_ports* old)
 {
     kern_return_t kr = 0;
     int err;
@@ -427,15 +428,13 @@ setup_exception_handling(task_t target_task, mach_port_t* exc_port)
         return err;
     }
 
-    old_exc_ports.count = TASK_MAX_EXCEPTION_PORT_COUNT;
+    old->count = TASK_MAX_EXCEPTION_PORT_COUNT;
 
     exception_mask_t mask = EXC_MASK_BREAKPOINT;
 
     /* get the old exception ports */
-    if ((kr = task_get_exception_ports(
-                    target_task, mask, old_exc_ports.masks,
-                    &old_exc_ports.count, old_exc_ports.ports,
-                    old_exc_ports.behaviors, old_exc_ports.flavors))
+    if ((kr = task_get_exception_ports(target_task, mask, old->masks,
+                    &old->count, old->ports, old->behaviors, old->flavors))
             != KERN_SUCCESS) {
         log_mach("task_get_exception_ports", kr);
         return ATT_FAIL;
@@ -457,6 +456,24 @@ setup_exception_handling(task_t target_task, mach_port_t* exc_port)
         return ATT_FAIL;
     }
     return ATT_SUCCESS;
+}
+
+static int
+restore_exception_handling(
+        task_t target_task, struct old_exc_ports* old)
+{
+    kern_return_t kr;
+    int err = 0;
+
+    for (int i = 0; i < (int)old->count; i++) {
+        kr = task_set_exception_ports(target_task, old->masks[i],
+                old->ports[i], old->behaviors[i], old->flavors[i]);
+        if (kr != KERN_SUCCESS) {
+            log_mach("task_set_exception_ports", kr);
+            err = ATT_UNKNOWN_STATE;
+        }
+    }
+    return err;
 }
 
 __attribute__((unused))
@@ -1144,6 +1161,7 @@ attach_and_execute(const int pid, const char* python_code)
     int err = 0;
     kern_return_t kr;
     struct handler_args args = {};
+    struct old_exc_ports old_exc_ports = {};
 
     // TODO: This code is hilariously non-reentrant. Find a way to
     // protect it. or make it reentrant.
@@ -1265,7 +1283,7 @@ attach_and_execute(const int pid, const char* python_code)
 
     mach_port_t exception_port = MACH_PORT_NULL;
 
-    if (setup_exception_handling(task, &exception_port) != 0) {
+    if (setup_exception_handling(task, &exception_port, &old_exc_ports) != 0) {
         err = ATT_FAIL;
         if (restore_page(task, &page_restore) != KERN_SUCCESS) {
             err = ATT_UNKNOWN_STATE;
@@ -1340,17 +1358,10 @@ attach_and_execute(const int pid, const char* python_code)
     }
 
 out:
-    // uninstall exception handlers
-    for (int i = 0; i < (int)old_exc_ports.count; i++) {
-        kr = task_set_exception_ports(task,
-                old_exc_ports.masks[i],
-                old_exc_ports.ports[i],
-                old_exc_ports.behaviors[i],
-                old_exc_ports.flavors[i]);
-        if (kr != KERN_SUCCESS) {
-            log_mach("task_set_exception_ports", kr);
-            err = ATT_UNKNOWN_STATE;
-        }
+    // Right now, this doesn't deal with the possibility of the task
+    // having ended for whatever reason.
+    if (restore_exception_handling(task, &old_exc_ports) != 0) {
+        err = ATT_UNKNOWN_STATE;
     }
 
     if (shutdown_signal_thread(t_sig_handler) != 0) {
@@ -1393,6 +1404,7 @@ execute_in_threads(
     mach_port_t exception_port = MACH_PORT_NULL;
     int found_threads = 0;
     struct handler_args args = {};
+    struct old_exc_ports old_exc_ports = {};
 
     if (count_tids < 0) {
         return ATT_FAIL;
@@ -1468,7 +1480,7 @@ execute_in_threads(
         }
     }
 
-    if (setup_exception_handling(task, &exception_port) != 0) {
+    if (setup_exception_handling(task, &exception_port, &old_exc_ports) != 0) {
         err = ATT_FAIL;
         goto out;
     }
@@ -1568,16 +1580,8 @@ out:
     }
 
     if (exception_port != MACH_PORT_NULL) {
-        for (int i = 0; i < (int)old_exc_ports.count; i++) {
-            kr = task_set_exception_ports(task,
-                    old_exc_ports.masks[i],
-                    old_exc_ports.ports[i],
-                    old_exc_ports.behaviors[i],
-                    old_exc_ports.flavors[i]);
-            if (kr != KERN_SUCCESS) {
-                log_mach("task_set_exception_ports", kr);
-                err = ATT_UNKNOWN_STATE;
-            }
+        if (restore_exception_handling(task, &old_exc_ports) != 0) {
+            err = ATT_UNKNOWN_STATE;
         }
     }
 
