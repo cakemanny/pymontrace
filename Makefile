@@ -54,4 +54,4 @@ publish: build
 
 .PHONY: clean
 clean:
-	$(RM) dist/ src/pymontrace.egg-info/
+	rm -rf dist/ src/pymontrace.egg-info/
