@@ -100,7 +100,7 @@ struct handler_args {
     int count_threads;
     mach_port_t exc_port;
     semaphore_t started;    /* signaled when the handler thread starts */
-    semaphore_t completed;  /* signaled once after each injection */ // TODO
+    semaphore_t completed;  /* signaled once after each injection */
     struct {
         thread_act_t act;
         _Atomic int refcount; /**/
@@ -308,20 +308,29 @@ get_region_protection(task_t task, vm_address_t page_addr, int* protection)
     return kr;
 }
 
-#if defined(__arm64__)
 static int
 set_hw_breakpoint(struct tgt_thread* thrd, uintptr_t bp_addr)
 {
     kern_return_t kr;
 
     __auto_type thread = thrd->act;
+#if defined(__arm64__)
     arm_debug_state64_t debug_state = {};
     __auto_type stateCnt = ARM_DEBUG_STATE64_COUNT;
-    if ((kr = thread_get_state(thread, ARM_DEBUG_STATE64,
+    int flavor = ARM_DEBUG_STATE64;
+#elif defined(__x86_64__)
+    x86_debug_state64_t debug_state = {};
+    __auto_type stateCnt = x86_DEBUG_STATE64_COUNT;
+    int flavor = x86_DEBUG_STATE64;
+#endif /* __arm64__ */
+
+    if ((kr = thread_get_state(thread, flavor,
                     (thread_state_t)&debug_state, &stateCnt)) != 0) {
         log_mach("thread_get_state", kr);
         return ATT_FAIL;
     }
+
+#if defined(__arm64__)
 
     if (debug_state.__bvr[0] != 0) {
         log_err("debug registers in use");
@@ -343,8 +352,27 @@ set_hw_breakpoint(struct tgt_thread* thrd, uintptr_t bp_addr)
         log_dbg("bcr[%02d] = 0x%llx\n", i, debug_state.__bcr[i]);
     }
 
-    if ((kr = thread_set_state(thread, ARM_DEBUG_STATE64,
-                       (thread_state_t)&debug_state, stateCnt)) != 0) {
+#elif defined(__x86_64__)
+
+    if (debug_state.__dr0 != 0) {
+        log_err("debug registers in use");
+        return ATT_FAIL;
+    }
+
+    int dr_idx = 0;  // will change if we ever decide to probe for free reg.
+
+    uint64_t ctrl = debug_state.__dr7;
+    // See linux code for comments
+    ctrl |= (1 << (2 * dr_idx));
+    ctrl &= ~((0b1111 << (dr_idx * 4)) << 16);
+
+    debug_state.__dr0 = bp_addr;
+    debug_state.__dr7 = ctrl;
+
+#endif /* __arm64__ */
+
+    if ((kr = thread_set_state(thread, flavor,
+                    (thread_state_t)&debug_state, stateCnt)) != 0) {
         log_mach("thread_set_state", kr);
         return ATT_FAIL;
     }
@@ -358,13 +386,23 @@ remove_hw_breakpoint(struct tgt_thread* thrd)
     kern_return_t kr;
 
     __auto_type thread = thrd->act;
+#if defined(__arm64__)
     arm_debug_state64_t debug_state = {};
     __auto_type stateCnt = ARM_DEBUG_STATE64_COUNT;
-    if ((kr = thread_get_state(thread, ARM_DEBUG_STATE64,
+    int flavor = ARM_DEBUG_STATE64;
+#elif defined(__x86_64__)
+    x86_debug_state64_t debug_state = {};
+    __auto_type stateCnt = x86_DEBUG_STATE64_COUNT;
+    int flavor = x86_DEBUG_STATE64;
+#endif /* __arm64__ */
+
+    if ((kr = thread_get_state(thread, flavor,
                     (thread_state_t)&debug_state, &stateCnt)) != 0) {
         log_mach("thread_get_state", kr);
         return ATT_FAIL;
     }
+
+#if defined(__arm64__)
 
     if (debug_state.__bvr[0] == 0 && debug_state.__bcr[0] == 0) {
         log_err("hw bp not set :/");
@@ -375,7 +413,22 @@ remove_hw_breakpoint(struct tgt_thread* thrd)
     debug_state.__bcr[0] = 0ULL;
     debug_state.__bvr[0] = 0ULL;
 
-    if ((kr = thread_set_state(thread, ARM_DEBUG_STATE64,
+#elif defined(__x86_64__)
+
+    if (debug_state.__dr0 == 0) {
+        log_err("hw bp not set :/");
+        thrd->hw_bp_set = 0;
+        return 0;
+    }
+
+    int dr_idx = 0;
+    // Clear local enable bit. See linux code for better comments.
+    debug_state.__dr7 &= ~(1 << (2 * dr_idx));
+    debug_state.__dr0 = 0;
+
+#endif /* __arm64__ */
+
+    if ((kr = thread_set_state(thread, flavor,
                        (thread_state_t)&debug_state, stateCnt)) != 0) {
         log_mach("thread_set_state", kr);
         return ATT_FAIL;
@@ -383,7 +436,6 @@ remove_hw_breakpoint(struct tgt_thread* thrd)
     thrd->hw_bp_set = 0;
     return 0;
 }
-#endif /* __arm64__ */
 
 // backport for macOS < 14
 #ifndef TASK_MAX_EXCEPTION_PORT_COUNT
@@ -465,6 +517,7 @@ restore_exception_handling(
     kern_return_t kr;
     int err = 0;
 
+    log_dbg("old->count = %d", old->count);
     for (int i = 0; i < (int)old->count; i++) {
         kr = task_set_exception_ports(target_task, old->masks[i],
                 old->ports[i], old->behaviors[i], old->flavors[i]);
@@ -642,22 +695,15 @@ catch_mach_exception_raise_state_identity(
                 return KERN_FAILURE; /* I think it'll die anyway */
             }
         } else {
-            #if defined(__arm64__)
-                assert(handler->exc_type == HANDLE_HARDWARE);
-
-                struct tgt_thread thrd = { .act = thread, };
-                int err = remove_hw_breakpoint(&thrd);
-                if (err != 0) {
-                    atomic_store(&g_err, ATT_UNKNOWN_STATE);
-                    handler->last_completed->act = thread;
-                    semaphore_signal(handler->completed); // XXX: err handling
-                    return KERN_FAILURE;
-                }
-            #elif defined(__x86_64__)
-                // TODO
-                log_err("x86_64: exc_handler_type != HANDLE_SOFTWARE");
-                abort();
-            #endif /* __arm64__ */
+            assert(handler->exc_type == HANDLE_HARDWARE);
+            struct tgt_thread thrd = { .act = thread, };
+            int err = remove_hw_breakpoint(&thrd);
+            if (err != 0) {
+                atomic_store(&g_err, ATT_UNKNOWN_STATE);
+                handler->last_completed->act = thread;
+                semaphore_signal(handler->completed); // XXX: err handling
+                return KERN_FAILURE;
+            }
         }
 
         // This is our last chance to bail.
@@ -825,6 +871,7 @@ exception_server_thread(void* arg)
     // done?
     const int breakpoints_per_thread = 2;
     for (int i = 0; i < args->count_threads * breakpoints_per_thread; i++) {
+        log_dbg("[%d] mach_msg_server_once", i);
         if ((kr = mach_msg_server_once(mach_exc_server,
                         MACH_MSG_SIZE_RELIABLE, args->exc_port, 0))
                 != KERN_SUCCESS) {
@@ -1135,7 +1182,8 @@ void
 deinit_handler_args(struct handler_args* args)
 {
     kern_return_t kr;
-    if (1 == atomic_fetch_sub(&args->last_completed->refcount, 1)) {
+    if (args->last_completed
+            && 1 == atomic_fetch_sub(&args->last_completed->refcount, 1)) {
         free(args->last_completed);
         args->last_completed = NULL;
     }
@@ -1334,7 +1382,7 @@ attach_and_execute(const int pid, const char* python_code)
             log_err("timed out after 30s waiting to reach safe point");
         }
         err = atomic_load(&g_err);
-        if (err == 0) { abort(); }; // bug in concurrency code.
+        if (err == 0) { log_err("BUG: g_err"); abort(); }; // bug in concurrency code.
         if (kr2 != KERN_SUCCESS) {
             err = ATT_UNKNOWN_STATE;
         }
@@ -1378,9 +1426,6 @@ restore_mask:
     return err;
 }
 
-#ifdef __x86_64__
-__attribute__((unused))
-#endif // __x86_64__
 static int
 find_tid(uint64_t tid, uint64_t* tids, int count_tids)
 {
@@ -1396,7 +1441,6 @@ int
 execute_in_threads(
         int pid, uint64_t* tids, int count_tids, const char* python_code)
 {
-#if defined(__arm64__)
     int err = 0;
     kern_return_t kr = 0;
     enum { MAX_THREADS = 16 };
@@ -1603,8 +1647,4 @@ out:
     deinit_handler_args(&args);
 
     return err;
-#else /* __x86_64__ */
-
-    return -1; /* not implemented */
-#endif /* __arm64__ */
 }
