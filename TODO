@@ -10,6 +10,7 @@ In priority order:
 - [x] Make darwin attach signal handling race-free
 - [x] Make linux attach code signal resistant
 - [o] Clean up C code (specific TODOs are within)
+- [ ] Handle target process + target thread ending cleanly.
 - [ ] Add command to list probes (maybe `sys.modules` can help)
 - [x] Use Py_AddPendingCall on Darwin too
 - [x] Add veneer around PyRun_SimpleString so that we

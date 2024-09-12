@@ -233,7 +233,7 @@ def decode_and_print_forever(s: socket.socket):
                 # This may not be the correct value if the target has forked
                 pid = get_peer_pid(s)
                 t = threading.Thread(target=settrace_in_threads,
-                                     args=(pid, thread_ids))
+                                     args=(pid, thread_ids), daemon=True)
                 t.start()
             else:
                 print('unknown message kind:', kind, file=sys.stderr)

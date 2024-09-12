@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <libgen.h>
 #include <pthread.h>
 #include <signal.h>
@@ -45,9 +46,12 @@ const bool debug = false;
 #define DEBUG_TRAP_INSTR    ((uint8_t)0xcc)
 #endif
 
+// TODO: use some sort of g_cancel instead of conflating the result for
+// a signal thread.
 // Note we don't use atomic routines to set this when setting it
 // just before using the semaphore.
 static _Atomic int g_err; /* failure state from exc handler */
+
 
 typedef struct {
     vm_address_t    page_addr;
@@ -190,6 +194,8 @@ log_dbg(const char* fmt, ...)
     return 0;  // we only return int to satisfy __builtin_dump_struct on
                // ventura
 }
+
+#define log_odbg(fmt, v)    log_dbg(#v " = " fmt, v)
 
 __attribute__((format(printf, 1, 2)))
 static void
@@ -437,6 +443,36 @@ remove_hw_breakpoint(struct tgt_thread* thrd)
     return 0;
 }
 
+
+static int
+get_exception_type(thread_act_t thread, int* exc_type)
+{
+    kern_return_t kr;
+    arm_exception_state64_t exc_state;
+    __auto_type exc_stateCnt = ARM_EXCEPTION_STATE64_COUNT;
+    if ((kr = thread_get_state(thread, ARM_EXCEPTION_STATE64,
+                    (thread_state_t)&exc_state, &exc_stateCnt))) {
+        log_mach("thread_get_state exc state", kr);
+        return ATT_FAIL;
+    }
+
+    __auto_type exception_class = (exc_state.__esr >> 26) & 0b111111;
+    switch (exception_class) {
+        case 0b110000: // Breakpoint exception from a lower Exception level
+        case 0b110001: // Breakpoint exception taken without a change in Exception level.
+            *exc_type = HANDLE_HARDWARE;
+            return 0;
+        case 0b111000: // BRK instruction execution in AArch32 state
+        case 0b111100: // BRK instruction execution in AArch64 state
+            *exc_type = HANDLE_SOFTWARE;
+            return 0;
+        default:
+            log_err("unknown exception class 0x%x", exception_class);
+            return ATT_FAIL;
+    }
+}
+
+
 // backport for macOS < 14
 #ifndef TASK_MAX_EXCEPTION_PORT_COUNT
 #define TASK_MAX_EXCEPTION_PORT_COUNT EXC_TYPES_COUNT
@@ -536,7 +572,7 @@ setup_thread_exc_handling(thread_act_t thread, mach_port_t* exc_port,
 {
     kern_return_t kr = 0;
 
-    exception_mask_t mask = EXC_BREAKPOINT;
+    exception_mask_t mask = EXC_MASK_BREAKPOINT;
     mach_msg_type_number_t count = 1; /* only 1 mask to be replaced  */
 
     task_flavor_t flavor =
@@ -592,6 +628,26 @@ find_state_slot(mach_port_t thread)
     return NULL;
 }
 
+static inline void
+print_backtrace()
+{
+    void* callstack[128];
+    int frames = backtrace(callstack, 128);
+    backtrace_symbols_fd(callstack, frames, STDERR_FILENO);
+}
+
+void
+sem_signal(semaphore_t semaphore)
+{
+    kern_return_t kr = 0;
+    if ((kr = semaphore_signal(semaphore)) != KERN_SUCCESS) {
+        log_mach("semaphore_signal", kr);
+        if (debug) {
+            print_backtrace();
+        }
+    }
+}
+
 extern kern_return_t
 catch_mach_exception_raise(mach_port_t exception_port,
         mach_port_t thread,
@@ -637,10 +693,10 @@ catch_mach_exception_raise_state_identity(
     kern_return_t kr;
 
     log_dbg("in catch_exception_raise_state_identity for %d", thread);
-    log_dbg("codeCnt = %d", codeCnt);
-    if (codeCnt > 0) {
-        log_dbg("code = %llx\n", *code);
+    if (codeCnt >= 2) {
+        log_dbg("code[0] = 0x%llx, code[1] = 0x%llx", code[0], code[1]);
     }
+
     assert(exception == EXC_BREAKPOINT);
     #if defined(__arm64__)
         assert(*flavor == ARM_THREAD_STATE64);
@@ -679,29 +735,58 @@ catch_mach_exception_raise_state_identity(
         #endif
     __auto_type bp_addr = handler->pyfn_addrs.breakpoint_addr;
     if (pc >= bp_addr && pc < bp_addr + 2) { // it's a range because of x86
+        log_dbg("pc = %llx", pc);
+
+#ifdef __arm64__
+        int exc_type = 0;
+        if (get_exception_type(thread, &exc_type)) {
+            atomic_store(&g_err , ATT_UNKNOWN_STATE);
+            handler->last_completed->act = thread;
+            sem_signal(handler->completed);
+            return KERN_FAILURE; /* I think it'll die anyway */
+        }
+#endif
+
         if (handler->exc_type == HANDLE_SOFTWARE) {
             if (handler->breakpoint_restore.page_addr == 0) {
                 abort();
             }
+#ifdef __arm64__
+            if (exc_type != HANDLE_SOFTWARE) {
+                log_err("leaked hw exception");
+                abort();
+            }
+#endif
+
             /*
              * Restore overwritten instruction
              */
+            kr = task_suspend(task); // hopefully this forces rereading the code?
+            if (kr) log_mach("task_suspend", kr);
             kr = restore_page(task, &handler->breakpoint_restore);
+            kern_return_t kr2 = task_resume(task);
+            if (kr2) log_mach("task_resume", kr);
             if (kr != KERN_SUCCESS) {
                 log_mach("restore_page", kr);
                 atomic_store(&g_err , ATT_UNKNOWN_STATE);
                 handler->last_completed->act = thread;
-                semaphore_signal(handler->completed); // XXX: err handling
+                sem_signal(handler->completed);
                 return KERN_FAILURE; /* I think it'll die anyway */
             }
         } else {
             assert(handler->exc_type == HANDLE_HARDWARE);
+#ifdef __arm64__
+            if (exc_type != HANDLE_HARDWARE) {
+                log_err("leaked sw exception");
+                abort();
+            }
+#endif
             struct tgt_thread thrd = { .act = thread, };
             int err = remove_hw_breakpoint(&thrd);
             if (err != 0) {
                 atomic_store(&g_err, ATT_UNKNOWN_STATE);
                 handler->last_completed->act = thread;
-                semaphore_signal(handler->completed); // XXX: err handling
+                sem_signal(handler->completed);
                 return KERN_FAILURE;
             }
         }
@@ -724,7 +809,7 @@ catch_mach_exception_raise_state_identity(
             log_mach("vm_allocate", kr);
             g_err = ATT_FAIL; // technically we're leaking memory...
             handler->last_completed->act = thread;
-            semaphore_signal(handler->completed); // XXX: err handling
+            sem_signal(handler->completed);
             return KERN_SUCCESS;
         }
         /* save so we can deallocate at the end */
@@ -739,7 +824,7 @@ catch_mach_exception_raise_state_identity(
             log_mach("vm_read", kr);
             g_err = ATT_FAIL;
             handler->last_completed->act = thread;
-            semaphore_signal(handler->completed); // XXX: err handling
+            sem_signal(handler->completed);
             return KERN_SUCCESS;
         }
         assert(dataCnt == pagesize);
@@ -763,7 +848,7 @@ catch_mach_exception_raise_state_identity(
             log_mach("restore_page", kr);
             g_err = ATT_FAIL;
             handler->last_completed->act = thread;
-            semaphore_signal(handler->completed);
+            sem_signal(handler->completed);
             return KERN_SUCCESS;
         }
 
@@ -827,15 +912,14 @@ catch_mach_exception_raise_state_identity(
         if (kr != KERN_SUCCESS) {
             log_mach("vm_deallocate", kr);
         }
-        state_slot->allocation.addr = state_slot->allocation.size = 0;
-        state_slot->thread = 0;
+        memset(state_slot, 0, sizeof *state_slot);
 
         if (retval != 0) {
             log_err("PyRun_SimpleString failed (%d)", (int)retval);
         }
         g_err = (retval == 0) ? ATT_SUCCESS : ATT_FAIL;
         handler->last_completed->act = thread;
-        semaphore_signal(handler->completed);
+        sem_signal(handler->completed);
     }
 
     return KERN_SUCCESS;
@@ -869,7 +953,7 @@ exception_server_thread(void* arg)
 
     // It would perhaps be better to have the main thread signal when all is
     // done?
-    const int breakpoints_per_thread = 2;
+    const int breakpoints_per_thread = 4;  // XXX: should be 2... but bugs.
     for (int i = 0; i < args->count_threads * breakpoints_per_thread; i++) {
         log_dbg("[%d] mach_msg_server_once", i);
         if ((kr = mach_msg_server_once(mach_exc_server,
@@ -1090,6 +1174,9 @@ find_pyfn(task_t task, const char* symbol)
 static int
 find_needed_python_funcs(task_t task, struct pyfn_addrs* addrs)
 {
+    // FIXME: we should pause the task before doing this, in order to
+    // get a consistent read
+
     addrs->breakpoint_addr = find_pyfn(task, SAFE_POINT);
     if (!addrs->breakpoint_addr) {
         log_err("could not find %s in shared libs\n", SAFE_POINT);
@@ -1382,7 +1469,10 @@ attach_and_execute(const int pid, const char* python_code)
             log_err("timed out after 30s waiting to reach safe point");
         }
         err = atomic_load(&g_err);
-        if (err == 0) { log_err("BUG: g_err"); abort(); }; // bug in concurrency code.
+        if (err == 0) {
+            log_err("BUG: g_err");
+            abort();
+        };
         if (kr2 != KERN_SUCCESS) {
             err = ATT_UNKNOWN_STATE;
         }
@@ -1408,8 +1498,13 @@ attach_and_execute(const int pid, const char* python_code)
 out:
     // Right now, this doesn't deal with the possibility of the task
     // having ended for whatever reason.
-    if (restore_exception_handling(task, &old_exc_ports) != 0) {
-        err = ATT_UNKNOWN_STATE;
+    if (exception_port != MACH_PORT_NULL) {
+        if (restore_exception_handling(task, &old_exc_ports) != 0) {
+            err = ATT_UNKNOWN_STATE;
+        }
+        if ((kr = mach_port_deallocate(mach_task_self(), exception_port))) {
+            log_mach("mach_port_deallocate", kr);
+        }
     }
 
     if (shutdown_signal_thread(t_sig_handler) != 0) {
@@ -1476,6 +1571,8 @@ execute_in_threads(
         log_dbg("tids[i] = %"PRIu64"\n", tids[i]);
     }
 
+    // TODO: suspend the target task while gathering the thread information
+
     thread_act_array_t thread_list = NULL;
     mach_msg_type_number_t thread_count = 0;
     if ((kr = task_threads(task, &thread_list, &thread_count)) != KERN_SUCCESS) {
@@ -1505,7 +1602,7 @@ execute_in_threads(
     if (found_threads != count_tids) {
         // This could just mean that a thread died/completed between reporting
         // and us now looking.
-        log_err("note: only %d of %d additional threads found", found_threads,
+        log_err("note: only %d of %d additional threads found\n", found_threads,
                 count_tids);
     }
 
@@ -1599,7 +1696,7 @@ execute_in_threads(
         if (err) {
             goto out;
         }
-        atomic_store(&g_err, 0);
+        atomic_store(&g_err, 0); // XXX: RACE
     }
     log_dbg("leaving...");
 
@@ -1626,6 +1723,9 @@ out:
     if (exception_port != MACH_PORT_NULL) {
         if (restore_exception_handling(task, &old_exc_ports) != 0) {
             err = ATT_UNKNOWN_STATE;
+        }
+        if ((kr = mach_port_deallocate(mach_task_self(), exception_port))) {
+            log_mach("mach_port_deallocate", kr);
         }
     }
 

@@ -649,6 +649,7 @@ interrupt_threads(struct tgt_thrd* thrds, int nthreads)
             log_err("ptrace interrupt: tid=%d", t->tid);
             return ATT_UNKNOWN_STATE;
         }
+        // FIXME: the thread may have exited normally.
         if (wait_for_stop(t->tid, SIGTRAP, &t->wstatus) == -1) {
             return ATT_UNKNOWN_STATE;
         }
