@@ -444,6 +444,7 @@ remove_hw_breakpoint(struct tgt_thread* thrd)
 }
 
 
+#ifdef __arm64__
 static int
 get_exception_type(thread_act_t thread, int* exc_type)
 {
@@ -471,6 +472,7 @@ get_exception_type(thread_act_t thread, int* exc_type)
             return ATT_FAIL;
     }
 }
+#endif
 
 
 // backport for macOS < 14
