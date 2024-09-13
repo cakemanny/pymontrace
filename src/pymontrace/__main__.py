@@ -56,6 +56,8 @@ def receive_and_print_until_interrupted(s: socket.socket):
 def tracepid(pid: int, probe, action: str):
     os.kill(pid, 0)
 
+    tracer.install_signal_handler()
+
     site_extension = tracer.install_pymontrace(pid)
 
     comms = CommsFile(pid)

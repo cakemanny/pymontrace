@@ -212,8 +212,6 @@ def install_signal_handler():
 def decode_and_print_forever(s: socket.socket):
     from pymontrace.tracee import Message
 
-    install_signal_handler()
-
     t = None
     try:
         header_fmt = struct.Struct('=HH')
