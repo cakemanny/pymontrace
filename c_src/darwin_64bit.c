@@ -95,7 +95,6 @@ struct handler_args {
     } exc_type;
     char* python_code;        /* code to execute */
     struct pyfn_addrs pyfn_addrs;
-    page_restore_t breakpoint_restore;
     bool interrupted;   /* we've been interrupted. the target should be
                            restored to what it was doing.*/
 };
@@ -253,15 +252,6 @@ load_and_find_safepoint(const char* sopath, const char* symbol, Dl_info* info)
     return 0;
 }
 
-static void
-fmt_prot(char out[4], vm_prot_t protection)
-{
-    out[0] = (protection & VM_PROT_READ) ? 'r' : '-';
-    out[1] = (protection & VM_PROT_WRITE) ? 'w' : '-';
-    out[2] = (protection & VM_PROT_EXECUTE) ? 'x' : '-';
-    out[3] = '\0';
-}
-
 static kern_return_t
 restore_page(task_t task, page_restore_t* r)
 {
@@ -283,40 +273,6 @@ restore_page(task_t task, page_restore_t* r)
     return kr;
 }
 
-static kern_return_t
-suspend_and_restore_page(task_t task, page_restore_t* r)
-{
-    int kr, kr2;
-    if ((kr = task_suspend(task)) != 0) {
-        log_mach("task_suspend", kr);
-    }
-    if ((kr2 = restore_page(task, r)) != 0) {
-        log_mach("restore_page", kr2);
-        return kr2;
-    }
-    return kr;
-}
-
-static kern_return_t
-get_region_protection(task_t task, vm_address_t page_addr, int* protection)
-{
-    kern_return_t kr;
-    vm_address_t region_address = page_addr;
-    vm_size_t region_size = 0;
-    struct vm_region_basic_info_64 region_info = {};
-    mach_msg_type_number_t infoCnt = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t object_name = MACH_PORT_NULL;
-    if ((kr = vm_region_64(task, &region_address, &region_size,
-                    VM_REGION_BASIC_INFO_64, (vm_region_info_t)&region_info,
-                    &infoCnt, &object_name)
-                ) != KERN_SUCCESS) {
-        log_mach("vm_region_64", kr);
-        return kr;
-    }
-
-    *protection = region_info.protection;
-    return kr;
-}
 
 static int
 set_hw_breakpoint(struct tgt_thread* thrd, uintptr_t bp_addr)
@@ -563,7 +519,10 @@ restore_exception_handling(
     for (int i = 0; i < (int)old->count; i++) {
         kr = task_set_exception_ports(target_task, old->masks[i],
                 old->ports[i], old->behaviors[i], old->flavors[i]);
-        if (kr != KERN_SUCCESS) {
+        if (kr == MACH_SEND_INVALID_DEST) {
+            // process probably ended.
+            log_dbg("task_set_exception_ports: %s", mach_error_string(kr));
+        } else if (kr != KERN_SUCCESS ) {
             log_mach("task_set_exception_ports", kr);
             err = ATT_UNKNOWN_STATE;
         }
@@ -761,46 +720,15 @@ catch_mach_exception_raise_state_identity(
             return handler_result(KERN_FAILURE, thread, ATT_UNKNOWN_STATE,
                     bp_kind); /* I think it'll die anyway */
         }
+        if (exc_type != HANDLE_HARDWARE) {
+            log_err("leaked sw exception");
+            abort();
+        }
 #endif
-
-        if (handler->exc_type == HANDLE_SOFTWARE) {
-            if (handler->breakpoint_restore.page_addr == 0) {
-                abort();
-            }
-#ifdef __arm64__
-            if (exc_type != HANDLE_SOFTWARE) {
-                log_err("leaked hw exception");
-                abort();
-            }
-#endif
-
-            /*
-             * Restore overwritten instruction
-             */
-            kr = task_suspend(task); // hopefully this forces rereading the code?
-            if (kr) log_mach("task_suspend", kr);
-            kr = restore_page(task, &handler->breakpoint_restore);
-            kern_return_t kr2 = task_resume(task);
-            if (kr2) log_mach("task_resume", kr);
-            if (kr != KERN_SUCCESS) {
-                log_mach("restore_page", kr);
-                return handler_result(KERN_FAILURE, thread, ATT_UNKNOWN_STATE,
-                    bp_kind); /* I think it'll die anyway */
-            }
-        } else {
-            assert(handler->exc_type == HANDLE_HARDWARE);
-#ifdef __arm64__
-            if (exc_type != HANDLE_HARDWARE) {
-                log_err("leaked sw exception");
-                abort();
-            }
-#endif
-            struct tgt_thread thrd = { .act = thread, };
-            int err = remove_hw_breakpoint(&thrd);
-            if (err != 0) {
-                return handler_result(KERN_FAILURE, thread, ATT_UNKNOWN_STATE,
+        struct tgt_thread thrd = { .act = thread, };
+        if (remove_hw_breakpoint(&thrd) != 0) {
+            return handler_result(KERN_FAILURE, thread, ATT_UNKNOWN_STATE,
                     bp_kind);
-            }
         }
 
         // This is our last chance to bail.
@@ -903,14 +831,6 @@ catch_mach_exception_raise_state_identity(
             #endif
 
         *(att_threadstate_t*)new_state = state_slot->orig_threadstate;
-        #ifdef __x86_64__
-            if (HANDLE_SOFTWARE) {
-                // 0xcc on x86 progresses the instruction pointer to the
-                // instruction after the trap instruction. But since we
-                // replaced it, we need to go back and execute it.
-                ((att_threadstate_t*)new_state)->__rip -= 1;
-            }
-        #endif
 
         kr = vm_deallocate(task, state_slot->allocation.addr,
                 state_slot->allocation.size);
@@ -1134,6 +1054,9 @@ attach_and_execute(const int pid, const char* python_code)
 {
     int err = 0;
     kern_return_t kr;
+    enum { MAX_THREADS = 16 };
+    struct tgt_thread thrds[MAX_THREADS] = {};
+    mach_port_t exception_port = MACH_PORT_NULL;
     struct handler_args args = {};
     struct old_exc_ports old_exc_ports = {};
     int kq = -1; /* kqueue file descriptor */
@@ -1166,49 +1089,36 @@ attach_and_execute(const int pid, const char* python_code)
             (void*)breakpoint_addr, pid);
 
 
-    // work out page to read and write
-
-    vm_address_t page_boundary = breakpoint_addr & ~(pagesize - 1);
-    vm_offset_t bp_page_offset = breakpoint_addr & (pagesize - 1);
-
     // Attach and set breakpoint
     if ((kr = task_suspend(task)) != KERN_SUCCESS) {
         log_mach("task_suspend", kr);
         return ATT_FAIL;
     }
 
-    vm_offset_t data;
-    mach_msg_type_number_t dataCnt;
-    if ((kr = vm_read(task, page_boundary, pagesize, &data, &dataCnt))
+    // IDEA: find all the threads and set a hardware breakpoint in each of
+    // them.
+
+    mach_msg_type_number_t thread_count = 0;
+    thread_act_array_t thread_list = NULL;
+
+    if ((kr = task_threads(task, &thread_list, &thread_count))
             != KERN_SUCCESS) {
-        log_mach("vm_read", kr);
+        task_resume(task);
         return ATT_FAIL;
     }
-    assert(dataCnt == pagesize);
-    void* local_bp_addr = (char*)data + (ptrdiff_t)bp_page_offset;
-
-    uint32_t saved_instruction = *(uint32_t*)local_bp_addr;
-    log_dbg("instr at BP: %8x\n", saved_instruction);
-
-    /* write the breakpoint */
-#if defined(__arm64__)
-    *(uint32_t*)local_bp_addr = DEBUG_TRAP_INSTR;
-#else /* __x86_64__ */
-    *(uint8_t*)local_bp_addr = DEBUG_TRAP_INSTR;
-#endif
-
-
-    int protection;
-    kr = get_region_protection(task, page_boundary, &protection);
-    if (kr != KERN_SUCCESS) {
-        log_mach("get_region_protection", kr);
+    if (thread_count > MAX_THREADS) {
+        log_err("too many threads: target has %u threads. max is %u\n",
+                thread_count, MAX_THREADS);
+        task_resume(task);
         return ATT_FAIL;
     }
-
-    if (debug) {
-        char prot_str[4];
-        fmt_prot(prot_str, protection);
-        log_dbg("region.protection = %s", prot_str);
+    if (thread_count == 0) {
+        log_err("task has no threads\n");
+        return ATT_FAIL;
+    }
+    for (int i = 0; i < (int)thread_count; i++) {
+        thrds[i].act = thread_list[i];
+        thrds[i].running = 1;
     }
 
     /*
@@ -1223,38 +1133,21 @@ attach_and_execute(const int pid, const char* python_code)
         return ATT_FAIL;
     }
 
-    page_restore_t page_restore = {
-        .page_addr = page_boundary,
-        .pagesize = pagesize,
-        .data = data,
-        .protection = protection,
-    };
-    if ((kr = restore_page(task, &page_restore)) != KERN_SUCCESS) {
-        log_mach("restore_page", kr);
-        err = ATT_UNKNOWN_STATE;
-        goto restore_mask;
-    }
-
-    /*
-     * We restore the instruction on our copy of the page so that we
-     * are prepared to unset the breakpoint in the exception handler
-     */
-    *(uint32_t*)local_bp_addr = saved_instruction;
-
-    mach_port_t exception_port = MACH_PORT_NULL;
 
     if (setup_exception_handling(task, &exception_port, &old_exc_ports) != 0) {
         err = ATT_FAIL;
-        if (restore_page(task, &page_restore) != KERN_SUCCESS) {
-            err = ATT_UNKNOWN_STATE;
-        }
         goto restore_mask;
     }
 
-    args.exc_type = HANDLE_SOFTWARE;
+    for (int i = 0; i < (int)thread_count; i++) {
+        if ((err = set_hw_breakpoint(&thrds[i], breakpoint_addr))) {
+            goto out;
+        }
+    }
+
+    args.exc_type = HANDLE_HARDWARE;
     args.python_code = (char*)python_code;
     args.pyfn_addrs = pyfn_addrs;
-    args.breakpoint_restore = page_restore;
 
     /* copy the args into our thread local space */
     t_handler_args = args;
@@ -1262,9 +1155,6 @@ attach_and_execute(const int pid, const char* python_code)
     if (-1 == (kq = kqueue())) {
         log_err("kqueue");
         err = ATT_FAIL;
-        if (restore_page(task, &page_restore) != KERN_SUCCESS) {
-            err = ATT_UNKNOWN_STATE;
-        }
         goto out;
     }
 
@@ -1294,14 +1184,17 @@ attach_and_execute(const int pid, const char* python_code)
             .filter = EVFILT_SIGNAL,
             .flags = EV_ADD,
         },
+        {
+            .ident = pid,
+            .filter = EVFILT_PROC,
+            .flags = EV_ADD,
+            .fflags = NOTE_EXIT | NOTE_EXITSTATUS,
+        },
     };
     int nevents = kevent64(kq, kev, NELEMS(kev), NULL, 0, 0, NULL);
     if (nevents == -1) {
         log_err("kevent64");
         err = ATT_FAIL;
-        if (restore_page(task, &page_restore) != KERN_SUCCESS) {
-            err = ATT_UNKNOWN_STATE;
-        }
         goto out;
     }
     assert(nevents == 0);
@@ -1311,13 +1204,10 @@ attach_and_execute(const int pid, const char* python_code)
     if ((kr = task_resume(task)) != KERN_SUCCESS) {
         log_mach("task_resume", kr);
         err = ATT_FAIL;
-        if (restore_page(task, &page_restore) != KERN_SUCCESS) {
-            err = ATT_UNKNOWN_STATE;
-        }
         goto out;
     }
 
-    bool page_restored = false;
+    bool safe_point_hit = false;
     bool code_execd = false;
     for (;;) {
         if (code_execd) {
@@ -1329,10 +1219,6 @@ attach_and_execute(const int pid, const char* python_code)
         nevents = kevent64(kq, NULL, 0, eventlist, 1, 0, &timeout);
         if (-1 == nevents) {
             int esaved = errno;
-            kr = KERN_SUCCESS;
-            if (!page_restored) {
-                kr = suspend_and_restore_page(task, &page_restore);
-            }
             errno = esaved;
             if (errno == EINTR) {
                 log_err("interrupted waiting to reach safe point");
@@ -1341,18 +1227,9 @@ attach_and_execute(const int pid, const char* python_code)
                 log_err("kevent64");
                 err = ATT_FAIL;
             }
-            if (kr != KERN_SUCCESS) {
-                err = ATT_UNKNOWN_STATE;
-            }
-            // It seems like here, we are forgetting to resume the task...
-
-            // Assuming no race with the exception handler, we're back to original
-            // state.
-            // TODO: do a non-blocking mach exception check to ensure we're
-            // not leaving the process about to die.
             goto out;
         } else if (nevents == 0) {
-            if (!page_restored) {
+            if (!safe_point_hit) {
                 log_err("timed out after 30s waiting to reach safe point");
                 err = ATT_INTERRUPTED;
             } else {
@@ -1381,16 +1258,56 @@ attach_and_execute(const int pid, const char* python_code)
                 goto out;
             }
             switch (t_handler_result.bp_kind) {
-                case BPK_AT_SAFE_POINT:
-                    page_restored = true;
-                    break;
-                case BPK_AFTER_PYRUN:
-                    code_execd = true;
-                    break;
+            case BPK_AT_SAFE_POINT:
+                safe_point_hit = true;
+                // sanity checks?
+                for (int i = 0; i < (int)thread_count; i++) {
+                    if (thrds[i].act == t_handler_result.act) {
+                        thrds[i].hw_bp_set = 0;
+                    } else {
+                        if ((kr = thread_suspend(thrds[i].act))
+                                != KERN_SUCCESS) {
+                            if (kr == MACH_SEND_INVALID_DEST) {
+                                // thread may have finished.
+                                log_dbg("thread_suspend: invalid dest");
+                                thrds[i].hw_bp_set = 0;
+                                thrds[i].attached = 0;
+                                thrds[i].running = 1;  // white lie
+                                continue;
+                            } else {
+                                log_mach("thread_suspend", kr);
+                                err = ATT_UNKNOWN_STATE;
+                                goto out;
+                            }
+                        }
+                        thrds[i].running = 0;
+                        if (remove_hw_breakpoint(&thrds[i]) != 0) {
+                            err = ATT_UNKNOWN_STATE;
+                        }
+                        if ((kr = thread_resume(thrds[i].act))
+                                != KERN_SUCCESS) {
+                            log_mach("thread_resume", kr);
+                            err = ATT_UNKNOWN_STATE;
+                            goto out;
+                        }
+                        thrds[i].running = 1;
+                    }
+                }
+                break;
+            case BPK_AFTER_PYRUN:
+                code_execd = true;
+                for (int i = 0; i < (int)thread_count; i++) {
+                    if (thrds[i].act == t_handler_result.act) {
+                        thrds[i].attached = 0;
+                        break;
+                    }
+                }
+                break;
             }
         } else if (eventlist[0].filter == EVFILT_SIGNAL) {
-            if (!page_restored) {
+            if (!safe_point_hit) {
                 err = ATT_INTERRUPTED;
+                fprintf(stderr, "Cancelled\n");
                 // TODO: set handler.interrupted and run the
                 // mach_msg_server_once in a non-blocking manner.
             } else {
@@ -1399,18 +1316,26 @@ attach_and_execute(const int pid, const char* python_code)
                         "Will be done in a few seconds.\n");
                 continue;
             }
+        } else if (eventlist[0].filter == EVFILT_PROC &&
+                (eventlist[0].fflags & NOTE_EXIT)) {
+            if (eventlist[0].fflags & NOTE_EXITSTATUS) {
+                log_err("target exited: exit status %llu\n", eventlist[0].data);
+            } else {
+                log_err("target exited: exit status unknown\n");
+            }
+            err = ATT_FAIL;
+            for (int i = 0; i < (int)thread_count; i++) {
+                thrds[i].running = 1; // not true, but confuses the exit code
+                                      // less
+                thrds[i].hw_bp_set = 0;
+                thrds[i].attached = 0;
+            }
+            goto out;
+        } else {
+            log_err("unexpected kqueue filter %x\n", eventlist[0].filter);
+            abort();
         }
 
-        if (err == ATT_INTERRUPTED) {
-            if (!page_restored) {
-                kr = suspend_and_restore_page(task, &page_restore);
-                if (kr != KERN_SUCCESS) {
-                    err = ATT_UNKNOWN_STATE;
-                } else {
-                    fprintf(stderr, "Cancelled\n");
-                }
-            }
-        }
         if (err) {
             goto out;
         }
@@ -1422,15 +1347,51 @@ out:
         close(kq);
     }
 
-    // Right now, this doesn't deal with the possibility of the task
-    // having ended for whatever reason.
-    if (exception_port != MACH_PORT_NULL) {
-        if (restore_exception_handling(task, &old_exc_ports) != 0) {
+    for (int i = 0; i < (int)thread_count; i++) {
+        if (!thrds[i].hw_bp_set) {
+            continue;
+        }
+        if (thrds[i].running) {
+            if ((kr = thread_suspend(thrds[i].act)) != KERN_SUCCESS) {
+                log_mach("thread_suspend", kr);
+                err = ATT_UNKNOWN_STATE;
+                continue;
+            }
+            thrds[i].running = 0;
+        }
+        if (remove_hw_breakpoint(&thrds[i])) {
             err = ATT_UNKNOWN_STATE;
         }
-        if ((kr = mach_port_deallocate(mach_task_self(), exception_port))) {
-            log_mach("mach_port_deallocate", kr);
+    }
+
+    // Maybe at this point we want / need to do a non-blocking check for
+    // mach exceptions to ensure we don't abandon a message and leave the
+    // process to die...?
+
+    // Right now, this doesn't deal with the possibility of the task
+    // having ended for whatever reason.
+
+    if (restore_exception_handling(task, &old_exc_ports) != 0) {
+        err = ATT_UNKNOWN_STATE;
+    }
+    if ((kr = mach_port_deallocate(mach_task_self(), exception_port))) {
+        log_mach("mach_port_deallocate", kr);
+    }
+
+    for (int i = 0; i < (int)thread_count; i++) {
+        if (thrds[i].running) {
+            continue;
         }
+        if ((kr = thread_resume(thrds[i].act)) != KERN_SUCCESS) {
+            if (kr == MACH_SEND_INVALID_DEST) {
+                // thread probably ended. would be nice to know if healthily
+            } else {
+                log_mach("thread_resume", kr);
+                err = ATT_UNKNOWN_STATE;
+            }
+            continue;
+        }
+        thrds[i].running = 1;
     }
 
 restore_mask:
@@ -1471,7 +1432,8 @@ find_and_suspend_threads(
         return ATT_FAIL;
     }
 
-    if ((kr = task_threads(task, &thread_list, &thread_count)) != KERN_SUCCESS) {
+    if ((kr = task_threads(task, &thread_list, &thread_count))
+            != KERN_SUCCESS) {
         log_mach("task_threads", kr);
         return ATT_FAIL;
     }
@@ -1513,7 +1475,14 @@ find_and_suspend_threads(
         }
         thrds[i].running = 0;
     }
+
 out:
+    kr = vm_deallocate(mach_task_self(), (vm_address_t)thread_list,
+            thread_count * sizeof *thread_list);
+    if (kr != KERN_SUCCESS) {
+        log_mach("vm_deallocate", kr);
+    }
+
     if ((kr = task_resume(task)) != KERN_SUCCESS) {
         return ATT_UNKNOWN_STATE;
     }
@@ -1660,12 +1629,14 @@ execute_in_threads(
             if (thrds[i].act == t_handler_result.act) {
                 switch (t_handler_result.bp_kind) {
                 case BPK_AT_SAFE_POINT:
+                    // TODO: move this to the exc handler
                     thrds[i].hw_bp_set = 0;
                     break;
                 case BPK_AFTER_PYRUN:
                     thrds[i].attached = 0;
                     break;
                 }
+                break;
             }
         }
 

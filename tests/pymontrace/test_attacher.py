@@ -24,6 +24,14 @@ def func_body_to_script_text(func):
     return textwrap.dedent(''.join(lines_wanted))
 
 
+def wait_for_started(p: subprocess.Popen):
+    # Most of the programs in this test suite write b'started\n' to stdout
+    # as a syncronisation point.
+    assert p.stdout
+    stdout = os.read(p.stdout.fileno(), len('started\n'))  # blocks until start
+    assert stdout == b'started\n'
+
+
 # Note: we use os.write instead of print, as print seems to write the \n
 # separately
 single_threaded_program = """\
@@ -43,10 +51,7 @@ def single_threaded_subprocess():
         stdout=subprocess.PIPE,
     ) as p:
         try:
-            assert p.stdout
-            stdout = os.read(p.stdout.fileno(), len('started\n'))  # blocks until start
-            assert stdout == b'started\n'
-
+            wait_for_started(p)
             yield p
         finally:
             # This seems to be necessary on macos, to avoid hanging
@@ -99,9 +104,7 @@ def test_attach_to_multithreaded_program():
         stdout=subprocess.PIPE,
     ) as p:
         try:
-            assert p.stdout
-            stdout = os.read(p.stdout.fileno(), len('started\n'))  # blocks until start
-            assert stdout == b'started\n'
+            wait_for_started(p)
 
             attacher.attach_and_exec(p.pid, 'for _ in range(3): print("hello")')
 
@@ -119,16 +122,13 @@ def test_receiving_signal_during_attach():
     import time
     import os
     os.write(1, b'started\\n')
-    start = time.time()
-    time.sleep(1)
-    time.sleep(1)
+    time.sleep(0.1)
+    time.sleep(0.1)
     """)
 
     p0 = subprocess.Popen([sys.executable, '-u', '-c', slow_program],
                           stdout=subprocess.PIPE)
-    assert p0.stdout
-    stdout = os.read(p0.stdout.fileno(), len('started\n'))
-    assert stdout == b'started\n'
+    wait_for_started(p0)
 
     attach_program = textwrap.dedent(f"""\
     from pymontrace import attacher
@@ -137,7 +137,7 @@ def test_receiving_signal_during_attach():
     """)
     attach_proc = subprocess.Popen([sys.executable, '-u', '-c', attach_program])
 
-    time.sleep(0.3)
+    time.sleep(0.03)
 
     os.kill(attach_proc.pid, signal.SIGTERM)
 
@@ -148,6 +148,67 @@ def test_receiving_signal_during_attach():
     assert p0.wait() == 0
 
     p0.terminate()
+
+
+def test_program_ends_during_attach():
+    if sys.platform == 'linux':
+        pytest.skip('not implemented on linux yet')
+    from pymontrace import attacher
+
+    # Attach should try to happen during the sleep.
+    # Once it wakes up, the program ends
+    ending_program = textwrap.dedent("""\
+    import time
+    import os
+    os.write(1, b'started\\n')
+    time.sleep(0.1)
+    """)
+
+    p = subprocess.Popen(
+        [sys.executable, '-u', '-c', ending_program], stdout=subprocess.PIPE,
+    )
+    try:
+        wait_for_started(p)
+
+        with pytest.raises(RuntimeError) as exc:
+            attacher.attach_and_exec(p.pid, 'print("hello")')
+
+        assert str(exc.value) == 'Error occurred installing/uninstalling probes.'
+
+    finally:
+        p.terminate()
+
+
+def test_program_dies_during_attach():
+    if os.uname().sysname == 'Darwin':
+        # it works though
+        pytest.skip('abort causes annoying mac error reporting dialogue')
+    else:
+        pytest.skip('not implemented on linux yet')
+
+    from pymontrace import attacher
+
+    ending_program = textwrap.dedent("""\
+    import time
+    import os
+    os.write(1, b'started\\n')
+    time.sleep(0.1)
+    os.abort()
+    """)
+
+    p = subprocess.Popen(
+        [sys.executable, '-u', '-c', ending_program], stdout=subprocess.PIPE,
+    )
+    try:
+        wait_for_started(p)
+
+        with pytest.raises(RuntimeError) as exc:
+            attacher.attach_and_exec(p.pid, 'print("hello")')
+
+        assert str(exc.value) == 'Error occurred installing/uninstalling probes.'
+
+    finally:
+        p.terminate()
 
 
 def test_exec_in_threads():
@@ -177,6 +238,7 @@ def test_exec_in_threads():
         [sys.executable, '-u', '-c', program_text], stdout=subprocess.PIPE,
     )
     try:
+        assert p.stdout is not None  # silence pyright
         tid0 = int(p.stdout.readline().decode().strip())
         tid1 = int(p.stdout.readline().decode().strip())
         assert tid0 != 0
