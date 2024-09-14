@@ -122,8 +122,8 @@ def test_receiving_signal_during_attach():
     import time
     import os
     os.write(1, b'started\\n')
-    time.sleep(0.1)
-    time.sleep(0.1)
+    time.sleep(0.5)
+    time.sleep(0.5)
     """)
 
     p0 = subprocess.Popen([sys.executable, '-u', '-c', slow_program],
@@ -137,7 +137,7 @@ def test_receiving_signal_during_attach():
     """)
     attach_proc = subprocess.Popen([sys.executable, '-u', '-c', attach_program])
 
-    time.sleep(0.03)
+    time.sleep(0.15)
 
     os.kill(attach_proc.pid, signal.SIGTERM)
 
