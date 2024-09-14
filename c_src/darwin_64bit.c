@@ -96,7 +96,6 @@ struct handler_args {
     char* python_code;        /* code to execute */
     struct pyfn_addrs pyfn_addrs;
     page_restore_t breakpoint_restore;
-    mach_port_t exc_port;
     bool interrupted;   /* we've been interrupted. the target should be
                            restored to what it was doing.*/
 };
@@ -1256,7 +1255,6 @@ attach_and_execute(const int pid, const char* python_code)
     args.python_code = (char*)python_code;
     args.pyfn_addrs = pyfn_addrs;
     args.breakpoint_restore = page_restore;
-    args.exc_port = exception_port;
 
     /* copy the args into our thread local space */
     t_handler_args = args;
@@ -1354,8 +1352,13 @@ attach_and_execute(const int pid, const char* python_code)
             // not leaving the process about to die.
             goto out;
         } else if (nevents == 0) {
-            log_err("timed out after 30s waiting to reach safe point");
-            err = ATT_INTERRUPTED;
+            if (!page_restored) {
+                log_err("timed out after 30s waiting to reach safe point");
+                err = ATT_INTERRUPTED;
+            } else {
+                log_err("something has gone terribly wrong...");
+                err = ATT_UNKNOWN_STATE;
+            }
             goto out;
         }
 
@@ -1364,7 +1367,7 @@ attach_and_execute(const int pid, const char* python_code)
 
             // Shouldn't need MACH_RCV_INTERRUPT or a timeout in theory
             if ((kr = mach_msg_server_once(mach_exc_server,
-                            MACH_MSG_SIZE_RELIABLE, args.exc_port, 0))
+                            MACH_MSG_SIZE_RELIABLE, exception_port, 0))
                     != KERN_SUCCESS) {
                 log_mach("mach_msg_server_once", kr);
                 // ??
@@ -1449,6 +1452,77 @@ find_tid(uint64_t tid, uint64_t* tids, int count_tids)
     return -1;
 }
 
+/*
+ * thrds must have enough space for count_tids threads.
+ */
+static int
+find_and_suspend_threads(
+        task_t task,
+        struct tgt_thread* thrds, int* pfound_threads,
+        uint64_t* tids, int count_tids)
+{
+    kern_return_t kr = 0;
+    int err = 0;
+    thread_act_array_t thread_list = NULL;
+    mach_msg_type_number_t thread_count = 0;
+
+    if ((kr = task_suspend(task)) != KERN_SUCCESS) {
+        log_mach("task_suspend", kr);
+        return ATT_FAIL;
+    }
+
+    if ((kr = task_threads(task, &thread_list, &thread_count)) != KERN_SUCCESS) {
+        log_mach("task_threads", kr);
+        return ATT_FAIL;
+    }
+
+    int found_threads = 0;
+    for (int i = 0; i < (int)thread_count; i++) {
+        struct thread_identifier_info info;
+        mach_msg_type_number_t size = THREAD_IDENTIFIER_INFO_COUNT;
+        thread_act_t thread = thread_list[i];
+
+        kr = thread_info((thread_inspect_t)thread,
+                THREAD_IDENTIFIER_INFO, (thread_info_t)&info, &size);
+        if (kr != 0) {
+            log_mach("thread_info", kr);
+            err = ATT_FAIL;
+            goto out;
+        }
+
+        if (-1 == find_tid(info.thread_id, tids, count_tids)) {
+            continue;
+        }
+        __auto_type t = &thrds[found_threads++];
+        t->thread_id = info.thread_id;
+        t->act = thread;
+        t->running = 1;
+    }
+    if (found_threads != count_tids) {
+        // This could just mean that a thread died/completed between reporting
+        // and us now looking.
+        log_err("note: only %d of %d additional threads found\n",
+                found_threads, count_tids);
+    }
+
+    for (int i = 0; i < found_threads; i++) {
+        if ((kr = thread_suspend(thrds[i].act)) != KERN_SUCCESS) {
+            log_mach("thread_suspend", kr);
+            err = (i == 0) ? ATT_FAIL : ATT_UNKNOWN_STATE;
+            goto out;
+        }
+        thrds[i].running = 0;
+    }
+out:
+    if ((kr = task_resume(task)) != KERN_SUCCESS) {
+        return ATT_UNKNOWN_STATE;
+    }
+
+    *pfound_threads = found_threads;
+
+    return err;
+}
+
 int
 execute_in_threads(
         int pid, uint64_t* tids, int count_tids, const char* python_code)
@@ -1487,48 +1561,9 @@ execute_in_threads(
         log_dbg("tids[i] = %"PRIu64"\n", tids[i]);
     }
 
-    // TODO: suspend the target task while gathering the thread information
-
-    thread_act_array_t thread_list = NULL;
-    mach_msg_type_number_t thread_count = 0;
-    if ((kr = task_threads(task, &thread_list, &thread_count)) != KERN_SUCCESS) {
-        log_mach("task_threads", kr);
-    }
-
-    for (int i = 0; i < (int)thread_count; i++) {
-        struct thread_identifier_info info;
-        __auto_type size = THREAD_IDENTIFIER_INFO_COUNT;
-        __auto_type thread = thread_list[i];
-
-        kr = thread_info((thread_inspect_t)thread,
-                THREAD_IDENTIFIER_INFO, (thread_info_t)&info, &size);
-        if (kr != 0) {
-            log_mach("thread_info", kr);
-            return ATT_FAIL;
-        }
-
-        if (-1 == find_tid(info.thread_id, tids, count_tids)) {
-            continue;
-        }
-        __auto_type t = &thrds[found_threads++];
-        t->thread_id = info.thread_id;
-        t->act = thread;
-        t->running = 1;
-    }
-    if (found_threads != count_tids) {
-        // This could just mean that a thread died/completed between reporting
-        // and us now looking.
-        log_err("note: only %d of %d additional threads found\n", found_threads,
-                count_tids);
-    }
-
-    for (int i = 0; i < found_threads; i++) {
-        if ((kr = thread_suspend(thrds[i].act)) != KERN_SUCCESS) {
-            log_mach("thread_suspend", kr);
-            err = ATT_UNKNOWN_STATE;
-            goto out;
-        }
-        thrds[i].running = 0;
+    if ((err = find_and_suspend_threads(task, thrds, &found_threads,
+                    tids, count_tids) != 0)) {
+        goto out;
     }
 
     for (int i = 0; i < found_threads; i++) {
@@ -1546,7 +1581,6 @@ execute_in_threads(
         .exc_type = HANDLE_HARDWARE,
         .python_code = (char*)python_code,
         .pyfn_addrs = pyfn_addrs,
-        .exc_port = exception_port,
     };
     /* copy the args into our thread local space */
     t_handler_args = args;
@@ -1593,21 +1627,17 @@ execute_in_threads(
         }
 
         struct kevent64_s eventlist[1] = {};
-        struct timespec timeout = { .tv_sec = 30, };
-        nevents = kevent64(kq, NULL, 0, eventlist, 1, 0, &timeout);
+        nevents = kevent64(kq, NULL, 0, eventlist, 1, 0, NULL);
         if (-1 == nevents) {
             if (errno == EINTR) {
                 err = ATT_INTERRUPTED;
             } else {
+                log_err("kevent64");
                 err = ATT_FAIL;
             }
-            log_err("kevent64");
-            goto out;
-        } else if (nevents == 0) {
-                log_err("timed out after 30s waiting to reach safe point");
-            err = ATT_INTERRUPTED;
             goto out;
         }
+        assert(nevents != 0); // we didn't set a timeout for this.
 
         assert(eventlist[0].filter == EVFILT_MACHPORT);
         mach_port_t port = eventlist[0].data;
