@@ -39,14 +39,6 @@ const bool debug = false;
 
 #define PYTHON_SO_BASENAME  "Python"
 
-// this is what clang gives for __builtin_debugtrap()
-//	brk	#0xf000
-#if defined(__arm64__)
-#define DEBUG_TRAP_INSTR    ((uint32_t)0xd43e0000)
-#elif defined(__x86_64__)
-#define DEBUG_TRAP_INSTR    ((uint8_t)0xcc)
-#endif
-
 
 typedef struct {
     vm_address_t    page_addr;
