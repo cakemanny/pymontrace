@@ -506,6 +506,11 @@ wait_for_stop(pid_t pid, int signo, int* pwstatus)
                 log_err("target %d (tid=%d) killed by signal: %s (%d)\n", pid,
                         tid, strsignal(signum), signum);
             }
+            if (pid == -1) {
+                // We'll get ECHILD on the next waitpid if we run out of child
+                // processes.
+                continue;
+            }
             return -1;
         }
         if (WIFSTOPPED(*pwstatus) && WSTOPSIG(*pwstatus) != signo) {
@@ -538,6 +543,14 @@ struct tgt_thrd {
                 hw_bp_set   : 1,
                 running     : 1;
 };
+
+static inline void
+thrd_set_exited(struct tgt_thrd* t)
+{
+    t->attached = 0;
+    t->hw_bp_set = 0;
+    t->running = 0;
+}
 
 static int
 get_threads(pid_t pid, struct tgt_thrd* thrd, int *numthrds)
@@ -615,6 +628,9 @@ detach_threads(struct tgt_thrd* thrds, int count)
 {
     int err = 0;
     for (int i = 0; i < count; i++) {
+        if (!thrds[i].attached) {
+            continue;
+        }
         err = ptrace(PTRACE_DETACH, thrds[i].tid, 0, 0);
         if (err == -1) {
             log_err("ptrace detach: tid=%d", thrds[i].tid);
@@ -645,13 +661,28 @@ interrupt_threads(struct tgt_thrd* thrds, int nthreads)
     int err = 0;
     for (int i = 0; i < nthreads; i++) {
         __auto_type t = &thrds[i];
-        if (ptrace(PTRACE_INTERRUPT, t->tid, 0, 0) == -1) {
-            log_err("ptrace interrupt: tid=%d", t->tid);
-            return ATT_UNKNOWN_STATE;
+        if (!t->attached) {
+            continue; // should only be exited threads.
         }
-        // FIXME: the thread may have exited normally.
+        if (ptrace(PTRACE_INTERRUPT, t->tid, 0, 0) == -1) {
+            if (errno == ESRCH) {
+                thrd_set_exited(t);
+                continue;
+            } else {
+                log_err("ptrace interrupt: tid=%d", t->tid);
+                return ATT_UNKNOWN_STATE;
+            }
+        }
         if (wait_for_stop(t->tid, SIGTRAP, &t->wstatus) == -1) {
-            return ATT_UNKNOWN_STATE;
+            if (WIFEXITED(t->wstatus)) {
+                thrd_set_exited(t);
+                continue;
+            } else {
+                if (WIFSIGNALED(t->wstatus)) {
+                    thrd_set_exited(t);
+                }
+                return ATT_UNKNOWN_STATE;
+            }
         }
         if ((t->wstatus >> 8) != ((PTRACE_EVENT_STOP << 8) | SIGTRAP)) {
             // TODO: this might be our breakpoint and not the event-stop.
@@ -1471,7 +1502,8 @@ attach_and_execute(const int pid, const char* python_code)
     // TODO: check all threads are stopped (i.e. some have not been spawned
     // while we were stopping them.)
 
-    // TODO: consider setting a hardware breakpoint instead.
+    // TODO: here, set options to trace clones, and maybe forks. (but maybe
+    // not vforks).
 
     saved_sigaction_t saved_sigactions = {};
     install_signal_handler(&saved_sigactions);
@@ -1513,6 +1545,13 @@ attach_and_execute(const int pid, const char* python_code)
         fprintf(stderr, "Cancelling...\n");
 
         if ((err = interrupt_threads(thrds, nthreads)) != 0) {
+            goto detach;
+        }
+
+        // Check if target no longer exists. In reality this could be for
+        // both expected and unexpected reasons.
+        if (kill(pid, 0) == -1 && errno == ESRCH) {
+            err = ATT_INTERRUPTED;
             goto detach;
         }
 
@@ -1562,17 +1601,16 @@ attach_and_execute(const int pid, const char* python_code)
     // stop the running threads so that they can be detached
     for (int i = 0; i < nthreads; i++) {
         __auto_type t = &thrds[i];
-        if (t->tid != tid) {
-            assert(t->running);
-            if (ptrace(PTRACE_INTERRUPT, t->tid, 0, 0) == -1) {
-                perror("ptrace interrupt");
-                continue;
-            }
-            if (wait_for_stop(t->tid, SIGTRAP, &t->wstatus) == -1) {
-                continue;
-            }
-            t->running = 0;
+        if (!t->attached || !t->running) {
+            // thread may have exited or it's the one one we exec'd code in
+            continue;
         }
+        int err2 = interrupt_threads(t, 1);
+        if (err2 != 0) {
+            err = err2;
+            continue;
+        }
+        t->running = 0;
     }
 
 detach:
@@ -1709,7 +1747,7 @@ out:
             continue;
         }
         if (t->running) {
-            int err2 = interrupt_threads(&thrds[i], 1);
+            int err2 = interrupt_threads(t, 1);
             if (err2 != 0) {
                 err = err2;
                 continue;

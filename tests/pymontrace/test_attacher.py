@@ -151,8 +151,6 @@ def test_receiving_signal_during_attach():
 
 
 def test_program_ends_during_attach():
-    if sys.platform == 'linux':
-        pytest.skip('not implemented on linux yet')
     from pymontrace import attacher
 
     # Attach should try to happen during the sleep.
@@ -183,8 +181,6 @@ def test_program_dies_during_attach():
     if os.uname().sysname == 'Darwin':
         # it works though
         pytest.skip('abort causes annoying mac error reporting dialogue')
-    else:
-        pytest.skip('not implemented on linux yet')
 
     from pymontrace import attacher
 
