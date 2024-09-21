@@ -165,16 +165,12 @@ def test_program_ends_during_attach():
     p = subprocess.Popen(
         [sys.executable, '-u', '-c', ending_program], stdout=subprocess.PIPE,
     )
-    try:
-        wait_for_started(p)
+    wait_for_started(p)
 
-        with pytest.raises(RuntimeError) as exc:
-            attacher.attach_and_exec(p.pid, 'print("hello")')
+    with pytest.raises(RuntimeError) as exc:
+        attacher.attach_and_exec(p.pid, 'print("hello")')
 
-        assert str(exc.value) == 'Error occurred installing/uninstalling probes.'
-
-    finally:
-        p.terminate()
+    assert str(exc.value) == 'Error occurred installing/uninstalling probes.'
 
 
 def test_program_dies_during_attach():
@@ -195,16 +191,12 @@ def test_program_dies_during_attach():
     p = subprocess.Popen(
         [sys.executable, '-u', '-c', ending_program], stdout=subprocess.PIPE,
     )
-    try:
-        wait_for_started(p)
+    wait_for_started(p)
 
-        with pytest.raises(RuntimeError) as exc:
-            attacher.attach_and_exec(p.pid, 'print("hello")')
+    with pytest.raises(RuntimeError) as exc:
+        attacher.attach_and_exec(p.pid, 'print("hello")')
 
-        assert str(exc.value) == 'Error occurred installing/uninstalling probes.'
-
-    finally:
-        p.terminate()
+    assert str(exc.value) == 'Error occurred installing/uninstalling probes.'
 
 
 def test_exec_in_threads():
