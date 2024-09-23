@@ -536,6 +536,8 @@ continue_sgl_thread(pid_t tid)
     return 0;
 }
 
+enum { MAX_THRDS = 16 };
+
 struct tgt_thrd {
     pid_t       tid;
     int         wstatus;
@@ -731,6 +733,85 @@ find_thread(struct tgt_thrd* thrds, int nthreads, pid_t tid)
     return &thrds[idx];
 }
 
+/*
+ * thrds_a is a previous read of the threads in a task which already tracks
+ * which threads are attached and stopped.
+ * thrds_b is a new read of the threads that took place after the stopping
+ * and thus may contain threads that were created during the stopping of the
+ * threads in thrds_a.
+ *
+ * merge_threads merges the list of threads in b into a but retains the info
+ * about their status
+ *
+ * returns 0 if the thread lists are the same non-zero otherwise.
+ */
+static int
+merge_threads(
+        struct tgt_thrd* thrds_a, int* count_a,
+        struct tgt_thrd* thrds_b, int count_b)
+{
+    bool changed = false;
+    if (*count_a != count_b) {
+        changed = true;
+    }
+
+    for (int i = 0; i < count_b; i++) {
+        __auto_type in_a = find_thread(thrds_a, *count_a, thrds_b[i].tid);
+        if (in_a == NULL) {
+            changed = true;
+        } else {
+            thrds_b[i] = *in_a;
+        }
+    }
+    memcpy(thrds_a, thrds_b, count_b * sizeof *thrds_b);
+    *count_a = count_b;
+    return changed ? 1 : 0;
+}
+
+static int
+attach_all_threads(
+        pid_t pid,
+        struct tgt_thrd* thrds, int* pnthreads)
+{
+    int err = 0;
+    int nthreads = *pnthreads;
+
+    struct tgt_thrd cmp_thrds[MAX_THRDS] = {};
+    int cmp_nthreads = MAX_THRDS;
+
+    err = get_threads(pid, thrds, &nthreads);
+    if (err != 0) {
+        return ATT_FAIL;
+    }
+
+    int loop_count = 0;
+    do {
+        if (loop_count++ > 10) {
+            log_err("unable to stop all threads");
+            err = ATT_FAIL;
+            goto error;
+        }
+        err = attach_threads(thrds, nthreads);
+        if (err != 0) {
+            goto error;
+        }
+
+        cmp_nthreads = MAX_THRDS;
+        if ((err = get_threads(pid, cmp_thrds, &cmp_nthreads)) != 0) {
+            goto error;
+        }
+
+    } while (merge_threads(thrds, &nthreads, cmp_thrds, cmp_nthreads) != 0);
+
+    *pnthreads = nthreads;
+    return err;
+
+error:
+    if (detach_threads(thrds, nthreads) != 0) {
+        err = ATT_UNKNOWN_STATE;
+    }
+    return err;
+}
 
 /*
  * ptrace pokedata takes a machine word, i.e. 64 bits. so we create
@@ -1463,30 +1544,6 @@ attach_and_execute(const int pid, const char* python_code)
 
     // TODO: check python_code size < page size
 
-    int nthreads = 0;
-    err = get_threads(pid, NULL, &nthreads);
-    if (err != 0) {
-        return ATT_FAIL;
-    }
-    enum { MAX_THRDS = 16 };
-    if (nthreads > MAX_THRDS) {
-        log_err("target has %d threads, multiple target threads are not yet "
-                "supported\n", nthreads);
-        return ATT_FAIL;
-    }
-    if (nthreads > 1) {
-        // Specifically it doesn't work if the main thread doesn't get time
-        // and the tracing doesn't work for non-main on <3.12
-        log_err("target has %d threads, this may not work correctly\n", nthreads);
-    }
-
-    struct tgt_thrd thrds[MAX_THRDS] = {};
-    nthreads = MAX_THRDS; // number of threads can change from first check.
-    err = get_threads(pid, thrds, &nthreads);
-    if (err != 0) {
-        return ATT_FAIL;
-    }
-
     uintptr_t breakpoint_addr = find_pyfn(pid, SAFE_POINT);
     if (breakpoint_addr == 0) {
         log_err("unable to find %s\n", SAFE_POINT);
@@ -1495,18 +1552,18 @@ attach_and_execute(const int pid, const char* python_code)
     log_dbg(SAFE_POINT " = %lx", breakpoint_addr);
 
 
-    err = attach_threads(thrds, nthreads);
+    saved_sigaction_t saved_sigactions = {};
+    install_signal_handler(&saved_sigactions);
+
+    struct tgt_thrd thrds[MAX_THRDS] = {};
+    int nthreads = MAX_THRDS;
+    err = attach_all_threads(pid, thrds, &nthreads);
     if (err != 0) {
-        return err;
+        goto detach;
     }
-    // TODO: check all threads are stopped (i.e. some have not been spawned
-    // while we were stopping them.)
 
     // TODO: here, set options to trace clones, and maybe forks. (but maybe
     // not vforks).
-
-    saved_sigaction_t saved_sigactions = {};
-    install_signal_handler(&saved_sigactions);
 
     saved_instrs_t saved_instrs = { .addr = breakpoint_addr };
     if (save_instrs(pid, &saved_instrs) != 0) {
@@ -1628,7 +1685,6 @@ execute_in_threads(
 {
 #if defined(__aarch64__) || defined(__x86_64__)
     int err = 0;
-    enum { MAX_THRDS = 16 };
     struct tgt_thrd thrds[MAX_THRDS] = {};
 
     if (count_tids > MAX_THRDS) {
