@@ -1,0 +1,115 @@
+name: Build and Publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build-sdist:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - run: |
+        pipx run build --sdist
+    - name: Upload distributions
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-dists-sdist
+        path: dist/
+
+  build-amd64:
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build package
+      run: |
+        for V in 3.8 3.9 3.10 3.11 3.12 3.13; do
+          python${V} -m build --installer=uv
+        done
+    - name: Run auditwheel
+      run: |
+        auditwheel repair -w wheelhouse/ dist/*.whl
+    - name: Upload distributions
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-dists-amd64
+        path: wheelhouse/
+
+  # Hopefully we can rewrite this to not use QEMU when github make arm64
+  # runners public.
+  build-arm64:
+    runs-on: ubuntu-latest
+    env:
+      MANYLINUX_IMAGE: quay.io/pypa/manylinux_2_28_aarch64
+    steps:
+    - uses: docker/setup-qemu-action@v3
+      with:
+        platforms: arm64
+    - uses: actions/checkout@v4
+    - name: Pull manylinux image
+      run: |
+        docker pull --platform=linux/arm64/v8 $MANYLINUX_IMAGE
+    - run: |
+        docker run -d --name=manylinux -v $PWD:/src -w /src \
+          --platform=linux/arm64/v8 $MANYLINUX_IMAGE \
+          sleep 300
+    - name: Build package
+      run: |
+        docker exec -i manylinux bash <<'EOF'
+          for V in 3.8 3.9 3.10 3.11 3.12 3.13; do
+            python${V} -m build --installer=uv
+          done
+        EOF
+    - name: Run auditwheel
+      run: |
+        docker exec manylinux \
+          bash -c 'auditwheel repair -w wheelhouse/ dist/*.whl'
+    - run: docker stop manylinux -t 0
+    - name: Upload distributions
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-dists-arm64
+        path: wheelhouse/
+
+  # TODO: build for macOS ?
+
+  publish:
+    runs-on: ubuntu-latest
+    needs:
+      - build-sdist
+      - build-amd64
+      - build-arm64
+    permissions:
+      # IMPORTANT: this permission is mandatory for trusted publishing
+      id-token: write
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pymontrace
+
+    steps:
+    - name: Retrieve sdist
+      uses: actions/download-artifact@v4
+      with:
+        name: release-dists-sdist
+        path: dist/
+    - name: Retrieve amd64
+      uses: actions/download-artifact@v4
+      with:
+        name: release-dists-amd64
+        path: dist/
+    - name: Retrieve arm64
+      uses: actions/download-artifact@v4
+      with:
+        name: release-dists-arm64
+        path: dist/
+
+    - name: Publish release distributions to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
