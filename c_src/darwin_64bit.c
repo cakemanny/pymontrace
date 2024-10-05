@@ -1232,7 +1232,6 @@ attach_and_execute(const int pid, const char* python_code)
         }
 
         if (eventlist[0].filter == EVFILT_MACHPORT) {
-            assert(eventlist[0].filter == EVFILT_MACHPORT);
 
             // Shouldn't need MACH_RCV_INTERRUPT or a timeout in theory
             if ((kr = mach_msg_server_once(mach_exc_server,
@@ -1553,12 +1552,40 @@ execute_in_threads(
         err = ATT_FAIL;
         goto out;
     }
-    struct kevent64_s kev = {
-        .ident = exception_port,
-        .filter = EVFILT_MACHPORT,
-        .flags = EV_ADD,
+    struct kevent64_s kev[] = {
+        {
+            .ident = exception_port,
+            .filter = EVFILT_MACHPORT,
+            .flags = EV_ADD,
+        },
+        {
+            .ident = SIGHUP,
+            .filter = EVFILT_SIGNAL,
+            .flags = EV_ADD,
+        },
+        {
+            .ident = SIGINT,
+            .filter = EVFILT_SIGNAL,
+            .flags = EV_ADD,
+        },
+        {
+            .ident = SIGTERM,
+            .filter = EVFILT_SIGNAL,
+            .flags = EV_ADD,
+        },
+        {
+            .ident = SIGQUIT,
+            .filter = EVFILT_SIGNAL,
+            .flags = EV_ADD,
+        },
+        {
+            .ident = pid,
+            .filter = EVFILT_PROC,
+            .flags = EV_ADD,
+            .fflags = NOTE_EXIT | NOTE_EXITSTATUS,
+        },
     };
-    int nevents = kevent64(kq, &kev, 1, NULL, 0, 0, NULL);
+    int nevents = kevent64(kq, kev, NELEMS(kev), NULL, 0, 0, NULL);
     if (nevents == -1) {
         log_err("kevent64");
         err = ATT_FAIL;
@@ -1590,6 +1617,8 @@ execute_in_threads(
         struct kevent64_s eventlist[1] = {};
         nevents = kevent64(kq, NULL, 0, eventlist, 1, 0, NULL);
         if (-1 == nevents) {
+            // FIXME: this is broken as it doesn't consider whether there
+            // might be a thread between the two breakpoints.
             if (errno == EINTR) {
                 err = ATT_INTERRUPTED;
             } else {
@@ -1600,38 +1629,52 @@ execute_in_threads(
         }
         assert(nevents != 0); // we didn't set a timeout for this.
 
-        assert(eventlist[0].filter == EVFILT_MACHPORT);
-        mach_port_t port = eventlist[0].data;
+        if (eventlist[0].filter == EVFILT_MACHPORT) {
+            mach_port_t port = eventlist[0].data;
 
-        if ((kr = mach_msg_server_once(mach_exc_server,
-                        MACH_MSG_SIZE_RELIABLE, port, 0))
-                != KERN_SUCCESS) {
-            log_mach("mach_msg_server_once", kr);
-            // ??
-            err = ATT_UNKNOWN_STATE;
-            goto out;
-        }
+            if ((kr = mach_msg_server_once(mach_exc_server,
+                            MACH_MSG_SIZE_RELIABLE, port, 0))
+                    != KERN_SUCCESS) {
+                log_mach("mach_msg_server_once", kr);
+                // ??
+                err = ATT_UNKNOWN_STATE;
+                goto out;
+            }
 
-        err = t_handler_result.err;
-        if (t_handler_result.kr == KERN_FAILURE) {
-            goto out;
-        }
+            err = t_handler_result.err;
+            if (t_handler_result.kr == KERN_FAILURE) {
+                goto out;
+            }
 
-        for (int i = 0; i < found_threads; i++) {
-            if (thrds[i].act == t_handler_result.act) {
-                switch (t_handler_result.bp_kind) {
-                case BPK_AT_SAFE_POINT:
-                    // TODO: move this to the exc handler
-                    thrds[i].hw_bp_set = 0;
-                    break;
-                case BPK_AFTER_PYRUN:
-                    thrds[i].attached = 0;
+            for (int i = 0; i < found_threads; i++) {
+                if (thrds[i].act == t_handler_result.act) {
+                    switch (t_handler_result.bp_kind) {
+                        case BPK_AT_SAFE_POINT:
+                            // TODO: move this to the exc handler
+                            thrds[i].hw_bp_set = 0;
+                            break;
+                        case BPK_AFTER_PYRUN:
+                            thrds[i].attached = 0;
+                            break;
+                    }
                     break;
                 }
-                break;
             }
+        } else if (eventlist[0].filter == EVFILT_SIGNAL) {
+            err = ATT_INTERRUPTED;
+        } else if (eventlist[0].filter == EVFILT_PROC &&
+                (eventlist[0].fflags & NOTE_EXIT)) {
+            log_dbg("target exited");
+            for (int i = 0; i < found_threads; i++) {
+                thrds[i].running = 1; // more like "needs_resuming = 0"
+                thrds[i].hw_bp_set = 0;
+                thrds[i].attached = 0;
+            }
+            goto out;
+        } else {
+            log_err("unexpected kqueue filter %x\n", eventlist[0].filter);
+            abort();
         }
-
         if (err) {
             goto out;
         }

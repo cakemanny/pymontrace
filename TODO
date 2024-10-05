@@ -10,7 +10,7 @@ In priority order:
 - [x] Make darwin attach signal handling race-free
 - [x] Make linux attach code signal resistant
 - [o] Clean up C code (specific TODOs are within)
-- [ ] Handle target process + target thread ending cleanly.
+- [x] Handle target process + target thread ending cleanly.
 - [ ] Add command to list probes (maybe `sys.modules` can help)
 - [x] Use Py_AddPendingCall on Darwin too
 - [x] Add veneer around PyRun_SimpleString so that we
@@ -19,6 +19,8 @@ In priority order:
 
 - [o] multithreaded processes on linux
 
+- [ ] Linux: Handle new threads being created.
+- [ ] Linux: Handle forks during attach
 - [ ] Make attach_and_execute re-entrant.
       We could use thread local storage. On darwin, the returning of the
       error code may be hard, since it uses two threads.
