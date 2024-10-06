@@ -845,19 +845,6 @@ catch_mach_exception_raise_state_identity(
  */
 extern boolean_t mach_exc_server(mach_msg_header_t *, mach_msg_header_t *);
 
-static sigset_t
-init_signal_mask()
-{
-    sigset_t mask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGHUP);
-    sigaddset(&mask, SIGINT);
-    sigaddset(&mask, SIGTERM);
-    sigaddset(&mask, SIGQUIT);
-    sigaddset(&mask, SIGUSR1);
-    return mask;
-}
-
 struct dyld_image_info_it {
     struct dyld_all_image_infos infos;
     struct dyld_image_info info;
@@ -1041,6 +1028,32 @@ get_task(int pid, task_t* task)
 }
 
 
+static sigset_t
+init_signal_mask()
+{
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGHUP);
+    sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGTERM);
+    sigaddset(&mask, SIGQUIT);
+    return mask;
+}
+
+#define SIGNAL_KEVENT_ADD(signo)    \
+(struct kevent64_s) {               \
+    .ident = signo,                 \
+    .filter = EVFILT_SIGNAL,        \
+    .flags = EV_ADD,                \
+}
+
+#define SIGNAL_KEVENTS          \
+    SIGNAL_KEVENT_ADD(SIGHUP),  \
+    SIGNAL_KEVENT_ADD(SIGINT),  \
+    SIGNAL_KEVENT_ADD(SIGTERM), \
+    SIGNAL_KEVENT_ADD(SIGQUIT)
+
+
 int
 attach_and_execute(const int pid, const char* python_code)
 {
@@ -1156,26 +1169,7 @@ attach_and_execute(const int pid, const char* python_code)
             .filter = EVFILT_MACHPORT,
             .flags = EV_ADD,
         },
-        {
-            .ident = SIGHUP,
-            .filter = EVFILT_SIGNAL,
-            .flags = EV_ADD,
-        },
-        {
-            .ident = SIGINT,
-            .filter = EVFILT_SIGNAL,
-            .flags = EV_ADD,
-        },
-        {
-            .ident = SIGTERM,
-            .filter = EVFILT_SIGNAL,
-            .flags = EV_ADD,
-        },
-        {
-            .ident = SIGQUIT,
-            .filter = EVFILT_SIGNAL,
-            .flags = EV_ADD,
-        },
+        SIGNAL_KEVENTS,
         {
             .ident = pid,
             .filter = EVFILT_PROC,
@@ -1558,26 +1552,7 @@ execute_in_threads(
             .filter = EVFILT_MACHPORT,
             .flags = EV_ADD,
         },
-        {
-            .ident = SIGHUP,
-            .filter = EVFILT_SIGNAL,
-            .flags = EV_ADD,
-        },
-        {
-            .ident = SIGINT,
-            .filter = EVFILT_SIGNAL,
-            .flags = EV_ADD,
-        },
-        {
-            .ident = SIGTERM,
-            .filter = EVFILT_SIGNAL,
-            .flags = EV_ADD,
-        },
-        {
-            .ident = SIGQUIT,
-            .filter = EVFILT_SIGNAL,
-            .flags = EV_ADD,
-        },
+        SIGNAL_KEVENTS,
         {
             .ident = pid,
             .filter = EVFILT_PROC,
