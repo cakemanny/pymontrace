@@ -3,7 +3,7 @@ import time
 
 def f(sleeper, a, b):
     while True:
-        sleeper((a + b) / 4, a, b)
+        sleeper((a + b) / 16, a, b)
         a, b = b, a + b
         b = b % 9
 

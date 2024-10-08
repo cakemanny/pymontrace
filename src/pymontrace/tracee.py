@@ -8,16 +8,22 @@ import sys
 import textwrap
 import threading
 import traceback
-from typing import Union
+from collections import namedtuple
 from types import CodeType, FrameType
+from typing import Union, Tuple
 
 TOOL_ID = sys.monitoring.DEBUGGER_ID if sys.version_info >= (3, 12) else 0
 
 
+class InvalidProbe:
+    def __init__(self) -> None:
+        raise IndexError('Invalid probe ID')
+
+
 class LineProbe:
-    def __init__(self, path: str, lineno: int) -> None:
+    def __init__(self, path: str, lineno: str) -> None:
         self.path = path
-        self.lineno = lineno
+        self.lineno = int(lineno)
 
         self.abs = os.path.isabs(path)
 
@@ -48,6 +54,56 @@ class LineProbe:
         if self.isregex:
             return bool(self.regex.match(to_match))
         return to_match == self.path
+
+    def __eq__(self, value: object, /) -> bool:
+        # Just implemented to help with tests
+        if isinstance(value, LineProbe):
+            return value.path == self.path and value.lineno == self.lineno
+        return False
+
+
+ProbeDescriptor = namedtuple('ProbeDescriptor', ('id', 'name', 'construtor'))
+
+PROBES = {
+    0: ProbeDescriptor(0, 'invalid', InvalidProbe),
+    1: ProbeDescriptor(1, 'line', LineProbe),
+}
+PROBES_BY_NAME = {
+    descriptor.name: descriptor for descriptor in PROBES.values()
+}
+
+
+def decode_pymontrace_program(encoded: bytes):
+
+    def read_null_terminated_str(buf: bytes) -> Tuple[str, bytes]:
+        c = 0
+        while buf[c] != 0:
+            c += 1
+        return buf[:c].decode(), buf[c + 1:]
+
+    version, = struct.unpack_from('=H', encoded, offset=0)
+    if version != 1:
+        # PEF: Pymontrace Encoding Format
+        raise ValueError(f'Unexpected PEF version: {version}')
+    num_probes, = struct.unpack_from('=H', encoded, offset=2)
+
+    probe_actions = []
+    remaining = encoded[4:]
+    for _ in range(num_probes):
+        probe_id, num_args = struct.unpack_from('=BB', remaining)
+        remaining = remaining[2:]
+        args = []
+        for _ in range(num_args):
+            arg, remaining = read_null_terminated_str(remaining)
+            args.append(arg)
+        action, remaining = read_null_terminated_str(remaining)
+
+        ctor = PROBES[probe_id].construtor
+        probe_actions.append(
+            (ctor(*args), action)
+        )
+    assert len(remaining) == 0
+    return probe_actions
 
 
 class Message:
@@ -191,10 +247,15 @@ def connect(comm_file):
 
 
 # The function called inside the target to start tracing
-def settrace(user_break, user_python_snippet, is_initial=True):
+def settrace(encoded_program: bytes, is_initial=True):
     try:
+        probe_actions = decode_pymontrace_program(encoded_program)
+        # Only using first probe for now.
+        probe, user_python_snippet = probe_actions[0]
         user_python_obj = compile(user_python_snippet, '<pymontrace expr>', 'exec')
-        probe = LineProbe(user_break[0], user_break[1])
+        # Will support more probes in future.
+        assert isinstance(probe, LineProbe), \
+            f"Bad probe type: {probe.__class__.__name__}"
 
         if sys.version_info < (3, 12):
             event_handlers = create_event_handlers(

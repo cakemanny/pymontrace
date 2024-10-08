@@ -4,7 +4,7 @@ First Terminal
 
 Second terminal
 
-    pymontrace -p "$(pgrep '[Pp]ython')" 'line:*/script_to_debug.py:13' 'pmt.print("a", a, "b", b)'
+    pymontrace -p "$(pgrep '[Pp]ython')" -e 'line:*/script_to_debug.py:13 {{ pmt.print("a", a, "b", b) }}'
     Waiting for process to reach safepoint...
     Probes installed. Hit CTRL-C to end...
     a 4 b 3
@@ -24,3 +24,12 @@ WARNING:
 
   - The interface will change wildly without warning. There are no versioning
     guarantees at this point.
+
+
+CAVEATS:
+
+  - Use on macOS requires root. Use `sudo`.
+
+  - Probes will only fire if the function is entered after the probe has
+    been installed. This means that top level statements cannot be traced and
+    that the statements inside an outermost forever-loop cannot be traced.

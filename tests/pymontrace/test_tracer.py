@@ -1,37 +1,93 @@
 import os
 import ast
+import textwrap
+
+import pytest
 
 
-def test_parse_probe():
-    from pymontrace.tracer import parse_probe
+def test_parse_script():
+    from pymontrace.tracer import parse_script
 
-    assert parse_probe("line:path/to/filename.py:56") == (
-        "line",
-        "path/to/filename.py",
-        56,
+    single_probe_script = 'line:*path/to/file.py:56 {{ pmt.print("yo") }}'
+
+    probe_actions = parse_script(single_probe_script)
+
+    assert probe_actions == [
+        (('line', '*path/to/file.py', '56'), 'pmt.print("yo") ')
+    ]
+
+
+def test_parse_script__two_probes():
+    from pymontrace.tracer import parse_script
+
+    two_probe_script = """
+    line:*path/to/file.py:56
+    {{
+        pmt.print("yo")
+    }}
+
+    line:*another.py:999
+    {{
+        pmt.print(a, b, c)
+        pmt.print()
+    }}
+    """
+    two_probe_script = textwrap.dedent(two_probe_script)
+
+    assert parse_script(two_probe_script) == [
+        (('line', '*path/to/file.py', '56'), '\npmt.print("yo")\n'),
+        (('line', '*another.py', '999'), '\npmt.print(a, b, c)\npmt.print()\n'),
+    ]
+
+
+def test_validate_script():
+    from pymontrace.tracer import validate_script
+
+    script_text = 'line:path.py:1 {{ x() }}'
+    # Doesn't throw
+    validate_script(script_text)
+
+    with pytest.raises(Exception):
+        validate_script('invalid')
+
+
+def test_encode_script():
+    from pymontrace.tracer import encode_script
+
+    encoded = encode_script('line:path.py:23 {{ print(x) }}')
+
+    assert encoded == (
+        b'\x01\x00'     # Version 1
+        b'\x01\x00'     # Number of probes
+        b'\x01'         # Line probe ID: 1
+        b'\x02'         # Number of arguments
+        b'path.py\x00'  # First argument
+        b'23\x00'       # Second argument
+        b'print(x) \x00'    # Action snippet
     )
 
 
 def test_format_bootstrap_snippet():
     from pymontrace.tracer import format_bootstrap_snippet
+    from pymontrace.tracer import _encode_script
 
     formatted = format_bootstrap_snippet(
-        (
-            "line",
-            "path/to/filename.py",
-            56,
+        _encode_script(
+            [
+                (
+                    ("line", "path/to/filename.py", "56",),
+                    'print("a", a, "b", b) ',
+                )
+            ]
         ),
-        'print("a", a, "b", b)',
         "/tmp/pymontrace-654",
         "/tmp/tmp942aigv0",
     )
 
-    assert formatted.endswith(
+    assert (
         "pymontrace.tracee.connect('/tmp/pymontrace-654')\n"
-
-        "pymontrace.tracee.settrace(('path/to/filename.py', 56), "
-        "'print(\"a\", a, \"b\", b)')\n"
-    )
+    ) in formatted
+    assert "pymontrace.tracee.settrace" in formatted
 
     # This will error if we introduce a syntax error
     ast.parse(formatted)

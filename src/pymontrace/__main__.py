@@ -8,8 +8,8 @@ import sys
 import pymontrace.attacher
 from pymontrace import tracer
 from pymontrace.tracer import (
-    CommsFile, create_and_bind_socket, decode_and_print_forever,
-    format_bootstrap_snippet, format_untrace_snippet, parse_probe,
+    CommsFile, create_and_bind_socket, decode_and_print_forever, encode_script,
+    format_bootstrap_snippet, format_untrace_snippet, validate_script,
     to_remote_path
 )
 
@@ -27,12 +27,8 @@ parser.add_argument(
     help=argparse.SUPPRESS,
 )
 parser.add_argument(
-    'probe', type=parse_probe,
-    help='Example: line:script.py:13',
-)
-parser.add_argument(
-    'action',
-    help='a python expression to evaluate each time the probe site is reached',
+    '-e', dest='prog_text', type=validate_script,
+    help='Example: line:script.py:13 {{ print(a, b) }}',
 )
 
 
@@ -53,7 +49,7 @@ def receive_and_print_until_interrupted(s: socket.socket):
     print('Removing probes...', file=sys.stderr)
 
 
-def tracepid(pid: int, probe, action: str):
+def tracepid(pid: int, encoded_script: bytes):
     os.kill(pid, 0)
 
     tracer.install_signal_handler()
@@ -68,7 +64,7 @@ def tracepid(pid: int, probe, action: str):
         pymontrace.attacher.attach_and_exec(
             pid,
             format_bootstrap_snippet(
-                probe, action, comms.remotepath,
+                encoded_script, comms.remotepath,
                 to_remote_path(pid, site_extension.name),
             )
         )
@@ -85,7 +81,7 @@ def tracepid(pid: int, probe, action: str):
         )
 
 
-def subprocess_entry(progpath, probe, action):
+def subprocess_entry(progpath, encoded_script: bytes):
     import runpy
     import time
 
@@ -95,16 +91,15 @@ def subprocess_entry(progpath, probe, action):
     while not os.path.exists(comm_file):
         time.sleep(1)
     connect(comm_file)
-    settrace(probe[1:], action)
+    settrace(encoded_script)
 
     runpy.run_path(progpath, run_name='__main__')
 
 
-def tracesubprocess(progpath: str, probe, action):
+def tracesubprocess(progpath: str, prog_text):
 
-    probestr = ':'.join(map(str, probe))
     p = subprocess.Popen(
-        [sys.executable, '-m', 'pymontrace', '-X', progpath, probestr, action]
+        [sys.executable, '-m', 'pymontrace', '-X', progpath, '-e', prog_text]
     )
 
     comms = CommsFile(p.pid)
@@ -122,11 +117,11 @@ def cli_main():
     args = parser.parse_args()
 
     if args.pyprog:
-        tracesubprocess(args.pyprog, args.probe, args.action)
+        tracesubprocess(args.pyprog, args.prog_text)
     elif args.subproc:
-        subprocess_entry(args.subproc, args.probe, args.action)
+        subprocess_entry(args.subproc, encode_script(args.prog_text))
     elif args.pid:
-        tracepid(args.pid, args.probe, args.action)
+        tracepid(args.pid, encode_script(args.prog_text))
     else:
         print('one or -p or -c required', file=sys.stderr)
         parser.print_usage(file=sys.stderr)

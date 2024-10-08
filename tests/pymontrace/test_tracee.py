@@ -13,13 +13,13 @@ def empty_user_action():
 
 def test_line_probe():
 
-    assert LineProbe('/a/b/c.py', 6).matches('/a/b/c.py', 6)
-    assert not LineProbe('/a/b/c.py', 6).matches('/a/b/c.py', 7)
+    assert LineProbe('/a/b/c.py', '6').matches('/a/b/c.py', 6)
+    assert not LineProbe('/a/b/c.py', '6').matches('/a/b/c.py', 7)
 
-    assert LineProbe('*/c.py', 6).matches('/a/b/c.py', 6)
+    assert LineProbe('*/c.py', '6').matches('/a/b/c.py', 6)
 
-    assert LineProbe('/a/*/c.py', 6).matches('/a/b/c.py', 6)
-    assert not LineProbe('/a/*/c.py', 6).matches('/a/b/c.pyx', 6)
+    assert LineProbe('/a/*/c.py', '6').matches('/a/b/c.py', 6)
+    assert not LineProbe('/a/*/c.py', '6').matches('/a/b/c.pyx', 6)
 
 
 @pytest.mark.skipif("sys.version_info >= (3, 12)")
@@ -35,7 +35,7 @@ def test_handle_events():
     assert test_frame is not None
 
     lineno = inspect.getlineno(test_frame)
-    probe = LineProbe(__file__, lineno)
+    probe = LineProbe(__file__, str(lineno))
 
     handler = create_event_handlers(probe, empty_user_action(), '')
 
@@ -56,9 +56,9 @@ def test_handle_events__wrong_function():
 
     this_frame = inspect.currentframe()
     assert this_frame is not None
-    for probe in (LineProbe(__file__, 1),
-                  LineProbe(__file__, this_frame.f_lineno),
-                  LineProbe('/not/this/file.py', test_frame.f_lineno)):
+    for probe in (LineProbe(__file__, '1'),
+                  LineProbe(__file__, str(this_frame.f_lineno)),
+                  LineProbe('/not/this/file.py', str(test_frame.f_lineno))):
 
         handler = create_event_handlers(probe, empty_user_action(), '')
 
@@ -97,3 +97,23 @@ def test_pmt_encode_threads():
         b'\xa1\x1e\x00\x00\x00\x00\x00\x00'
         b'\xa3\x1e\x00\x00\x00\x00\x00\x00'
     )
+
+
+def test_decode_pymontrace_program():
+    from pymontrace.tracee import decode_pymontrace_program
+
+    encoded = (
+        b'\x01\x00'     # Version 1
+        b'\x01\x00'     # Number of probes
+        b'\x01'         # Line probe ID: 1
+        b'\x02'         # Number of arguments
+        b'path.py\x00'  # First argument
+        b'23\x00'       # Second argument
+        b'print(x) \x00'    # Action snippet
+    )
+
+    decoded = decode_pymontrace_program(encoded)
+
+    assert decoded == [
+        (LineProbe('path.py', '23'), 'print(x) '),
+    ]

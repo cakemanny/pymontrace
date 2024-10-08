@@ -1,7 +1,7 @@
-from contextlib import contextmanager
 import inspect
 import os
 import pathlib
+import re
 import shutil
 import signal
 import socket
@@ -9,19 +9,153 @@ import struct
 import sys
 import textwrap
 import threading
+from contextlib import contextmanager
 from tempfile import TemporaryDirectory
 
 from pymontrace import _darwin
 from pymontrace import attacher
+from pymontrace.tracee import PROBES_BY_NAME
 
 
-def parse_probe(probe_spec):
-    probe_name, probe_args = probe_spec.split(':', 1)
-    if probe_name == 'line':
-        filename, lineno = probe_args.split(':')
-        return (probe_name, filename, int(lineno))
-    else:
-        raise ValueError('only "line" probe supported right now')
+def parse_script(script_text: str):
+    # In here we use i for "input"
+
+    class ParseError(Exception):
+        def __init__(self, message) -> None:
+            super().__init__(message)
+            self.message = message
+
+    class ExpectError(ParseError):
+        def __init__(self, expected, got=None) -> None:
+            super().__init__(f'Expected {expected} got {got}')
+
+    def expect(s):
+        def f(i):
+            if i.startswith(s):
+                return s, i[len(s):]
+            got = i if len(i) <= len(s) else f'{i[:len(s)]}...'
+            raise ExpectError(s, got)
+        return f
+
+    def regex_parser(regex, desc):
+        def parse_regex(i: str):
+            if m := re.match(regex, i):
+                return m[0], i[len(m[0]):]
+            raise ExpectError(desc, got=i)
+        return parse_regex
+
+    def many(pred):
+        def parsemany(i):
+            c = 0
+            while i[c:] and pred(i[c]):
+                c += 1
+            return i[:c], i[c:]
+        return parsemany
+
+    def manyone(pred, desc):
+        thismany = many(pred)
+
+        def parsemanyone(i):
+            if not pred(i[:1]):
+                raise ExpectError(desc, got=i)
+            return thismany(i)
+        return parsemanyone
+
+    def whilenot(literal):
+        def parseuntil(i):
+            j = i
+            c = 0
+            while j and not j.startswith(literal):
+                j = j[1:]
+                c += 1
+            if j.startswith(literal):
+                return i[:c], i[c:]
+            raise ParseError('Ending {literal!r} not found, got {i!r}')
+        return parseuntil
+
+    whitespace = many(str.isspace)
+    nonempty_whitespace = manyone(str.isspace, 'whitespace')
+
+    parse_colon = expect(':')
+    parse_probe_name = regex_parser(r'[^:\s]+', 'probe name')
+    parse_filepath = regex_parser(r'[^:\s]+', 'file path')
+    parse_lineno = regex_parser(r'[^:\s{]+', 'line number')
+
+    def parse_probe_spec(i):
+        name, i = parse_probe_name(i)
+        valid_probe_names = ('line',)
+        if name not in valid_probe_names:
+            raise ParseError(
+                f'Unknown probe {name}. '
+                f'Valid probes are {",".join(valid_probe_names)}'
+            )
+        _, i = parse_colon(i)
+        path, i = parse_filepath(i)
+        _, i = parse_colon(i)
+        lineno, i = parse_lineno(i)
+        _ = int(lineno)  # just validate
+        return (name, path, lineno), i
+
+    parse_action_start = expect('{{')
+    parse_action_body = whilenot('}}')
+    parse_action_end = expect('}}')
+
+    def parse_probe_action(i: str):
+        _, i = parse_action_start(i)
+        inner, i = parse_action_body(i)
+        _, i = parse_action_end(i)
+        return inner, i
+
+    probe_actions = []
+
+    i = script_text
+    _, i = whitespace(i)  # eat leading space
+    while i:
+        probespec, i = parse_probe_spec(i)
+        _, i = nonempty_whitespace(i)
+        action, i = parse_probe_action(i)
+
+        # Should we check it's valid python? this may not be the target's
+        # python...
+        action = textwrap.dedent(action)
+        compile(action, '<probeaction>', 'exec')
+
+        probe_actions.append((probespec, action))
+        _, i = whitespace(i)
+    return probe_actions
+
+
+def validate_script(script_text: str) -> str:
+    """
+    Raises an exception if the script text is invalid.
+    Returns the script text if it's valid.
+    """
+    _ = parse_script(script_text)
+    return script_text
+
+
+def _encode_script(parsed_script) -> bytes:
+
+    VERSION = 1
+    result = bytearray()
+    num_probes = len(parsed_script)
+    result += struct.pack('=HH', VERSION, num_probes)
+
+    for (probe_spec, action) in parsed_script:
+        name, *args = probe_spec
+        probe_id = PROBES_BY_NAME[name].id
+        result += struct.pack('=BB', probe_id, len(args))
+        for arg in args:
+            result += arg.encode()
+            result += b'\x00'
+        result += action.encode()
+        result += b'\x00'
+    return bytes(result)
+
+
+def encode_script(script_text: str) -> bytes:
+    parsed = parse_script(script_text)
+    return _encode_script(parsed)
 
 
 def install_pymontrace(pid: int) -> TemporaryDirectory:
@@ -61,8 +195,7 @@ def to_remote_path(pid: int, path):
     return path
 
 
-def format_bootstrap_snippet(parsed_probe, action, comm_file, site_extension):
-    user_break = parsed_probe[1:]
+def format_bootstrap_snippet(encoded_script: bytes, comm_file, site_extension):
 
     import_snippet = textwrap.dedent(
         """
@@ -81,7 +214,7 @@ def format_bootstrap_snippet(parsed_probe, action, comm_file, site_extension):
     settrace_snippet = textwrap.dedent(
         f"""
         pymontrace.tracee.connect({comm_file!r})
-        pymontrace.tracee.settrace({user_break!r}, {action!r})
+        pymontrace.tracee.settrace({encoded_script!r})
         """
     )
 
