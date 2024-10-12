@@ -10,7 +10,7 @@ import threading
 import traceback
 from collections import namedtuple
 from types import CodeType, FrameType
-from typing import Union, Tuple
+from typing import Union, Tuple, List
 
 TOOL_ID = sys.monitoring.DEBUGGER_ID if sys.version_info >= (3, 12) else 0
 
@@ -185,12 +185,12 @@ def safe_eval(action: CodeType, frame: FrameType, snippet: str):
         buf = io.StringIO()
         print('Probe action failed', file=buf)
         traceback.print_exc(file=buf)
-        print(textwrap.indent(snippet, 4 * ''), file=buf)
+        print(textwrap.indent(snippet, 4 * ' '), file=buf)
         pmt.print(buf.getvalue(), end='', file=sys.stderr)
 
 
 # Handlers for 3.11 and earlier
-def create_event_handlers(probe: LineProbe, action: CodeType, snippet: str):
+def create_event_handlers(probe_actions: List[Tuple[LineProbe, CodeType, str]]):
 
     if sys.version_info < (3, 10):
         # https://github.com/python/cpython/blob/3.12/Objects/lnotab_notes.txt
@@ -212,21 +212,31 @@ def create_event_handlers(probe: LineProbe, action: CodeType, snippet: str):
                     lineno = max(lineno, this_lineno)
             return lineno - f_code.co_firstlineno
 
-    def handle_local(frame, event, arg):
-        if event != 'line' or probe.lineno != frame.f_lineno:
+    def make_local_handler(probe, action, snippet):
+        def handle_local(frame, event, _arg):
+            if event != 'line' or probe.lineno != frame.f_lineno:
+                return handle_local
+            safe_eval(action, frame, snippet)
             return handle_local
-        safe_eval(action, frame, snippet)
         return handle_local
 
+    # We allow that only one probe will match any given event
+    probes_and_handlers = [
+        (probe, make_local_handler(probe, action, snippet))
+        for (probe, action, snippet) in probe_actions
+    ]
+
     def handle_call(frame: FrameType, event, arg):
-        if probe.lineno < frame.f_lineno:
-            return None
-        f_code = frame.f_code
-        if not probe.matches_file(f_code.co_filename):
-            return None
-        if probe.lineno > f_code.co_firstlineno + num_lines(f_code):
-            return None
-        return handle_local
+        for probe, local_handler in probes_and_handlers:
+            if probe.lineno < frame.f_lineno:
+                continue
+            f_code = frame.f_code
+            if not probe.matches_file(f_code.co_filename):
+                continue
+            if probe.lineno > f_code.co_firstlineno + num_lines(f_code):
+                continue
+            return local_handler
+        return None
 
     return handle_call
 
@@ -251,16 +261,18 @@ def settrace(encoded_program: bytes, is_initial=True):
     try:
         probe_actions = decode_pymontrace_program(encoded_program)
         # Only using first probe for now.
-        probe, user_python_snippet = probe_actions[0]
-        user_python_obj = compile(user_python_snippet, '<pymontrace expr>', 'exec')
-        # Will support more probes in future.
-        assert isinstance(probe, LineProbe), \
-            f"Bad probe type: {probe.__class__.__name__}"
+        compiled = []
+        for probe, user_python_snippet in probe_actions:
+            user_python_obj = compile(
+                user_python_snippet, '<pymontrace expr>', 'exec'
+            )
+            # Will support more probes in future.
+            assert isinstance(probe, LineProbe), \
+                f"Bad probe type: {probe.__class__.__name__}"
+            compiled.append((probe, user_python_obj, user_python_snippet))
 
         if sys.version_info < (3, 12):
-            event_handlers = create_event_handlers(
-                probe, user_python_obj, user_python_snippet
-            )
+            event_handlers = create_event_handlers(compiled)
             sys.settrace(event_handlers)
             if is_initial:
                 threading.settrace(event_handlers)
@@ -275,13 +287,16 @@ def settrace(encoded_program: bytes, is_initial=True):
         else:
 
             def handle_line(code: CodeType, line_number: int):
-                if not probe.matches(code.co_filename, line_number):
-                    return sys.monitoring.DISABLE
-                if ((cur_frame := inspect.currentframe()) is None
-                        or (frame := cur_frame.f_back) is None):
-                    # TODO: warn about not being able to collect data
-                    return
-                safe_eval(user_python_obj, frame, user_python_snippet)
+                for (probe, action, snippet) in compiled:
+                    if not probe.matches(code.co_filename, line_number):
+                        continue
+                    if ((cur_frame := inspect.currentframe()) is None
+                            or (frame := cur_frame.f_back) is None):
+                        # TODO: warn about not being able to collect data
+                        continue
+                    safe_eval(action, frame, snippet)
+                    return None
+                return sys.monitoring.DISABLE
 
             sys.monitoring.use_tool_id(TOOL_ID, 'pymontrace')
             sys.monitoring.register_callback(

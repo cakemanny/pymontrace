@@ -37,7 +37,7 @@ def test_handle_events():
     lineno = inspect.getlineno(test_frame)
     probe = LineProbe(__file__, str(lineno))
 
-    handler = create_event_handlers(probe, empty_user_action(), '')
+    handler = create_event_handlers([(probe, empty_user_action(), '')])
 
     local_handler = handler(test_frame, 'call', None)
     assert local_handler is not None
@@ -60,7 +60,7 @@ def test_handle_events__wrong_function():
                   LineProbe(__file__, str(this_frame.f_lineno)),
                   LineProbe('/not/this/file.py', str(test_frame.f_lineno))):
 
-        handler = create_event_handlers(probe, empty_user_action(), '')
+        handler = create_event_handlers([(probe, empty_user_action(), '')])
 
         local_handler = handler(test_frame, 'call', None)
         assert local_handler is None
