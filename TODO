@@ -34,12 +34,12 @@ In priority order:
 
 - [ ] Firm up the language / interface.
       - [ ] Create buffer spaces to support aggregations?
-      - [ ] needs: multiple probes and per-thread/per-context storage to store
-            some amount of data.
+      - [o] multiple probes
+      - [ ] per-thread/per-context storage to store some amount of data.
 - [ ] func probes (entry, exit, exception, yield, unwind, resume, ...)
 
 - [ ] our own signal handlers, to be able to sneak out maps as the program
-      is about to end...
+      is about to end...?
 - [ ] Support FreeBSD + jails , Illumos + zones, ...
 - [ ] musl support on Linux ...
 - [ ] Rewrite the C code in Rust?

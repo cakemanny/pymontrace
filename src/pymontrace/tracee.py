@@ -112,15 +112,49 @@ class Message:
     THREADS = 3  # Additional threads the tracer must attach to
 
 
-class pmt:
-    """
-    pmt is a utility namespace of functions that may be useful for examining
-    the system and returning data to the tracer.
-    """
+class TracerRemote:
 
-    # TODO: we should either use datagrams, or lock access to
-    # this since we use it from multiple threads.
     comm_fh: Union[socket.socket, None] = None
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+
+    @property
+    def is_connected(self):
+        # Not sure the lock is actually needed here if the GIL is still about
+        with self._lock:
+            return self.comm_fh is not None
+
+    def connect(self, comm_file):
+        if self.comm_fh is not None:
+            # Maybe a previous settrace failed half-way through
+            try:
+                self.comm_fh.close()
+            except Exception:
+                pass
+        self.comm_fh = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.comm_fh.connect(comm_file)
+
+    def close(self):
+        try:
+            self.comm_fh.close()  # type: ignore  # we catch the exception
+        except Exception:
+            pass
+        self.comm_fh = None
+
+    def sendall(self, data):
+        # Probes may be installed in multiple threads. We lock to avoid
+        # mixing messages from different threads onto the socket.
+        with self._lock:
+            if self.comm_fh is not None:
+                try:
+                    return self.comm_fh.sendall(data)
+                except BrokenPipeError:
+                    self._force_close()
+
+    def _force_close(self):
+        unsettrace()
+        self.close()
 
     @staticmethod
     def _encode_print(*args, **kwargs):
@@ -136,43 +170,35 @@ class pmt:
         return struct.pack('=HH', message_type, len(to_write)) + to_write
 
     @staticmethod
-    def print(*args, **kwargs):
-        if pmt.comm_fh is not None:
-            try:
-                to_write = pmt._encode_print(*args, **kwargs)
-                pmt.comm_fh.sendall(to_write)
-            except BrokenPipeError:
-                pmt._force_close()
-
-    @staticmethod
-    def _force_close():
-        unsettrace()
-        if pmt.comm_fh is not None:
-            try:
-                pmt.comm_fh.close()
-            except Exception:
-                pass
-            pmt.comm_fh = None
-
-    @staticmethod
     def _encode_threads(tids):
         count = len(tids)
         fmt = '=HH' + (count * 'Q')
         body_size = struct.calcsize((count * 'Q'))
         return struct.pack(fmt, Message.THREADS, body_size, *tids)
 
-    @staticmethod
-    def _notify_threads(tids):
+    def notify_threads(self, tids):
         """
         Notify the tracer about additional threads that may need a
         settrace call.
         """
-        if pmt.comm_fh is not None:
-            try:
-                to_write = pmt._encode_threads(tids)
-                pmt.comm_fh.sendall(to_write)
-            except BrokenPipeError:
-                pmt._force_close()
+        to_write = self._encode_threads(tids)
+        self.sendall(to_write)
+
+
+remote = TracerRemote()
+
+
+class pmt:
+    """
+    pmt is a utility namespace of functions that may be useful for examining
+    the system and returning data to the tracer.
+    """
+
+    @staticmethod
+    def print(*args, **kwargs):
+        if remote.is_connected:
+            to_write = remote._encode_print(*args, **kwargs)
+            remote.sendall(to_write)
 
 
 def safe_eval(action: CodeType, frame: FrameType, snippet: str):
@@ -244,16 +270,9 @@ def create_event_handlers(probe_actions: List[Tuple[LineProbe, CodeType, str]]):
 def connect(comm_file):
     """
     Connect back to the tracer.
-    Called by the tracer when attaching to the target.
+    Tracer invokes this in the target when attaching to it.
     """
-    if pmt.comm_fh is not None:
-        # Maybe a previous settrace failed half-way through
-        try:
-            pmt.comm_fh.close()
-        except Exception:
-            pass
-    pmt.comm_fh = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    pmt.comm_fh.connect(comm_file)
+    remote.connect(comm_file)
 
 
 # The function called inside the target to start tracing
@@ -283,7 +302,7 @@ def settrace(encoded_program: bytes, is_initial=True):
                         and thread.native_id is not None)
                 ]
                 if additional_tids:
-                    pmt._notify_threads(additional_tids)
+                    remote.notify_threads(additional_tids)
         else:
 
             def handle_line(code: CodeType, line_number: int):
@@ -311,11 +330,7 @@ def settrace(encoded_program: bytes, is_initial=True):
             pmt.print(buf.getvalue(), end='', file=sys.stderr)
         except Exception:
             print(f'{__name__}.settrace failed:', repr(e), file=sys.stderr)
-        try:
-            pmt.comm_fh.close()  # type: ignore  # we catch the exception
-            pmt.comm_fh = None
-        except Exception:
-            pass
+        remote.close()
 
 
 def synctrace():
@@ -324,7 +339,7 @@ def synctrace():
     """
     # sys.settrace must be called in each thread that wants tracing
     if sys.version_info < (3, 10):
-        sys.settrace(threading._trace_hook)
+        sys.settrace(threading._trace_hook)  # type: ignore  # we're adults
     elif sys.version_info < (3, 12):
         sys.settrace(threading.gettrace())
     else:
@@ -346,9 +361,7 @@ def unsettrace():
             )
             sys.monitoring.free_tool_id(TOOL_ID)
 
-        if pmt.comm_fh is not None:
-            pmt.comm_fh.close()
-            pmt.comm_fh = None
+        remote.close()
     except Exception:
         print(f'{__name__}.unsettrace failed', file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
