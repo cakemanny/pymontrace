@@ -67,6 +67,15 @@ jobs:
         else
           pytest
         fi
+    - name: Run Integration tests
+      run: |
+        source .venv/bin/activate
+        ulimit -c unlimited
+        if [[ $(uname) == "Darwin" ]]; then
+          sudo pytest integration_tests
+        else
+          pytest integration_tests
+        fi
     - name: Check for core files
       if: always()
       run: |
