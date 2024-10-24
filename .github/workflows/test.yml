@@ -18,8 +18,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.11", "3.13"]
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
         runner: ["macos-13", "macos-latest", "ubuntu-latest"]
+        include:
+          # pymontrace doesn' work on macOS with the python3.13 that brew
+          # installs. (nor is 3.13 on macos-13 as at writing).
+          - python-version: "3.13"
+            runner: "ubuntu-latest"
 
     runs-on: ${{ matrix.runner }}
 
