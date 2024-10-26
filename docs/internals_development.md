@@ -22,5 +22,24 @@ sudo dtrace -n pid$(pgrep Python):Python:Py\*:entry'{ trace(probefunc); }'
 ...
 ```
 
-TODO: add bpftrace example for Linux
+On Linux this does roughly the same thing:
 
+```sh
+sudo bpftrace -p $(pgrep python3) -e 'u:/usr/bin/python3:PyEval*{print(func)}'
+```
+
+```
+Attaching 24 probes...
+PyEval_RestoreThread
+PyEval_SaveThread
+PyEval_RestoreThread
+PyEval_SaveThread
+PyEval_RestoreThread
+...
+```
+
+Specifying `u:/usr/bin/python3:Py*` would be better tends to exceed what
+bpftrace is capable of.
+
+Note: The `$(pgrep python3)` is not actually needed but I leave it in the
+example to remind that it's possible to target a specific python process.
