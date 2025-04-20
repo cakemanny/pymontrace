@@ -48,7 +48,7 @@ to the `pmt` module
 
 === `pmt` standard functions
 
-[cols="1,1"]
+[cols="1,3"]
 |===
 | `print(arg1, arg2, ...)`
 | Works just like the python `print` builtin, except that it sends the
@@ -65,7 +65,10 @@ NOTE: not yet implemented
 Aggregation functions are special and must be assigned to
 pymontrace variables or into map entries.
 
+[cols="1,3"]
 |===
+| Function | Description
+
 | `count()`
 | Counts the number of times it is hit
 
@@ -84,7 +87,10 @@ pymontrace variables or into map entries.
 
 NOTE: not yet implemented
 
+[cols="1,5"]
 |===
+| Property | Description
+
 | `vars`
 | `vars` is a namespace for holding user variables. This can be used to
 store values between probe executions.
@@ -99,6 +105,7 @@ combined with aggregations.
 
 == Probes
 
+[cols="1,3"]
 |===
 | Probe Name | Description
 
@@ -107,7 +114,7 @@ combined with aggregations.
 `END` is executed if tracing ends normally and before the program itself
 terminates.
 
-| `line:_filepath_:_line number_`
+| `line:__filepath__:__line number__`
 | Executes its action just before the matched line executes.
 It corresponds to https://docs.python.org/3/library/sys.monitoring.html#monitoring-event-LINE[sys.monitoring.events.LINE]
 when tracing Python 3.12 and later.
