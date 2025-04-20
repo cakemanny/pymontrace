@@ -8,9 +8,9 @@ import sys
 import pymontrace.attacher
 from pymontrace import tracer
 from pymontrace.tracer import (
-    CommsFile, create_and_bind_socket, decode_and_print_forever, encode_script,
-    format_bootstrap_snippet, format_untrace_snippet, validate_script,
-    to_remote_path
+    CommsFile, create_and_bind_socket, decode_and_print_forever,
+    decode_and_print_remaining, encode_script, format_bootstrap_snippet,
+    format_untrace_snippet, validate_script, to_remote_path
 )
 
 parser = argparse.ArgumentParser(prog='pymontrace')
@@ -79,6 +79,7 @@ def tracepid(pid: int, encoded_script: bytes):
             pid,
             format_untrace_snippet()
         )
+        decode_and_print_remaining(s)
 
 
 def subprocess_entry(progpath, encoded_script: bytes):
@@ -111,6 +112,8 @@ def tracesubprocess(progpath: str, prog_text):
 
         receive_and_print_until_interrupted(s)
         p.terminate()
+        # BUG: there's not a nice way to print and messages sent by
+        # pymontrace::END
 
 
 def cli_main():

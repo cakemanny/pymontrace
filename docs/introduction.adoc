@@ -1,0 +1,145 @@
+= Pymontrace
+:toc:
+
+// TODO: have a quickstart
+
+// TODO: have some nice one-liners
+
+
+== The pymontrace language
+
+The pymontrace language is heavily inspired the D language of Dtrace.
+
+In general it follows the form
+
+....
+program ::= ( probe-spec probe-action )*
+
+probe-spec = probe-name ":" probe-arg1 ":" probe-arg2
+
+probe-action = "{{" python-program-text "}}"
+
+probe-name = "line" | ...
+....
+
+
+.Example pymontrace program
+----
+line:*/some-file.py:123 {{
+    pmt.print("a =", a)
+    if b is not None:
+        pmt.vars.b = pmt.count()  # how the fuck will this work?
+}}
+
+pymontrace::END {{
+    pmt.print("b =", pmt.vars.b)
+}}
+----
+
+
+The python blocks are run in the context of the probe site.
+They have access to all the local variables
+
+
+== Special variables
+
+The executing python actions, in addition to the traced program, have access
+to the `pmt` module
+
+=== `pmt` standard functions
+
+[cols="1,1"]
+|===
+| `print(arg1, arg2, ...)`
+| Works just like the python `print` builtin, except that it sends the
+output back to the tracer.
+
+// TODO: have some kind of pmt.exit() function
+|===
+
+
+=== `pmt` aggregation functions
+
+NOTE: not yet implemented
+
+Aggregation functions are special and must be assigned to
+pymontrace variables or into map entries.
+
+|===
+| `count()`
+| Counts the number of times it is hit
+
+| `sum(arg)`
+| Adds `arg` to the sum.
+
+| `max(arg)`
+| Computes the maximum over supplied arguments.
+
+| `min(arg)`
+| Computes the minimum over supplied arguments.
+
+|===
+
+=== `pmt` properties
+
+NOTE: not yet implemented
+
+|===
+| `vars`
+| `vars` is a namespace for holding user variables. This can be used to
+store values between probe executions.
+
+| `maps`
+| `maps` is a namespace for holding user maps (dictionaries). Any non-empty
+maps will printed out at the end of tracing. They are most useful when
+combined with aggregations.
+
+|===
+
+
+== Probes
+
+|===
+| Probe Name | Description
+
+| `pymontrace::BEGIN`, `pymontrace::END`
+| `BEGIN` is executed after pymontrace successfully connects to a target.
+`END` is executed if tracing ends normally and before the program itself
+terminates.
+
+| `line:_filepath_:_line number_`
+| Executes its action just before the matched line executes.
+It corresponds to https://docs.python.org/3/library/sys.monitoring.html#monitoring-event-LINE[sys.monitoring.events.LINE]
+when tracing Python 3.12 and later.
+It corresponds to the https://docs.python.org/3/library/sys.html#sys.settrace[`'line'` trace event]
+when tracing Python 3.11 and earlier.
+
+|===
+
+
+// Maybe we should have non-table sections like they do in the bpftrace docs
+
+=== `pymontrace::BEGIN`
+
+`BEGIN` can be useful to set up initial values of variables.
+
+Since it runs in the context of the traced target, it can also be used
+to do simple state checks.
+
+Another use for `BEGIN` is to import modules and define helper functions.
+Since importing in python can be very expensive you'll want to avoid that
+in a tight loop.
+A way around that would be to import and assign to a variable on `pmt.vars`.
+
+.Example showing import in `BEGIN`
+----
+pymontrace::BEGIN {{
+    import base64
+    pmt.vars.b64decode = base64.b64decode
+}}
+
+line:*/target.py:123 {{
+    pmt.print(pmt.vars.b64decode(some_base64_encoded_value))
+}}
+----
+

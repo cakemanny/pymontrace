@@ -9,10 +9,15 @@ import textwrap
 import threading
 import traceback
 from collections import namedtuple
-from types import CodeType, FrameType
-from typing import Union, Tuple, List
+from types import CodeType, FrameType, SimpleNamespace
+from typing import Literal, NoReturn, Union, Tuple, List
 
 TOOL_ID = sys.monitoring.DEBUGGER_ID if sys.version_info >= (3, 12) else 0
+
+
+# Replace with typing.assert_never after 3.11
+def assert_never(arg: NoReturn) -> NoReturn:
+    raise AssertionError(f"assert_never: got {arg!r}")
 
 
 class InvalidProbe:
@@ -62,15 +67,23 @@ class LineProbe:
         return False
 
 
+class PymontraceProbe:
+    def __init__(self, _: str, hook: Union[Literal["BEGIN"], Literal["END"]]) -> None:
+        self.is_begin = hook == 'BEGIN'
+        self.is_end = hook == 'END'
+
+
 ProbeDescriptor = namedtuple('ProbeDescriptor', ('id', 'name', 'construtor'))
 
 PROBES = {
     0: ProbeDescriptor(0, 'invalid', InvalidProbe),
     1: ProbeDescriptor(1, 'line', LineProbe),
+    2: ProbeDescriptor(2, 'pymontrace', PymontraceProbe)
 }
 PROBES_BY_NAME = {
     descriptor.name: descriptor for descriptor in PROBES.values()
 }
+ValidProbe = Union[LineProbe, PymontraceProbe]
 
 
 def decode_pymontrace_program(encoded: bytes):
@@ -87,7 +100,7 @@ def decode_pymontrace_program(encoded: bytes):
         raise ValueError(f'Unexpected PEF version: {version}')
     num_probes, = struct.unpack_from('=H', encoded, offset=2)
 
-    probe_actions = []
+    probe_actions: list[tuple[ValidProbe, str]] = []
     remaining = encoded[4:]
     for _ in range(num_probes):
         probe_id, num_args = struct.unpack_from('=BB', remaining)
@@ -200,6 +213,15 @@ class pmt:
             to_write = remote._encode_print(*args, **kwargs)
             remote.sendall(to_write)
 
+    vars = SimpleNamespace()
+
+    _end_actions: list[tuple[PymontraceProbe, CodeType, str]] = []
+
+    @staticmethod
+    def _reset():
+        pmt._end_actions = []
+        pmt.vars = SimpleNamespace()
+
 
 def safe_eval(action: CodeType, frame: FrameType, snippet: str):
     try:
@@ -208,11 +230,22 @@ def safe_eval(action: CodeType, frame: FrameType, snippet: str):
             'pmt': pmt,
         })
     except Exception:
-        buf = io.StringIO()
-        print('Probe action failed', file=buf)
-        traceback.print_exc(file=buf)
-        print(textwrap.indent(snippet, 4 * ' '), file=buf)
-        pmt.print(buf.getvalue(), end='', file=sys.stderr)
+        _handle_eval_error(snippet)
+
+
+def safe_eval_no_frame(action: CodeType, snippet: str):
+    try:
+        eval(action, None, {'pmt': pmt})
+    except Exception:
+        _handle_eval_error(snippet)
+
+
+def _handle_eval_error(snippet: str) -> None:
+    buf = io.StringIO()
+    print('Probe action failed', file=buf)
+    traceback.print_exc(file=buf)
+    print(textwrap.indent(snippet, 4 * ' '), file=buf)
+    pmt.print(buf.getvalue(), end='', file=sys.stderr)
 
 
 # Handlers for 3.11 and earlier
@@ -279,19 +312,24 @@ def connect(comm_file):
 def settrace(encoded_program: bytes, is_initial=True):
     try:
         probe_actions = decode_pymontrace_program(encoded_program)
-        # Only using first probe for now.
-        compiled = []
+        line_probes: list[tuple[LineProbe, CodeType, str]] = []
+        pmt_probes: list[tuple[PymontraceProbe, CodeType, str]] = []
         for probe, user_python_snippet in probe_actions:
             user_python_obj = compile(
                 user_python_snippet, '<pymontrace expr>', 'exec'
             )
             # Will support more probes in future.
-            assert isinstance(probe, LineProbe), \
+            assert isinstance(probe, (LineProbe, PymontraceProbe)), \
                 f"Bad probe type: {probe.__class__.__name__}"
-            compiled.append((probe, user_python_obj, user_python_snippet))
+            if isinstance(probe, LineProbe):
+                line_probes.append((probe, user_python_obj, user_python_snippet))
+            elif isinstance(probe, PymontraceProbe):
+                pmt_probes.append((probe, user_python_obj, user_python_snippet))
+            else:
+                assert_never(probe)
 
         if sys.version_info < (3, 12):
-            event_handlers = create_event_handlers(compiled)
+            event_handlers = create_event_handlers(line_probes)
             sys.settrace(event_handlers)
             if is_initial:
                 threading.settrace(event_handlers)
@@ -306,7 +344,7 @@ def settrace(encoded_program: bytes, is_initial=True):
         else:
 
             def handle_line(code: CodeType, line_number: int):
-                for (probe, action, snippet) in compiled:
+                for (probe, action, snippet) in line_probes:
                     if not probe.matches(code.co_filename, line_number):
                         continue
                     if ((cur_frame := inspect.currentframe()) is None
@@ -322,6 +360,15 @@ def settrace(encoded_program: bytes, is_initial=True):
                 TOOL_ID, sys.monitoring.events.LINE, handle_line
             )
             sys.monitoring.set_events(TOOL_ID, sys.monitoring.events.LINE)
+
+        pmt._end_actions = [
+            (probe, action, snippet)
+            for (probe, action, snippet) in pmt_probes
+            if probe.is_end
+        ]
+        for (probe, action, snippet) in pmt_probes:
+            if probe.is_begin:
+                safe_eval_no_frame(action, snippet)
     except Exception as e:
         try:
             buf = io.StringIO()
@@ -361,6 +408,10 @@ def unsettrace():
             )
             sys.monitoring.free_tool_id(TOOL_ID)
 
+        for (probe, action, snippet) in pmt._end_actions:
+            assert probe.is_end
+            safe_eval_no_frame(action, snippet)
+        pmt._reset()
         remote.close()
     except Exception:
         print(f'{__name__}.unsettrace failed', file=sys.stderr)

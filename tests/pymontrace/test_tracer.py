@@ -40,6 +40,22 @@ def test_parse_script__two_probes():
     ]
 
 
+def test_parse_script__begin_and_end():
+    from pymontrace.tracer import parse_script
+
+    script = 'pymontrace::BEGIN {{ "junk" }}'
+
+    probe_actions = parse_script(script)
+
+    assert probe_actions == [
+        (('pymontrace', '', 'BEGIN'), '"junk" ')
+    ]
+
+    with pytest.raises(Exception) as exc:
+        parse_script('pymontrace::UNREAL {{"junk"}}')
+
+    assert 'UNREAL' in str(exc.value)
+
 def test_validate_script():
     from pymontrace.tracer import validate_script
 

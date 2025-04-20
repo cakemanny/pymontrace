@@ -11,10 +11,16 @@ import textwrap
 import threading
 from contextlib import contextmanager
 from tempfile import TemporaryDirectory
+from typing import NoReturn
 
 from pymontrace import _darwin
 from pymontrace import attacher
 from pymontrace.tracee import PROBES_BY_NAME
+
+
+# Replace with typing.assert_never after 3.11
+def assert_never(arg: NoReturn) -> NoReturn:
+    raise AssertionError(f"assert_never: got {arg!r}")
 
 
 def parse_script(script_text: str):
@@ -37,11 +43,14 @@ def parse_script(script_text: str):
             raise ExpectError(s, got)
         return f
 
-    def regex_parser(regex, desc):
-        def parse_regex(i: str):
+    def regex_parser(regex, desc=None):
+        outer_desc = desc
+
+        def parse_regex(i: str, desc=None):
             if m := re.match(regex, i):
                 return m[0], i[len(m[0]):]
-            raise ExpectError(desc, got=i)
+            assert desc is not None or outer_desc is not None, "regex_parser no desc"
+            raise ExpectError(desc or outer_desc, got=i)
         return parse_regex
 
     def many(pred):
@@ -78,23 +87,36 @@ def parse_script(script_text: str):
 
     parse_colon = expect(':')
     parse_probe_name = regex_parser(r'[^:\s]+', 'probe name')
-    parse_filepath = regex_parser(r'[^:\s]+', 'file path')
-    parse_lineno = regex_parser(r'[^:\s{]+', 'line number')
+    parse_arg1 = regex_parser(r'[^:\s]*')
+    parse_arg2 = regex_parser(r'[^:\s{]+')
 
     def parse_probe_spec(i):
         name, i = parse_probe_name(i)
-        valid_probe_names = ('line',)
+        valid_probe_names = ('line', 'pymontrace')
         if name not in valid_probe_names:
             raise ParseError(
                 f'Unknown probe {name}. '
                 f'Valid probes are {",".join(valid_probe_names)}'
             )
+        arg1_desc = {'line': 'file path', 'pymontrace': 'nothing'}[name]
+        arg2_desc = {'line': 'line number', 'pymontrace': 'BEGIN or END'}[name]
+
         _, i = parse_colon(i)
-        path, i = parse_filepath(i)
+        arg1, i = parse_arg1(i, arg1_desc)
         _, i = parse_colon(i)
-        lineno, i = parse_lineno(i)
-        _ = int(lineno)  # just validate
-        return (name, path, lineno), i
+        arg2, i = parse_arg2(i, arg2_desc)
+        if name == 'line':
+            _ = int(arg2)  # just validate
+        elif name == 'pymontrace':
+            if arg2 not in ('BEGIN', 'END'):
+                raise ParseError(
+                    f'Invalid probe point for pymontrace: {arg2}. '
+                    'Valid pymontrace probe specs are: '
+                    'pymontrace::BEGIN, pymontrace::END'
+                )
+        else:
+            assert_never(name)
+        return (name, arg1, arg2), i
 
     parse_action_start = expect('{{')
     parse_action_body = whilenot('}}')
@@ -106,7 +128,7 @@ def parse_script(script_text: str):
         _, i = parse_action_end(i)
         return inner, i
 
-    probe_actions = []
+    probe_actions: list[tuple[tuple[str, str, str], str]] = []
 
     i = script_text
     _, i = whitespace(i)  # eat leading space
@@ -342,7 +364,7 @@ def install_signal_handler():
         signal.signal(signo, signal_handler)
 
 
-def decode_and_print_forever(s: socket.socket):
+def decode_and_print_forever(s: socket.socket, only_print=False):
     from pymontrace.tracee import Message
 
     t = None
@@ -358,6 +380,8 @@ def decode_and_print_forever(s: socket.socket):
                 line = body
                 out = (sys.stderr if kind == Message.ERROR else sys.stdout)
                 out.write(line.decode())
+            elif kind == Message.THREADS and only_print:
+                print(f'ignoring {kind=} during shutdown', file=sys.stderr)
             elif kind == Message.THREADS:
                 count_threads = size // struct.calcsize('=Q')
                 thread_ids = struct.unpack('=' + (count_threads * 'Q'), body)
@@ -376,3 +400,8 @@ def decode_and_print_forever(s: socket.socket):
             except ProcessLookupError:
                 pass  # It may have finished.
             t.join()
+
+
+def decode_and_print_remaining(s: socket.socket):
+    # This should not block as the client should have disconnected
+    decode_and_print_forever(s, only_print=True)
