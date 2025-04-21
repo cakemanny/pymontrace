@@ -68,9 +68,84 @@ class LineProbe:
 
 
 class PymontraceProbe:
-    def __init__(self, _: str, hook: Union[Literal["BEGIN"], Literal["END"]]) -> None:
+    def __init__(self, _: str, hook: Literal['BEGIN', 'END']) -> None:
         self.is_begin = hook == 'BEGIN'
         self.is_end = hook == 'END'
+
+
+_FUNC_PROBE_EVENT = Literal['start', 'yield', 'resume', 'return', 'unwind']
+
+
+class FuncProbe:
+
+    # Grouped by the shape of the sys.monitoring callback
+    entry_sites = ('start', 'resume')
+    return_sites = ('yield', 'return')
+    unwind_sites = ('unwind')
+
+    def __init__(self, qpath: str, site: _FUNC_PROBE_EVENT) -> None:
+        for c in qpath:
+            if not (c.isalnum() or c in '*._'):
+                raise ValueError('invalid qpath glob: {qpath!r}')
+        self.qpath = qpath
+        self.site = site
+
+        star_count = sum(map(lambda c: c == '*', qpath))
+        dot_count = sum(map(lambda c: c == '.', qpath))
+
+        self.name = ""
+        # Example: *.foo
+        self.is_name_match = False
+        if qpath.startswith('*.') and star_count == 1 and dot_count == 1:
+            self.is_name_match = True
+            self.name = qpath[2:]
+
+        # Example: *.bar.foo
+        self.is_suffix_path = False
+        self.suff_module: list[str] = []
+        if qpath.startswith('*.') and star_count == 1 and dot_count > 1:
+            self.is_suffix_path = True
+            *self.suff_module, self.name = qpath[2:].split('.')
+
+        self.isregex = False
+        if star_count > 0 and not self.is_name_match and not self.is_suffix_path:
+            self.isregex = True
+            self.regex = re.compile(
+                '^' + qpath.replace('.', '\\.').replace('*', '.*') + '$'
+            )
+
+    @staticmethod
+    def _faux_mod_path(file_path: str) -> list[str]:
+        assert file_path.endswith(".py"), f"not endswith .py: {file_path!r}"
+        parts = file_path.split('/')
+        if parts[0] == '':
+            parts = parts[1:]
+        if parts[-1] == '__init__.py':
+            return parts[:-1]
+        # foo.py -> foo
+        parts[-1] = parts[-1][:-3]
+        return parts
+
+    def matches(self, co_name: str, co_filename: str) -> bool:
+        if self.is_name_match:
+            return co_name == self.name
+
+        # TODO: do something with '<module>' style filenames
+
+        if self.is_suffix_path:
+            if co_name != self.name:
+                return False
+            mod_path = self._faux_mod_path(co_filename)
+            return self.suff_module == mod_path[-len(self.suff_module):]
+
+        # TODO: this could make relpaths from sys.path
+        mod_path = self._faux_mod_path(co_filename)
+        faux_func_path = '.'.join(mod_path + [co_name])
+
+        if self.isregex:
+            return bool(self.regex.match(faux_func_path))
+
+        return False
 
 
 ProbeDescriptor = namedtuple('ProbeDescriptor', ('id', 'name', 'construtor'))
@@ -78,12 +153,13 @@ ProbeDescriptor = namedtuple('ProbeDescriptor', ('id', 'name', 'construtor'))
 PROBES = {
     0: ProbeDescriptor(0, 'invalid', InvalidProbe),
     1: ProbeDescriptor(1, 'line', LineProbe),
-    2: ProbeDescriptor(2, 'pymontrace', PymontraceProbe)
+    2: ProbeDescriptor(2, 'pymontrace', PymontraceProbe),
+    3: ProbeDescriptor(3, 'func', FuncProbe),
 }
 PROBES_BY_NAME = {
     descriptor.name: descriptor for descriptor in PROBES.values()
 }
-ValidProbe = Union[LineProbe, PymontraceProbe]
+ValidProbe = Union[LineProbe, PymontraceProbe, FuncProbe]
 
 
 def decode_pymontrace_program(encoded: bytes):
@@ -308,27 +384,52 @@ def connect(comm_file):
     remote.connect(comm_file)
 
 
+if sys.version_info >= (3, 12):
+
+    # We enumerate the ones we use so that it's easier to
+    # unregister callbacks for them
+    class events:
+        LINE = sys.monitoring.events.LINE
+        PY_START = sys.monitoring.events.PY_START
+        PY_RESUME = sys.monitoring.events.PY_RESUME
+        PY_YIELD = sys.monitoring.events.PY_YIELD
+        PY_RETURN = sys.monitoring.events.PY_RETURN
+        PY_UNWIND = sys.monitoring.events.PY_UNWIND
+
+        @classmethod
+        def all(cls):
+            for k, v in cls.__dict__.items():
+                if not k.startswith("_") and isinstance(v, int):
+                    yield v
+
+
 # The function called inside the target to start tracing
 def settrace(encoded_program: bytes, is_initial=True):
     try:
         probe_actions = decode_pymontrace_program(encoded_program)
-        line_probes: list[tuple[LineProbe, CodeType, str]] = []
+
         pmt_probes: list[tuple[PymontraceProbe, CodeType, str]] = []
+        line_probes: list[tuple[LineProbe, CodeType, str]] = []
+        func_probes: list[tuple[FuncProbe, CodeType, str]] = []
+
         for probe, user_python_snippet in probe_actions:
             user_python_obj = compile(
                 user_python_snippet, '<pymontrace expr>', 'exec'
             )
             # Will support more probes in future.
-            assert isinstance(probe, (LineProbe, PymontraceProbe)), \
+            assert isinstance(probe, (LineProbe, PymontraceProbe, FuncProbe)), \
                 f"Bad probe type: {probe.__class__.__name__}"
             if isinstance(probe, LineProbe):
                 line_probes.append((probe, user_python_obj, user_python_snippet))
             elif isinstance(probe, PymontraceProbe):
                 pmt_probes.append((probe, user_python_obj, user_python_snippet))
+            elif isinstance(probe, FuncProbe):
+                func_probes.append((probe, user_python_obj, user_python_snippet))
             else:
                 assert_never(probe)
 
         if sys.version_info < (3, 12):
+            # TODO: handle func probes
             event_handlers = create_event_handlers(line_probes)
             sys.settrace(event_handlers)
             if is_initial:
@@ -355,11 +456,47 @@ def settrace(encoded_program: bytes, is_initial=True):
                     return None
                 return sys.monitoring.DISABLE
 
+            start_probes = [p for p in func_probes if p[0].site == 'start']
+            resume_probes = [p for p in func_probes if p[0].site == 'resume']
+            yield_probes = [p for p in func_probes if p[0].site == 'yield']
+            return_probes = [p for p in func_probes if p[0].site == 'return']
+            unwind_probes = [p for p in func_probes if p[0].site == 'unwind']
+
+            # For any func probe except unwind
+            def handle_(probes, nodisable=False):
+                def handle(code: CodeType, arg1, arg2=None):
+                    for (probe, action, snippet) in probes:
+                        if not probe.matches(code.co_name, code.co_filename):
+                            continue
+                        if ((cur_frame := inspect.currentframe()) is None
+                                or (frame := cur_frame.f_back) is None):
+                            continue
+                        safe_eval(action, frame, snippet)
+                        return None
+                    if nodisable:
+                        return None
+                    return sys.monitoring.DISABLE
+                return handle
+
             sys.monitoring.use_tool_id(TOOL_ID, 'pymontrace')
-            sys.monitoring.register_callback(
-                TOOL_ID, sys.monitoring.events.LINE, handle_line
-            )
-            sys.monitoring.set_events(TOOL_ID, sys.monitoring.events.LINE)
+
+            event_set: int = 0
+            handlers = [
+                (events.LINE, line_probes, handle_line),
+                (events.PY_START, start_probes, handle_(start_probes)),
+                (events.PY_RESUME, resume_probes, handle_(resume_probes)),
+                (events.PY_YIELD, yield_probes, handle_(yield_probes)),
+                (events.PY_RETURN, return_probes, handle_(return_probes)),
+                (events.PY_UNWIND, unwind_probes, handle_(unwind_probes, nodisable=True)),
+            ]
+            for event, probes, handler in handlers:
+                if len(probes) > 0:
+                    sys.monitoring.register_callback(
+                        TOOL_ID, event, handler
+                    )
+                    event_set |= event
+
+            sys.monitoring.set_events(TOOL_ID, event_set)
 
         pmt._end_actions = [
             (probe, action, snippet)
@@ -400,9 +537,10 @@ def unsettrace():
             threading.settrace(None)  # type: ignore  # bug in typeshed.
             sys.settrace(None)
         else:
-            sys.monitoring.register_callback(
-                TOOL_ID, sys.monitoring.events.LINE, None
-            )
+            for event in events.all():
+                sys.monitoring.register_callback(
+                    TOOL_ID, event, None
+                )
             sys.monitoring.set_events(
                 TOOL_ID, sys.monitoring.events.NO_EVENTS
             )

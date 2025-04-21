@@ -92,14 +92,22 @@ def parse_script(script_text: str):
 
     def parse_probe_spec(i):
         name, i = parse_probe_name(i)
-        valid_probe_names = ('line', 'pymontrace')
+        valid_probe_names = ('line', 'pymontrace', 'func')
         if name not in valid_probe_names:
             raise ParseError(
-                f'Unknown probe {name}. '
-                f'Valid probes are {",".join(valid_probe_names)}'
+                f'Unknown probe {name!r}. '
+                f'Valid probes are: {", ".join(valid_probe_names)}'
             )
-        arg1_desc = {'line': 'file path', 'pymontrace': 'nothing'}[name]
-        arg2_desc = {'line': 'line number', 'pymontrace': 'BEGIN or END'}[name]
+        arg1_desc = {
+            'line': 'file path',
+            'pymontrace': 'nothing',
+            'func': 'qualified function path (qpath)'
+        }[name]
+        arg2_desc = {
+            'line': 'line number',
+            'pymontrace': 'BEGIN or END',
+            'func': 'func probe point'
+        }[name]
 
         _, i = parse_colon(i)
         arg1, i = parse_arg1(i, arg1_desc)
@@ -114,6 +122,11 @@ def parse_script(script_text: str):
                     'Valid pymontrace probe specs are: '
                     'pymontrace::BEGIN, pymontrace::END'
                 )
+        elif name == 'func':
+            if any(not (c.isalnum() or c in '*._') for c in arg1):
+                raise ParseError(f'Invalid qpath glob: {arg1!r}')
+            if arg2 not in ('start', 'yield', 'resume', 'return', 'unwind'):
+                raise ParseError(f'Invalid func probe point {arg2!r}')
         else:
             assert_never(name)
         return (name, arg1, arg2), i

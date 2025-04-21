@@ -27,8 +27,9 @@ parser.add_argument(
     help=argparse.SUPPRESS,
 )
 parser.add_argument(
-    '-e', dest='prog_text', type=validate_script,
+    '-e', dest='prog_text', type=str,
     help='Example: line:script.py:13 {{ print(a, b) }}',
+    required=True
 )
 
 
@@ -119,6 +120,12 @@ def tracesubprocess(progpath: str, prog_text):
 def cli_main():
     args = parser.parse_args()
 
+    try:
+        validate_script(args.prog_text)
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        exit(1)
+
     if args.pyprog:
         tracesubprocess(args.pyprog, args.prog_text)
     elif args.subproc:
@@ -126,7 +133,7 @@ def cli_main():
     elif args.pid:
         tracepid(args.pid, encode_script(args.prog_text))
     else:
-        print('one or -p or -c required', file=sys.stderr)
+        print('one of -p or -c required', file=sys.stderr)
         parser.print_usage(file=sys.stderr)
         exit(1)
 

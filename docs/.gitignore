@@ -1,0 +1,3 @@
+# In case people are previewing the asciidoc
+*.html
+*.pdf

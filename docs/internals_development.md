@@ -11,6 +11,10 @@ On macOS, with only the target running
 ```sh
 sudo dtrace -n pid$(pgrep Python):Python:Py\*:entry'{ trace(probefunc); }'
 ```
+or maybe this is working more widely
+```sh
+sudo dtrace -n pid$(pgrep '[Pp]ython'):\*ython\*:Py\*:entry'{ trace(probefunc); }'
+```
 
 ```
 ...

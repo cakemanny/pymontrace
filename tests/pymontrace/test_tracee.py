@@ -22,6 +22,19 @@ def test_line_probe():
     assert not LineProbe('/a/*/c.py', '6').matches('/a/b/c.pyx', 6)
 
 
+def test_func_probe():
+    from pymontrace.tracee import FuncProbe
+
+    assert FuncProbe('*.foo', 'start').matches('foo', '/a/b/c.py')
+    assert FuncProbe('*.c.foo', 'start').matches('foo', '/a/b/c.py')
+    assert FuncProbe('*.c.foo', 'start').matches('foo', '/a/b/c/__init__.py')
+    assert FuncProbe('*.b.c.foo', 'start').matches('foo', '/a/b/c/__init__.py')
+
+    assert FuncProbe('*oo', 'start').matches('foo', 'c.py')
+    assert FuncProbe('*ar.foo', 'start').matches('foo', 'baz/bar.py')
+    assert FuncProbe('*bar*', 'start').matches('foo', 'baz/bar.py')
+
+
 @pytest.mark.skipif("sys.version_info >= (3, 12)")
 def test_handle_events():
     from pymontrace.tracee import create_event_handlers

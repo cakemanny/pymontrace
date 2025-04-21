@@ -56,6 +56,28 @@ def test_parse_script__begin_and_end():
 
     assert 'UNREAL' in str(exc.value)
 
+
+def test_parse_script__func():
+    from pymontrace.tracer import parse_script
+
+    script = 'func:*.foo:start {{ pmt.print("hi") }}'
+
+    probe_actions = parse_script(script)
+
+    assert probe_actions == [
+        (('func', '*.foo', 'start'), 'pmt.print("hi") ')
+    ]
+
+    with pytest.raises(Exception) as exc:
+        parse_script('func:*.foo:unreal {{"junk"}}')
+
+    assert 'unreal' in str(exc.value)
+
+    with pytest.raises(Exception) as exc:
+        parse_script('func:<badchars>:start {{"junk"}}')
+    assert 'badchars' in str(exc.value)
+
+
 def test_validate_script():
     from pymontrace.tracer import validate_script
 

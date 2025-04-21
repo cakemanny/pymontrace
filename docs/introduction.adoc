@@ -28,7 +28,7 @@ probe-name = "line" | ...
 line:*/some-file.py:123 {{
     pmt.print("a =", a)
     if b is not None:
-        pmt.vars.b = pmt.count()  # how the fuck will this work?
+        pmt.vars.b = pmt.count()
 }}
 
 pymontrace::END {{
@@ -38,13 +38,16 @@ pymontrace::END {{
 
 
 The python blocks are run in the context of the probe site.
-They have access to all the local variables
+They have access to all the local variables.
 
 
 == Special variables
 
-The executing python actions, in addition to the traced program, have access
-to the `pmt` module
+The executing python actions, in addition to the program context, have access
+to a helper module called the `pmt` module.
+
+The `pmt` module contains a number of helper functions and special properties.
+
 
 === `pmt` standard functions
 
@@ -121,6 +124,20 @@ when tracing Python 3.12 and later.
 It corresponds to the https://docs.python.org/3/library/sys.html#sys.settrace[`'line'` trace event]
 when tracing Python 3.11 and earlier.
 
+| xref:_probe_func[
+`func:__qpath__:start`,
+`func:__qpath__:yield`,
+`func:__qpath__:resume`,
+`func:__qpath__:return`,
+`func:__qpath__:unwind`
+]
+| Entry and exit points of python functions.
+
+| `call:__qpath__:before`,
+`call:__qpath__:after`,
+| Before and after making a function call. The context is within the caller.
+_Not yet implemented_.
+
 |===
 
 
@@ -150,3 +167,89 @@ line:*/target.py:123 {{
 }}
 ----
 
+
+[#_probe_func]
+=== `func:__qpath__:...`
+
+`func` probes are able to monitor the entry and exit points of any python
+function.
+
+The `_qpath_` segment is a faux module and function path based on the filepath.
+It's recommended to always start with `*.` as the module prefix may not be
+what you expect.
+Using a module path based on a reexport will not match.
+
+For example, assuming the next two files are part of the traced process,
+the probe spec
+`+func:requests.client.exceptions.ClientException.__init__:start+`
+will match when `ClientException` is constructed,
+whereas
+`+func:requests.exceptions.ClientException.__init__:start+`
+will not.
+
+.requests/exceptions.py
+[,python]
+----
+from client.exceptions import ClientException
+__all__ = ("ClientException",)
+----
+
+.requests/clients/exceptions.py
+[,python]
+----
+class ClientException(Exception):
+    def __init__(*args):
+        ...
+----
+
+
+The following shows the positions of the probe sites in a representative
+function
+
+[,python]
+----
+def example():
+    # start
+    ...
+    # yield
+    yield
+    # resume
+
+    if ...:
+        # unwind
+        raise Exception
+
+    # return
+    return
+
+async def coro():
+    ...
+    # yield
+    await other()
+    # resume
+    ...
+----
+
+NOTE: Tracking the `unwind` event causes some overhead when any exception is
+raised within the target. Whereas, on Python 3.12 and later, tracking
+for example `start` only causes overhead in matches functions.
+
+WARNING: `yield` and `resume` only match on Python 3.12 and later.
+
+
+== Known Issues
+
+=== macOS
+
+* Tracing a python process on macOS which has either it's binary or shared
+  objects under a system path is not possible unless
+  https://support.apple.com/en-gb/102149[SIP] is
+  https://developer.apple.com/documentation/security/disabling-and-enabling-system-integrity-protection[disabled].
+  This includes
+    1. The system python (`/usr/bin/python3`)
+    2. Python installed via the macOS universal installer found on https://python.org
+  Versions installed via Homebrew work up to 3.12
+
+* Attaching never succeed on the Python 3.13 installed via Homebrew.
+  The build doesn't seem to call `PyEval_SaveThread`.
+  Should be fixable.
