@@ -44,7 +44,7 @@ def receive_and_print_until_interrupted(s: socket.socket):
     print('Probes installed. Hit CTRL-C to end...', file=sys.stderr)
     try:
         decode_and_print_forever(s)
-        print('Target disconnected.')
+        print('Target disconnected.', file=sys.stderr)
     except KeyboardInterrupt:
         pass
     print('Removing probes...', file=sys.stderr)
@@ -123,8 +123,7 @@ def cli_main():
     try:
         validate_script(args.prog_text)
     except Exception as e:
-        print(str(e), file=sys.stderr)
-        exit(1)
+        parser.error(str(e))
 
     if args.pyprog:
         tracesubprocess(args.pyprog, args.prog_text)
@@ -133,9 +132,7 @@ def cli_main():
     elif args.pid:
         tracepid(args.pid, encode_script(args.prog_text))
     else:
-        print('one of -p or -c required', file=sys.stderr)
-        parser.print_usage(file=sys.stderr)
-        exit(1)
+        parser.error("one of -p or -c required")
 
 
 if __name__ == '__main__':
