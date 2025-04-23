@@ -16,7 +16,11 @@ from pymontrace.tracer import (
 parser = argparse.ArgumentParser(prog='pymontrace')
 parser.add_argument(
     '-c', dest='pyprog',
-    help='a python script to run and trace')
+    help=(
+        "a python script to run and trace, including any arguments "
+        "e.g. 'some_script.py \"one arg\" another'"
+    ),
+)
 parser.add_argument(
     '-p', dest='pid', type=int,
     help='pid of a python process to attach to',
@@ -28,8 +32,8 @@ parser.add_argument(
 )
 parser.add_argument(
     '-e', dest='prog_text', type=str,
-    help='Example: line:script.py:13 {{ print(a, b) }}',
-    required=True
+    help="pymontrace program text e.g. 'line:*script.py:13 {{ pmt.print(a, b) }}'",
+    required=True,
 )
 
 
@@ -67,7 +71,7 @@ def tracepid(pid: int, encoded_script: bytes):
             format_bootstrap_snippet(
                 encoded_script, comms.remotepath,
                 to_remote_path(pid, site_extension.name),
-            )
+            ),
         )
 
         # TODO: this needs a timeout
@@ -78,7 +82,7 @@ def tracepid(pid: int, encoded_script: bytes):
         receive_and_print_until_interrupted(s)
         pymontrace.attacher.attach_and_exec(
             pid,
-            format_untrace_snippet()
+            format_untrace_snippet(),
         )
         decode_and_print_remaining(s)
 
@@ -86,6 +90,7 @@ def tracepid(pid: int, encoded_script: bytes):
 def subprocess_entry(progpath, encoded_script: bytes):
     import runpy
     import time
+    import shlex
 
     from pymontrace.tracee import settrace, connect
 
@@ -94,12 +99,14 @@ def subprocess_entry(progpath, encoded_script: bytes):
         time.sleep(1)
     connect(comm_file)
     settrace(encoded_script)
+    # TODO: install a sigterm handler for doing pymontrace::END ?
 
-    runpy.run_path(progpath, run_name='__main__')
+    sys.argv = shlex.split(progpath)
+
+    runpy.run_path(sys.argv[0], run_name='__main__')
 
 
 def tracesubprocess(progpath: str, prog_text):
-
     p = subprocess.Popen(
         [sys.executable, '-m', 'pymontrace', '-X', progpath, '-e', prog_text]
     )
