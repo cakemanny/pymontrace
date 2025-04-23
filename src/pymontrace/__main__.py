@@ -92,18 +92,22 @@ def subprocess_entry(progpath, encoded_script: bytes):
     import time
     import shlex
 
-    from pymontrace.tracee import settrace, connect
+    from pymontrace.tracee import connect, settrace, unsettrace
 
     comm_file = CommsFile(os.getpid()).remotepath
     while not os.path.exists(comm_file):
         time.sleep(1)
     connect(comm_file)
     settrace(encoded_script)
-    # TODO: install a sigterm handler for doing pymontrace::END ?
 
     sys.argv = shlex.split(progpath)
 
-    runpy.run_path(sys.argv[0], run_name='__main__')
+    try:
+        runpy.run_path(sys.argv[0], run_name='__main__')
+    except KeyboardInterrupt:
+        pass
+    finally:
+        unsettrace()
 
 
 def tracesubprocess(progpath: str, prog_text):
@@ -119,9 +123,10 @@ def tracesubprocess(progpath: str, prog_text):
         os.unlink(comms.localpath)
 
         receive_and_print_until_interrupted(s)
-        p.terminate()
-        # BUG: there's not a nice way to print and messages sent by
-        # pymontrace::END
+        # The child will also have had a SIGINT at this point as it's
+        # in the same terminal group. So should have ended unless it's
+        # installed its own signal handlers.
+        decode_and_print_remaining(s)
 
 
 def cli_main():
