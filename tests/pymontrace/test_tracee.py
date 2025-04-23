@@ -4,7 +4,7 @@ import inspect
 
 import pytest
 
-from pymontrace.tracee import LineProbe, Message, remote
+from pymontrace.tracee import FuncProbe, LineProbe, Message, remote
 
 
 def empty_user_action():
@@ -36,7 +36,7 @@ def test_func_probe():
 
 
 @pytest.mark.skipif("sys.version_info >= (3, 12)")
-def test_handle_events():
+def test_handle_events__line_probe():
     from pymontrace.tracee import create_event_handlers
 
     # The frame returned by currentframe changes its linenumber, so, we
@@ -77,6 +77,26 @@ def test_handle_events__wrong_function():
 
         local_handler = handler(test_frame, 'call', None)
         assert local_handler is None
+
+
+@pytest.mark.skipif("sys.version_info >= (3, 12)")
+def test_handle_events__func_probe():
+    from pymontrace.tracee import create_event_handlers
+
+    # The frame returned by currentframe changes its linenumber, so, we
+    # use a dummy function to create a frame that doesn't move
+    def make_frame():
+        return inspect.currentframe()
+
+    test_frame = make_frame()
+    assert test_frame is not None
+
+    probe = FuncProbe('*.make_frame', 'return')
+
+    handler = create_event_handlers([(probe, empty_user_action(), '')])
+
+    local_handler = handler(test_frame, 'call', None)
+    assert local_handler is not None
 
 
 def test_pmt_print():

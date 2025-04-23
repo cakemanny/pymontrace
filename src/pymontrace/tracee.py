@@ -10,7 +10,7 @@ import threading
 import traceback
 from collections import namedtuple
 from types import CodeType, FrameType, SimpleNamespace
-from typing import Literal, NoReturn, Union, Tuple, List
+from typing import Literal, NoReturn, Union, Sequence
 
 TOOL_ID = sys.monitoring.DEBUGGER_ID if sys.version_info >= (3, 12) else 0
 
@@ -164,7 +164,7 @@ ValidProbe = Union[LineProbe, PymontraceProbe, FuncProbe]
 
 def decode_pymontrace_program(encoded: bytes):
 
-    def read_null_terminated_str(buf: bytes) -> Tuple[str, bytes]:
+    def read_null_terminated_str(buf: bytes) -> tuple[str, bytes]:
         c = 0
         while buf[c] != 0:
             c += 1
@@ -324,8 +324,10 @@ def _handle_eval_error(snippet: str) -> None:
     pmt.print(buf.getvalue(), end='', file=sys.stderr)
 
 
-# Handlers for 3.11 and earlier
-def create_event_handlers(probe_actions: List[Tuple[LineProbe, CodeType, str]]):
+# Handlers for 3.11 and earlier - TODO: should this be guarded?
+def create_event_handlers(
+    probe_actions: Sequence[tuple[Union[LineProbe, FuncProbe], CodeType, str]],
+):
 
     if sys.version_info < (3, 10):
         # https://github.com/python/cpython/blob/3.12/Objects/lnotab_notes.txt
@@ -348,29 +350,126 @@ def create_event_handlers(probe_actions: List[Tuple[LineProbe, CodeType, str]]):
             return lineno - f_code.co_firstlineno
 
     def make_local_handler(probe, action, snippet):
-        def handle_local(frame, event, _arg):
-            if event != 'line' or probe.lineno != frame.f_lineno:
+        if isinstance(probe, LineProbe):
+            def handle_local(frame, event, _arg):
+                if event != 'line' or probe.lineno != frame.f_lineno:
+                    return handle_local
+                safe_eval(action, frame, snippet)
+                return None
+
+        elif isinstance(probe, FuncProbe) and probe.site == 'return':
+            # BUG: Both this event and 'exception' fire during an
+            # exception
+            def handle_local(frame, event, _arg):
+                if event == 'return':
+                    safe_eval(action, frame, snippet)
+                    return None
                 return handle_local
-            safe_eval(action, frame, snippet)
-            return handle_local
+
+        elif isinstance(probe, FuncProbe) and probe.site == 'unwind':
+            def handle_local(frame, event, _arg):
+                if event == 'exception':
+                    safe_eval(action, frame, snippet)
+                    return None
+                return handle_local
+
+        else:
+            def handle_local(frame, event, _arg):
+                return handle_local
+
         return handle_local
+
+    def combine_handlers(handlers):
+        def handle(frame, event, arg):
+            for h in handlers:
+                result = h(frame, event, arg)
+                if result is None:
+                    return None
+            return handle
+        return handle
+
+    count_line_probes = 0
+    count_exit_probes = 0
+    count_start_probes = 0
+    for (probe, action, snippet) in probe_actions:
+        if isinstance(probe, LineProbe):
+            count_line_probes += 1
+        elif isinstance(probe, FuncProbe) and probe.site == 'start':
+            count_start_probes += 1
+        elif isinstance(probe, FuncProbe) and probe.site in ('return', 'unwind'):
+            count_exit_probes += 1
 
     # We allow that only one probe will match any given event
     probes_and_handlers = [
-        (probe, make_local_handler(probe, action, snippet))
+        (probe, action, snippet, make_local_handler(probe, action, snippet))
         for (probe, action, snippet) in probe_actions
     ]
 
+    if count_line_probes > 0 and (count_start_probes == 0 and count_exit_probes == 0):
+        def handle_call(frame: FrameType, event, arg):
+            for probe, action, snippet, local_handler in probes_and_handlers:
+                assert isinstance(probe, LineProbe)
+                if probe.lineno < frame.f_lineno:
+                    continue
+                f_code = frame.f_code
+                if not probe.matches_file(f_code.co_filename):
+                    continue
+                if probe.lineno > f_code.co_firstlineno + num_lines(f_code):
+                    continue
+                return local_handler
+            return None
+        return handle_call
+
+    if count_line_probes == 0:
+        def handle_call(frame: FrameType, event, arg):
+            local_handlers = []
+            for probe, action, snippet, local_handler in probes_and_handlers:
+                assert isinstance(probe, FuncProbe)
+                # first just entry
+                if probe.site in ('start', 'return', 'unwind') and probe.matches(
+                    frame.f_code.co_name, frame.f_code.co_filename
+                ):
+                    if probe.site == 'start':
+                        safe_eval(action, frame, snippet)
+                        continue
+                    else:
+                        # There are no line probes
+                        frame.f_trace_lines = False
+                        local_handlers.append(local_handler)
+            if len(local_handlers) == 1:
+                return local_handlers[0]
+            if len(local_handlers) > 1:
+                return combine_handlers(local_handlers)
+            return None
+        return handle_call
+
     def handle_call(frame: FrameType, event, arg):
-        for probe, local_handler in probes_and_handlers:
-            if probe.lineno < frame.f_lineno:
-                continue
-            f_code = frame.f_code
-            if not probe.matches_file(f_code.co_filename):
-                continue
-            if probe.lineno > f_code.co_firstlineno + num_lines(f_code):
-                continue
-            return local_handler
+        # TODO: have a list of possible probes to push into
+        local_handlers = []
+        for probe, action, snippet, local_handler in probes_and_handlers:
+            if isinstance(probe, LineProbe):
+                if probe.lineno < frame.f_lineno:
+                    continue
+                f_code = frame.f_code
+                if not probe.matches_file(f_code.co_filename):
+                    continue
+                if probe.lineno > f_code.co_firstlineno + num_lines(f_code):
+                    continue
+                local_handlers.append(local_handler)
+            elif isinstance(probe, FuncProbe) and probe.site == 'start':
+                if probe.matches(
+                    frame.f_code.co_name, frame.f_code.co_filename
+                ):
+                    safe_eval(action, frame, snippet)
+            elif isinstance(probe, FuncProbe) and probe.site in ('return', 'unwind'):
+                if probe.matches(
+                    frame.f_code.co_name, frame.f_code.co_filename
+                ):
+                    local_handlers.append(local_handler)
+        if len(local_handlers) == 1:
+            return local_handlers[0]
+        if len(local_handlers) > 1:
+            return combine_handlers(local_handlers)
         return None
 
     return handle_call
@@ -430,7 +529,7 @@ def settrace(encoded_program: bytes, is_initial=True):
 
         if sys.version_info < (3, 12):
             # TODO: handle func probes
-            event_handlers = create_event_handlers(line_probes)
+            event_handlers = create_event_handlers(line_probes + func_probes)
             sys.settrace(event_handlers)
             if is_initial:
                 threading.settrace(event_handlers)
