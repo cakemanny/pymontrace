@@ -829,8 +829,24 @@ typedef struct {
 } saved_instrs_t;
 
 static int
-save_instrs(pid_t pid, saved_instrs_t* psaved)
+save_instrs(pid_t pid, pid_t tid, saved_instrs_t* psaved)
 {
+
+    long err;
+    errno = 0;
+    err = ptrace(PTRACE_PEEKTEXT, tid, psaved->addr, 0);
+    if (-1 == err && errno != 0) {
+        log_err("save_instrs: ptrace peektext: pid=%d", pid);
+        return -1;
+    }
+    psaved->instrs.u64 = (uint64_t)err;
+    return 0;
+
+    // process_vm_readv felt a bit nicer for not clobbering the err return
+    // but it's not always compiled into the kernel
+    // also we don't reap much benefit of not transferring the data through
+    // the kernel for a single u64
+
     struct iovec local = {
         .iov_base = psaved->instrs.c_bytes,
         .iov_len = sizeof psaved->instrs,
@@ -866,6 +882,54 @@ replace_instrs(pid_t tid, uintptr_t addr, word_of_instr_t instrs)
     }
     return 0;
 }
+
+static int
+write_memory(pid_t pid, const void* laddr, uintptr_t raddr, ssize_t len)
+{
+    // safe to cast away const here as process_vm_writev doesn't modify
+    // the local memory.
+    struct iovec local = { .iov_base = (void*)laddr, .iov_len=len };
+    struct iovec remote = { .iov_base = (void*)raddr, .iov_len=len };
+    errno = 0;
+    if (process_vm_writev(pid, &local, 1, &remote, 1, 0) != len) {
+        if (ENOSYS == errno) {
+            goto useprocmem;
+        }
+        perror("process_vm_writev");
+        return -1;
+    }
+    return 0;
+
+useprocmem:
+    char mempath[PATH_MAX];
+    snprintf(mempath, PATH_MAX, "/proc/%d/mem", pid);
+
+    int fd = open(mempath, O_RDWR);
+    if (-1 == fd) {
+        perror("open");
+        return -1;
+    }
+
+    if ((off_t)-1 == lseek(fd, raddr, SEEK_SET)) {
+        goto error;
+    }
+
+    if (write(fd, laddr, len) != len) {
+        perror("write");
+        goto error;
+    }
+    if (-1 == close(fd)) {
+        perror("close");
+        return -1;
+    }
+
+    return 0;
+
+error:
+    close(fd);
+    return -1;
+}
+
 
 #if defined(__aarch64__)
 
@@ -1201,7 +1265,7 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t bp_addr, size_t length,
     }
 
     saved_instrs_t saved_instrs = { .addr = bp_addr };
-    if (save_instrs(pid, &saved_instrs) != 0) {
+    if (save_instrs(pid, tid, &saved_instrs) != 0) {
         return ATT_FAIL;
     }
 
@@ -1275,7 +1339,7 @@ call_munmap_in_target(pid_t pid, pid_t tid, uintptr_t scratch_addr,
     }
 
     saved_instrs_t saved_instrs = { .addr = scratch_addr };
-    if (save_instrs(pid, &saved_instrs) != 0) {
+    if (save_instrs(pid, tid, &saved_instrs) != 0) {
         return ATT_FAIL;
     }
 
@@ -1344,7 +1408,7 @@ indirect_call_and_brk2(
     }
 
     saved_instrs_t saved_instrs = { .addr = scratch_addr };
-    if (save_instrs(pid, &saved_instrs) != 0) {
+    if (save_instrs(pid, tid, &saved_instrs) != 0) {
         return ATT_FAIL;
     }
 
@@ -1465,12 +1529,8 @@ exec_python_code(pid_t pid, pid_t tid, const char* python_code)
     }
 
     ssize_t len = (1 + strlen(python_code));
-    // safe to cast away const here as process_vm_writev doesn't modify
-    // the local memory.
-    struct iovec local = { .iov_base = (char*)python_code, .iov_len=len };
-    struct iovec remote = { .iov_base = (void*)mapped_addr, .iov_len=len };
-    if (process_vm_writev(pid, &local, 1, &remote, 1, 0) != len) {
-        perror("process_vm_writev");
+    if (write_memory(pid, python_code, mapped_addr, len) != 0) {
+        log_err("writing python code to target memory failed");
         err = ATT_FAIL;
         goto out;
     }
@@ -1566,7 +1626,7 @@ attach_and_execute(const int pid, const char* python_code)
     // not vforks).
 
     saved_instrs_t saved_instrs = { .addr = breakpoint_addr };
-    if (save_instrs(pid, &saved_instrs) != 0) {
+    if (save_instrs(pid, pid, &saved_instrs) != 0) {
         err = ATT_FAIL;
         goto detach;
     }
