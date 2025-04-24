@@ -911,6 +911,7 @@ useprocmem:
     }
 
     if ((off_t)-1 == lseek(fd, raddr, SEEK_SET)) {
+        perror("lseek");
         goto error;
     }
 
