@@ -829,37 +829,17 @@ typedef struct {
 } saved_instrs_t;
 
 static int
-save_instrs(pid_t pid, pid_t tid, saved_instrs_t* psaved)
+save_instrs(pid_t tid, saved_instrs_t* psaved)
 {
 
     long err;
     errno = 0;
     err = ptrace(PTRACE_PEEKTEXT, tid, psaved->addr, 0);
     if (-1 == err && errno != 0) {
-        log_err("save_instrs: ptrace peektext: pid=%d", pid);
+        log_err("save_instrs: ptrace peektext: tid=%d", tid);
         return -1;
     }
     psaved->instrs.u64 = (uint64_t)err;
-    return 0;
-
-    // process_vm_readv felt a bit nicer for not clobbering the err return
-    // but it's not always compiled into the kernel
-    // also we don't reap much benefit of not transferring the data through
-    // the kernel for a single u64
-
-    struct iovec local = {
-        .iov_base = psaved->instrs.c_bytes,
-        .iov_len = sizeof psaved->instrs,
-    };
-    struct iovec remote = {
-        .iov_base = (void*)psaved->addr,
-        .iov_len = sizeof psaved->instrs,
-    };
-    if (process_vm_readv(pid, &local, 1, &remote, 1, 0)
-            != (ssize_t)remote.iov_len) {
-        log_err("process_vm_readv: pid=%d", pid);
-        return ATT_FAIL;
-    }
     return 0;
 }
 
@@ -1266,7 +1246,7 @@ call_mmap_in_target(pid_t pid, pid_t tid, uintptr_t bp_addr, size_t length,
     }
 
     saved_instrs_t saved_instrs = { .addr = bp_addr };
-    if (save_instrs(pid, tid, &saved_instrs) != 0) {
+    if (save_instrs(tid, &saved_instrs) != 0) {
         return ATT_FAIL;
     }
 
@@ -1340,7 +1320,7 @@ call_munmap_in_target(pid_t pid, pid_t tid, uintptr_t scratch_addr,
     }
 
     saved_instrs_t saved_instrs = { .addr = scratch_addr };
-    if (save_instrs(pid, tid, &saved_instrs) != 0) {
+    if (save_instrs(tid, &saved_instrs) != 0) {
         return ATT_FAIL;
     }
 
@@ -1409,7 +1389,7 @@ indirect_call_and_brk2(
     }
 
     saved_instrs_t saved_instrs = { .addr = scratch_addr };
-    if (save_instrs(pid, tid, &saved_instrs) != 0) {
+    if (save_instrs(tid, &saved_instrs) != 0) {
         return ATT_FAIL;
     }
 
@@ -1627,7 +1607,7 @@ attach_and_execute(const int pid, const char* python_code)
     // not vforks).
 
     saved_instrs_t saved_instrs = { .addr = breakpoint_addr };
-    if (save_instrs(pid, pid, &saved_instrs) != 0) {
+    if (save_instrs(pid, &saved_instrs) != 0) {
         err = ATT_FAIL;
         goto detach;
     }
