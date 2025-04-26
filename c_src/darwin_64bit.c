@@ -37,8 +37,6 @@ const bool debug = false;
 //#define SAFE_POINT "PyErr_CheckSignals"
 #define SAFE_POINT  "PyEval_SaveThread"
 
-#define PYTHON_SO_BASENAME  "Python"
-
 
 typedef struct {
     vm_address_t    page_addr;
@@ -964,7 +962,16 @@ find_pyfn(task_t task, const char* symbol)
         // make a copy. ... even though this code is only for macOS
         char bn[1024];
         memcpy(bn, it.filepath, 1024);
-        if (strcmp(basename(bn), PYTHON_SO_BASENAME) == 0) {
+
+        // This seems to be used by the system python and Homebrew python build
+        #define PYTHON_SO_BASENAME  "Python"
+        // uv managed python has them named like libpython3.12.dylib
+        #define PYTHON_DYLIB_PREFIX "libpython"
+
+        if (strcmp(basename(bn), PYTHON_SO_BASENAME) == 0
+                || strncmp(basename(bn), PYTHON_DYLIB_PREFIX,
+                           strlen(PYTHON_DYLIB_PREFIX)) == 0
+        ) {
             log_dbg("looking in %s", it.filepath);
 
             Dl_info dlinfo = {};
@@ -980,7 +987,8 @@ find_pyfn(task_t task, const char* symbol)
                 break;
             }
         }
-
+        #undef PYTHON_SO_BASENAME
+        #undef PYTHON_DYLIB_PREFIX
     }
     errno = 0; // that search process above leaves the errno dirty
     return fn_addr;
