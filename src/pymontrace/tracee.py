@@ -16,7 +16,7 @@ import threading
 import traceback
 from collections import namedtuple
 from types import CodeType, FrameType, SimpleNamespace
-from typing import Literal, NoReturn, Type, Union, Sequence, Optional
+from typing import Literal, NoReturn, Optional, Sequence, Union
 
 TOOL_ID = sys.monitoring.DEBUGGER_ID if sys.version_info >= (3, 12) else 0
 
