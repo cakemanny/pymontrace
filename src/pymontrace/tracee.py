@@ -1,3 +1,9 @@
+"""
+The module that is imported in the tracee.
+
+This is a single large file to simplify injecting into the target (tracee).
+All imports are from the standard library.
+"""
 import inspect
 import io
 import os
@@ -10,7 +16,7 @@ import threading
 import traceback
 from collections import namedtuple
 from types import CodeType, FrameType, SimpleNamespace
-from typing import Literal, NoReturn, Union, Sequence
+from typing import Literal, NoReturn, Type, Union, Sequence, Optional
 
 TOOL_ID = sys.monitoring.DEBUGGER_ID if sys.version_info >= (3, 12) else 0
 
@@ -90,62 +96,70 @@ class FuncProbe:
         self.qpath = qpath
         self.site = site
 
+        self.name = ""
+        self.is_name_match = False
+        self.is_star_match = False
+        self.is_suffix_path = False
+        self.suffix = ""
+        self.isregex = False
+
         star_count = sum(map(lambda c: c == '*', qpath))
         dot_count = sum(map(lambda c: c == '.', qpath))
 
-        self.name = ""
+        if qpath == '*':
+            self.is_star_match = True
+
         # Example: *.foo
-        self.is_name_match = False
-        if qpath.startswith('*.') and star_count == 1 and dot_count == 1:
+        elif qpath.startswith('*.') and star_count == 1 and dot_count == 1:
             self.is_name_match = True
             self.name = qpath[2:]
 
         # Example: *.bar.foo
-        self.is_suffix_path = False
-        self.suff_module: list[str] = []
-        if qpath.startswith('*.') and star_count == 1 and dot_count > 1:
+        elif qpath.startswith('*.') and star_count == 1 and dot_count > 1:
             self.is_suffix_path = True
-            *self.suff_module, self.name = qpath[2:].split('.')
+            self.suffix = qpath[2:]
+            self.name = self.suffix.split('.')[-1]
 
-        self.isregex = False
-        if star_count > 0 and not self.is_name_match and not self.is_suffix_path:
+        elif star_count > 0:
             self.isregex = True
             self.regex = re.compile(
                 '^' + qpath.replace('.', '\\.').replace('*', '.*') + '$'
             )
 
-    @staticmethod
-    def _faux_mod_path(file_path: str) -> list[str]:
-        assert file_path.endswith(".py"), f"not endswith .py: {file_path!r}"
-        parts = file_path.split('/')
-        if parts[0] == '':
-            parts = parts[1:]
-        if parts[-1] == '__init__.py':
-            return parts[:-1]
-        # foo.py -> foo
-        parts[-1] = parts[-1][:-3]
-        return parts
-
-    def matches(self, co_name: str, co_filename: str) -> bool:
+    def excludes(self, code: CodeType) -> bool:
+        """fast path for when we don't have the frame yet"""
+        if self.is_star_match:
+            return False
         if self.is_name_match:
-            return co_name == self.name
+            return code.co_name != self.name
+        return False
 
-        # TODO: do something with '<module>' style filenames
+    def matches(self, frame: FrameType) -> bool:
+        if self.is_star_match:
+            return True
+        if self.is_name_match:
+            return frame.f_code.co_name == self.name
+
+        co_name = frame.f_code.co_name
+        co_qualname = frame.f_code.co_qualname
 
         if self.is_suffix_path:
             if co_name != self.name:
                 return False
-            mod_path = self._faux_mod_path(co_filename)
-            return self.suff_module == mod_path[-len(self.suff_module):]
+            qpath = frame.f_globals['__name__'] + '.' + co_qualname
+            return qpath.endswith(self.suffix)
 
-        # TODO: this could make relpaths from sys.path
-        mod_path = self._faux_mod_path(co_filename)
-        faux_func_path = '.'.join(mod_path + [co_name])
+        qpath = frame.f_globals['__name__'] + '.' + co_qualname
 
         if self.isregex:
-            return bool(self.regex.match(faux_func_path))
+            return bool(self.regex.match(qpath))
 
-        return False
+        # make it simpler to trace simple scripts:
+        if frame.f_globals['__name__'] == '__main__':
+            if self.qpath == co_qualname:
+                return True
+
+        return self.qpath == qpath
 
 
 ProbeDescriptor = namedtuple('ProbeDescriptor', ('id', 'name', 'construtor'))
@@ -277,11 +291,107 @@ class TracerRemote:
 remote = TracerRemote()
 
 
+class PMTError(Exception):
+    """Represents a mistake in the use of pmt."""
+    pass
+
+
+class EvaluationError(PMTError):
+    pass
+
+
+class aggregation:
+    COUNT = object()
+
+    class Sum:
+        def __init__(self, value):
+            self.value = value
+
+    class Max:
+        def __init__(self, value):
+            self.value = value
+
+    class Min:
+        def __init__(self, value):
+            self.value = value
+
+
+class VarNS(SimpleNamespace):
+
+    def __setattr__(self, name: str, value, /) -> None:
+        if value is aggregation.COUNT:
+            # This would probably want / need to deal with threadlocalness /
+            # contextness
+            current = getattr(self, name, 0)
+            object.__setattr__(self, name, current + 1)
+        elif isinstance(value, aggregation.Sum):
+            current = getattr(self, name, 0)
+            object.__setattr__(self, name, current + value.value)
+        elif isinstance(value, aggregation.Min):
+            current = getattr(self, name, value.value)
+            object.__setattr__(self, name, min(current, value.value))
+        elif isinstance(value, aggregation.Max):
+            current = getattr(self, name, value.value)
+            object.__setattr__(self, name, max(current, value.value))
+        else:
+            object.__setattr__(self, name, value)
+
+
+class PMTMap(dict):  # Should be collections.MutableMapping
+
+    def __setitem__(self, key, value, /) -> None:
+        if value is aggregation.COUNT:
+            current = self.get(key, 0)
+            return super().__setitem__(key, current + 1)
+        elif isinstance(value, aggregation.Sum):
+            current = self.get(key, 0)
+            return super().__setitem__(key, current + value.value)
+        elif isinstance(value, aggregation.Min):
+            current = self.get(key, value.value)
+            return super().__setitem__(key, min(current, value.value))
+        elif isinstance(value, aggregation.Max):
+            current = self.get(key, value.value)
+            return super().__setitem__(key, max(current, value.value))
+        else:
+            return super().__setitem__(key, value)
+
+
+class MapNS(SimpleNamespace):
+
+    # Only happens on AttributeError
+    def __getattr__(self, name):
+        # At this point we'd create the buffer space
+        # new_map = PMTMap()
+        new_map = PMTMap()
+        self.__setattr__(name, new_map)
+        return new_map
+
+    def __setattr__(self, name: str, value, /) -> None:
+        if not isinstance(value, PMTMap):
+            # ... The user is probably messing up some syntax..
+            raise EvaluationError(
+                f'cannot set attribute {name!r} on pmt.maps, '
+                f'use pmt.maps[...] = ... or pmt.vars.{name} instead'
+            )
+        super().__setattr__(name, value)
+
+    def __getitem__(self, key):
+        # A default map. We use a name that's not possible in python
+        # to avoid possible conflicts
+        return getattr(self, '@')[key]
+
+    def __setitem__(self, key, value, /) -> None:
+        return getattr(self, '@').__setitem__(key, value)
+
+
 class pmt:
     """
     pmt is a utility namespace of functions that may be useful for examining
     the system and returning data to the tracer.
     """
+
+    vars = VarNS()
+    maps = MapNS()
 
     @staticmethod
     def print(*args, **kwargs):
@@ -289,7 +399,38 @@ class pmt:
             to_write = remote._encode_print(*args, **kwargs)
             remote.sendall(to_write)
 
-    vars = SimpleNamespace()
+    def __init__(self, frame: Optional[FrameType]):
+        self._frame = frame
+        self._frozen = True
+
+    def funcname(self):
+        if self._frame is None:
+            return None
+        return self._frame.f_code.co_name
+
+    def qualname(self):
+        if self._frame is None:
+            return None
+        module_name = self._frame.f_globals['__name__']
+        if module_name:
+            return module_name + '.' + self._frame.f_code.co_qualname
+        return module_name + '.' + self._frame.f_code.co_qualname
+
+    @staticmethod
+    def count():
+        return aggregation.COUNT
+
+    @staticmethod
+    def sum(value):
+        return aggregation.Sum(value)
+
+    @staticmethod
+    def min(value):
+        return aggregation.Min(value)
+
+    @staticmethod
+    def max(value):
+        return aggregation.Max(value)
 
     _end_actions: list[tuple[PymontraceProbe, CodeType, str]] = []
 
@@ -298,28 +439,45 @@ class pmt:
         pmt._end_actions = []
         pmt.vars = SimpleNamespace()
 
+    def __setattr__(self, name: str, value, /) -> None:
+        # It's quite easy too accidentally assign to something here
+        # instead of into pmt.vars. This should help.
+        if getattr(self, "_frozen", False):
+            raise EvaluationError(
+                f'cannot set {name!r}, pmt is readonly, '
+                'set your attribute on pmt.vars or pmt.maps instead'
+            )
+        return super().__setattr__(name, value)
+
 
 def safe_eval(action: CodeType, frame: FrameType, snippet: str):
     try:
         eval(action, {**frame.f_globals}, {
             **frame.f_locals,
-            'pmt': pmt,
+            'pmt': pmt(frame),
         })
-    except Exception:
-        _handle_eval_error(snippet)
+    except Exception as e:
+        _handle_eval_error(e, snippet, frame)
 
 
 def safe_eval_no_frame(action: CodeType, snippet: str):
     try:
-        eval(action, None, {'pmt': pmt})
-    except Exception:
-        _handle_eval_error(snippet)
+        eval(action, None, {'pmt': pmt(frame=None)})
+    except Exception as e:
+        _handle_eval_error(e, snippet)
 
 
-def _handle_eval_error(snippet: str) -> None:
+def _handle_eval_error(
+        e: Exception, snippet: str, frame: Optional[FrameType] = None,
+) -> None:
     buf = io.StringIO()
-    print('Probe action failed', file=buf)
-    traceback.print_exc(file=buf)
+    print('Probe action failed:', file=buf)
+    if isinstance(e, PMTError):
+        if frame is not None:
+            traceback.print_stack(frame, file=buf)
+        print(f"{e.__class__.__name__}: {e}", file=buf)
+    else:
+        traceback.print_exc(file=buf)
     print(textwrap.indent(snippet, 4 * ' '), file=buf)
     pmt.print(buf.getvalue(), end='', file=sys.stderr)
 
@@ -427,7 +585,7 @@ def create_event_handlers(
                 assert isinstance(probe, FuncProbe)
                 # first just entry
                 if probe.site in ('start', 'return', 'unwind') and probe.matches(
-                    frame.f_code.co_name, frame.f_code.co_filename
+                    frame
                 ):
                     if probe.site == 'start':
                         safe_eval(action, frame, snippet)
@@ -444,7 +602,6 @@ def create_event_handlers(
         return handle_call
 
     def handle_call(frame: FrameType, event, arg):
-        # TODO: have a list of possible probes to push into
         local_handlers = []
         for probe, action, snippet, local_handler in probes_and_handlers:
             if isinstance(probe, LineProbe):
@@ -457,14 +614,10 @@ def create_event_handlers(
                     continue
                 local_handlers.append(local_handler)
             elif isinstance(probe, FuncProbe) and probe.site == 'start':
-                if probe.matches(
-                    frame.f_code.co_name, frame.f_code.co_filename
-                ):
+                if probe.matches(frame):
                     safe_eval(action, frame, snippet)
             elif isinstance(probe, FuncProbe) and probe.site in ('return', 'unwind'):
-                if probe.matches(
-                    frame.f_code.co_name, frame.f_code.co_filename
-                ):
+                if probe.matches(frame):
                     local_handlers.append(local_handler)
         if len(local_handlers) == 1:
             return local_handlers[0]
@@ -562,13 +715,18 @@ def settrace(encoded_program: bytes, is_initial=True):
             unwind_probes = [p for p in func_probes if p[0].site == 'unwind']
 
             # For any func probe except unwind
-            def handle_(probes, nodisable=False):
+            def handle_(
+                probes: list[tuple[FuncProbe, CodeType, str]],
+                nodisable=False,
+            ):
                 def handle(code: CodeType, arg1, arg2=None):
                     for (probe, action, snippet) in probes:
-                        if not probe.matches(code.co_name, code.co_filename):
+                        if probe.excludes(code):
                             continue
                         if ((cur_frame := inspect.currentframe()) is None
                                 or (frame := cur_frame.f_back) is None):
+                            continue
+                        if not probe.matches(frame):
                             continue
                         safe_eval(action, frame, snippet)
                         return None
@@ -648,6 +806,16 @@ def unsettrace():
         for (probe, action, snippet) in pmt._end_actions:
             assert probe.is_end
             safe_eval_no_frame(action, snippet)
+
+        for name, mapp in vars(pmt.maps).items():
+            pmt.print(name, "\n")
+            kwidth, vwidth = 0, 0
+            for k, v in mapp.items():
+                kwidth = max(kwidth, len(str(k)))
+                vwidth = max(vwidth, len(str(v)))
+            for k, v in sorted(mapp.items(), key=lambda kv: kv[1]):
+                pmt.print(f"  {k:{kwidth}}: {v:{vwidth}}")
+
         pmt._reset()
         remote.close()
     except Exception:

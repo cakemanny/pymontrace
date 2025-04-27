@@ -94,14 +94,15 @@ def subprocess_entry(progpath, encoded_script: bytes):
 
     from pymontrace.tracee import connect, settrace, unsettrace
 
+    sys.argv = shlex.split(progpath)
+
     comm_file = CommsFile(os.getpid()).remotepath
     while not os.path.exists(comm_file):
         time.sleep(1)
     connect(comm_file)
+
+    # Avoid code between settrace and starting the target program
     settrace(encoded_script)
-
-    sys.argv = shlex.split(progpath)
-
     try:
         runpy.run_path(sys.argv[0], run_name='__main__')
     except KeyboardInterrupt:

@@ -63,8 +63,6 @@ output back to the tracer.
 
 === `pmt` aggregation functions
 
-NOTE: not yet implemented
-
 Aggregation functions are special and must be assigned to
 pymontrace variables or into map entries.
 
@@ -87,8 +85,6 @@ pymontrace variables or into map entries.
 |===
 
 === `pmt` properties
-
-NOTE: not yet implemented
 
 [cols="1,5"]
 |===
@@ -174,9 +170,29 @@ line:*/target.py:123 {{
 `func` probes are able to monitor the entry and exit points of any python
 function.
 
-The `_qpath_` segment is a faux module and function path based on the filepath.
-It's recommended to always start with `*.` as the module prefix may not be
-what you expect.
+The `_qpath_` segment is the module qualified function path.
+
+To give an example, let's state the qpaths for if the following was imported
+as `import helpers.helpful`
+
+.helpers/helpful.py
+[source,python]
+----
+class Helper:
+    def help(self):  # <1>
+        pass
+
+def make_helper():  # <2>
+    class Elf:
+        def help(self):  # <3>
+            pass
+    return Elf().help()
+----
+<1> `helpers.helpful.Helper.help`
+<2> `helpers.helpful.make_helper`
+<3> `helpers.helpful.make_helper.<locals>.Elf.help`
+
+
 Using a module path based on a reexport will not match.
 
 For example, assuming the next two files are part of the traced process,
@@ -232,7 +248,7 @@ async def coro():
 
 NOTE: Tracking the `unwind` event causes some overhead when any exception is
 raised within the target. Whereas, on Python 3.12 and later, tracking
-for example `start` only causes overhead in matches functions.
+for example `start` only causes overhead in matching functions.
 
 WARNING: `yield` and `resume` only match on Python 3.12 and later.
 
