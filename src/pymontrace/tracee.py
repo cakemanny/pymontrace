@@ -390,9 +390,6 @@ class pmt:
     the system and returning data to the tracer.
     """
 
-    vars = VarNS()
-    maps = MapNS()
-
     @staticmethod
     def print(*args, **kwargs):
         if remote.is_connected:
@@ -411,10 +408,10 @@ class pmt:
     def qualname(self):
         if self._frame is None:
             return None
-        module_name = self._frame.f_globals['__name__']
+        module_name = self._frame.f_globals.get('__name__')
         if module_name:
             return module_name + '.' + self._frame.f_code.co_qualname
-        return module_name + '.' + self._frame.f_code.co_qualname
+        return self._frame.f_code.co_qualname
 
     @staticmethod
     def count():
@@ -434,10 +431,14 @@ class pmt:
 
     _end_actions: list[tuple[PymontraceProbe, CodeType, str]] = []
 
+    vars = VarNS()
+    maps = MapNS()
+
     @staticmethod
     def _reset():
         pmt._end_actions = []
-        pmt.vars = SimpleNamespace()
+        pmt.vars = VarNS()
+        pmt.maps = MapNS()
 
     def __setattr__(self, name: str, value, /) -> None:
         # It's quite easy too accidentally assign to something here
@@ -448,6 +449,26 @@ class pmt:
                 'set your attribute on pmt.vars or pmt.maps instead'
             )
         return super().__setattr__(name, value)
+
+    @staticmethod
+    def printmaps():
+        try:
+            for name, mapp in vars(pmt.maps).items():
+                pmt.print(name, "\n")
+                kwidth, vwidth = 0, 0
+                for k, v in mapp.items():
+                    kwidth = max(kwidth, len(str(k)))
+                    vwidth = max(vwidth, len(str(v)))
+                for k, v in sorted(mapp.items(), key=lambda kv: kv[1]):
+                    if isinstance(k, (int, str)):
+                        pmt.print(f"  {k:{kwidth}}: {v:{vwidth}}")
+                    else:
+                        pmt.print(f"  {k!s:{kwidth}}: {v:{vwidth}}")
+        except Exception:
+            buf = io.StringIO()
+            print(f'{__name__}.pmt.printmaps failed', file=buf)
+            traceback.print_exc(file=buf)
+            pmt.print(buf.getvalue(), end='', file=sys.stderr)
 
 
 def safe_eval(action: CodeType, frame: FrameType, snippet: str):
@@ -807,14 +828,7 @@ def unsettrace():
             assert probe.is_end
             safe_eval_no_frame(action, snippet)
 
-        for name, mapp in vars(pmt.maps).items():
-            pmt.print(name, "\n")
-            kwidth, vwidth = 0, 0
-            for k, v in mapp.items():
-                kwidth = max(kwidth, len(str(k)))
-                vwidth = max(vwidth, len(str(v)))
-            for k, v in sorted(mapp.items(), key=lambda kv: kv[1]):
-                pmt.print(f"  {k:{kwidth}}: {v:{vwidth}}")
+        pmt.printmaps()
 
         pmt._reset()
         remote.close()
