@@ -141,6 +141,7 @@ class FuncProbe:
             return frame.f_code.co_name == self.name
 
         co_name = frame.f_code.co_name
+        # FIXME: this is broken on 3.9
         co_qualname = frame.f_code.co_qualname
 
         if '__name__' not in frame.f_globals:
@@ -482,9 +483,11 @@ class pmt:
 
     def _asdict(self):
         o = {}
-        for k, v in (vars(self) | vars(pmt)).items():
+        for k in (vars(self) | vars(pmt)):
             if not k.startswith("_"):
-                o[k] = v
+                # seems to be necessary in python 3.9 to access the
+                # staticmethods through the instance ... :shrug:
+                o[k] = getattr(self, k)
         return o
 
 
