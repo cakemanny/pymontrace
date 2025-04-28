@@ -32,7 +32,7 @@ parser.add_argument(
 )
 parser.add_argument(
     '-e', dest='prog_text', type=str,
-    help="pymontrace program text e.g. 'line:*script.py:13 {{ pmt.print(a, b) }}'",
+    help="pymontrace program text e.g. 'line:*script.py:13 {{ print(ctx.a, ctx.b) }}'",
     required=True,
 )
 

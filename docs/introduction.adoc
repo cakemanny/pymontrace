@@ -28,75 +28,30 @@ probe-name = "line" | ...
 .Example pymontrace program
 ----
 line:*/some-file.py:123 {{
-    pmt.print("a =", a)
+    print("a =", ctx.a)
     if b is not None:
-        pmt.vars.b = pmt.count()
+        vars.b = agg.count()
 }}
 
 pymontrace::END {{
-    pmt.print("b =", pmt.vars.b)
+    print("b =", vars.b)
 }}
 ----
 
 
 The python blocks are run in the context of the probe site.
-They have access to all the local variables.
+The local and global variables are available on `ctx` and `ctx.globals`
+respectively.
 
 
 == Special variables
 
-The executing python actions, in addition to the program context, have access
-to a helper module called the `pmt` module.
-
-The `pmt` module contains a number of helper functions and special properties.
-
-
-=== `pmt` standard functions
-
-[cols="1,3"]
-|===
-| `print(arg1, arg2, ...)`
-| Works just like the python `print` builtin, except that it sends the
-output back to the tracer.
-
-| `funcname()`
-| Returns the name of the function in which the probe hit.
-
-| `qualname()`
-| Returns the full module-qualified name of the function.
-
-// TODO: have some kind of pmt.exit() function
-|===
-
-
-=== `pmt` aggregation functions
-
-Aggregation functions are special and must be assigned to
-pymontrace variables or into map entries.
-
-[cols="1,3"]
-|===
-| Function | Description
-
-| `count()`
-| Counts the number of times it is called.
-
-| `sum(arg)`
-| Adds `arg` to the sum.
-
-| `max(arg)`
-| Computes the maximum over supplied arguments.
-
-| `min(arg)`
-| Computes the minimum over supplied arguments.
-
-|===
-
-=== `pmt` properties
+There are a couple of variables that act as namespaces for storing data
+between the executions of probe actions.
 
 [cols="1,5"]
 |===
-| Property | Description
+| Variable | Description
 
 | `vars`
 | `vars` is a namespace for holding user variables. This can be used to
@@ -105,9 +60,64 @@ store values between probe executions.
 | `maps`
 | `maps` is a namespace for holding user maps (dictionaries). Any non-empty
 maps will printed out at the end of tracing. They are most useful when
-combined with aggregations.
+combined with aggregations. `maps` itself behaves like an dictionary with the
+name `@`.
 
 |===
+
+
+== Functions
+
+A number of utility functions are made available in probe context to facilitate
+common debugging and tracing scenarios.
+These functions are divided up into two kinds, standard functions and
+aggregation functions.
+
+=== Standard Functions
+
+[cols="1,3"]
+|===
+| `print(arg1, arg2, ...)`
+| Works just like the python `print` builtin, except that it sends the
+output back to the tracer. It intentionally shadows the `print` builtin so that
+it's easier to debug than to accidently cause observable behaviour in the
+target.
+
+| `funcname()`
+| Returns the name of the function in which the probe hit.
+
+| `qualname()`
+| Returns the full module-qualified name of the function.
+
+| `exit()`
+| Ends tracing.
+
+|===
+
+
+=== Aggregation Functions
+
+Aggregation functions are special and must be assigned to
+pymontrace variables or into map entries.
+
+[cols="1,3"]
+|===
+| Function | Description
+
+| `agg.count()`
+| Counts the number of times it is called.
+
+| `agg.sum(arg)`
+| Adds `arg` to the sum.
+
+| `agg.max(arg)`
+| Computes the maximum over supplied arguments.
+
+| `agg.min(arg)`
+| Computes the minimum over supplied arguments.
+
+|===
+
 
 
 == Probes
@@ -123,10 +133,6 @@ terminates.
 
 | `line:__filepath__:__line number__`
 | Executes its action just before the matched line executes.
-It corresponds to https://docs.python.org/3/library/sys.monitoring.html#monitoring-event-LINE[sys.monitoring.events.LINE]
-when tracing Python 3.12 and later.
-It corresponds to the https://docs.python.org/3/library/sys.html#sys.settrace[`'line'` trace event]
-when tracing Python 3.11 and earlier.
 
 | xref:_probe_func[
 `func:__qpath__:start`,
@@ -157,19 +163,26 @@ to do simple state checks.
 Another use for `BEGIN` is to import modules and define helper functions.
 Since importing in python can be very expensive you'll want to avoid that
 in a tight loop.
-A way around that would be to import and assign to a variable on `pmt.vars`.
+A way around that would be to import and assign to a variable on `vars`.
 
 .Example showing import in `BEGIN`
 ----
 pymontrace::BEGIN {{
     import base64
-    pmt.vars.b64decode = base64.b64decode
+    vars.b64decode = base64.b64decode
 }}
 
 line:*/target.py:123 {{
-    pmt.print(pmt.vars.b64decode(some_base64_encoded_value))
+    print(vars.b64decode(some_base64_encoded_value))
 }}
 ----
+
+=== `line:__filepath__:__lineno__`
+
+It corresponds to https://docs.python.org/3/library/sys.monitoring.html#monitoring-event-LINE[sys.monitoring.events.LINE]
+when tracing Python 3.12 and later.
+It corresponds to the https://docs.python.org/3/library/sys.html#sys.settrace[`'line'` trace event]
+when tracing Python 3.11 and earlier.
 
 
 [#_probe_func]

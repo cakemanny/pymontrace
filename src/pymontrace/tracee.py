@@ -143,19 +143,22 @@ class FuncProbe:
         co_name = frame.f_code.co_name
         co_qualname = frame.f_code.co_qualname
 
+        if '__name__' not in frame.f_globals:
+            # can happen if an eval/exec gets traced
+            qpath = co_qualname
+        else:
+            qpath = frame.f_globals['__name__'] + '.' + co_qualname
+
         if self.is_suffix_path:
             if co_name != self.name:
                 return False
-            qpath = frame.f_globals['__name__'] + '.' + co_qualname
             return qpath.endswith(self.suffix)
-
-        qpath = frame.f_globals['__name__'] + '.' + co_qualname
 
         if self.isregex:
             return bool(self.regex.match(qpath))
 
         # make it simpler to trace simple scripts:
-        if frame.f_globals['__name__'] == '__main__':
+        if frame.f_globals.get('__name__') == '__main__':
             if self.qpath == co_qualname:
                 return True
 
@@ -316,6 +319,24 @@ class aggregation:
             self.value = value
 
 
+class agg:
+    @staticmethod
+    def count():
+        return aggregation.COUNT
+
+    @staticmethod
+    def sum(value):
+        return aggregation.Sum(value)
+
+    @staticmethod
+    def min(value):
+        return aggregation.Min(value)
+
+    @staticmethod
+    def max(value):
+        return aggregation.Max(value)
+
+
 class VarNS(SimpleNamespace):
 
     def __setattr__(self, name: str, value, /) -> None:
@@ -396,6 +417,11 @@ class pmt:
             to_write = remote._encode_print(*args, **kwargs)
             remote.sendall(to_write)
 
+    @staticmethod
+    def exit(status=None):
+        # FIXME: this is not re-entrant
+        unsettrace()
+
     def __init__(self, frame: Optional[FrameType]):
         self._frame = frame
         self._frozen = True
@@ -412,22 +438,6 @@ class pmt:
         if module_name:
             return module_name + '.' + self._frame.f_code.co_qualname
         return self._frame.f_code.co_qualname
-
-    @staticmethod
-    def count():
-        return aggregation.COUNT
-
-    @staticmethod
-    def sum(value):
-        return aggregation.Sum(value)
-
-    @staticmethod
-    def min(value):
-        return aggregation.Min(value)
-
-    @staticmethod
-    def max(value):
-        return aggregation.Max(value)
 
     _end_actions: list[tuple[PymontraceProbe, CodeType, str]] = []
 
@@ -470,20 +480,51 @@ class pmt:
             traceback.print_exc(file=buf)
             pmt.print(buf.getvalue(), end='', file=sys.stderr)
 
+    def _asdict(self):
+        o = {}
+        for k, v in (vars(self) | vars(pmt)).items():
+            if not k.startswith("_"):
+                o[k] = v
+        return o
+
+
+class ChainNS(SimpleNamespace):
+    def __init__(self, level1, level2, /, **kwargs):
+        self.__dict__.update(level1)
+        self.__dict__.update(kwargs)
+        self._level2 = level2
+
+    def __getattr__(self, name: str):
+        return getattr(self._level2, name)
+
 
 def safe_eval(action: CodeType, frame: FrameType, snippet: str):
     try:
-        eval(action, {**frame.f_globals}, {
-            **frame.f_locals,
-            'pmt': pmt(frame),
-        })
+        framepmt = pmt(frame)
+        globals_as_ns = SimpleNamespace(**frame.f_globals)
+        eval(action, {
+            'ctx': ChainNS(
+                frame.f_locals,
+                globals_as_ns,
+                # to allow getting around shadowed variables
+                globals=globals_as_ns,
+            ),
+            'pmt': framepmt,
+            **framepmt._asdict(),
+            'agg': agg,
+        }, {})
     except Exception as e:
         _handle_eval_error(e, snippet, frame)
 
 
 def safe_eval_no_frame(action: CodeType, snippet: str):
     try:
-        eval(action, None, {'pmt': pmt(frame=None)})
+        noframepmt = pmt(frame=None)
+        eval(action, {
+            'pmt': noframepmt,
+            **noframepmt._asdict(),
+            'agg': agg,
+        }, {})
     except Exception as e:
         _handle_eval_error(e, snippet)
 
@@ -701,6 +742,15 @@ def settrace(encoded_program: bytes, is_initial=True):
             else:
                 assert_never(probe)
 
+        pmt._end_actions = [
+            (probe, action, snippet)
+            for (probe, action, snippet) in pmt_probes
+            if probe.is_end
+        ]
+        for (probe, action, snippet) in pmt_probes:
+            if probe.is_begin:
+                safe_eval_no_frame(action, snippet)
+
         if sys.version_info < (3, 12):
             # TODO: handle func probes
             event_handlers = create_event_handlers(line_probes + func_probes)
@@ -776,14 +826,6 @@ def settrace(encoded_program: bytes, is_initial=True):
 
             sys.monitoring.set_events(TOOL_ID, event_set)
 
-        pmt._end_actions = [
-            (probe, action, snippet)
-            for (probe, action, snippet) in pmt_probes
-            if probe.is_end
-        ]
-        for (probe, action, snippet) in pmt_probes:
-            if probe.is_begin:
-                safe_eval_no_frame(action, snippet)
     except Exception as e:
         try:
             buf = io.StringIO()

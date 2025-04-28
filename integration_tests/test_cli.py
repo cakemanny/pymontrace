@@ -10,7 +10,7 @@ def test_dash_c_mode():
             '-c',
             'modulo_loop.py',
             '-e',
-            'line:modulo_loop.py:4 {{ pmt.print("a", a) }}'
+            'line:modulo_loop.py:4 {{ print("a", ctx.a) }}'
         ],
         cwd=(pathlib.Path('.') / 'integration_tests' / 'targets'),
         capture_output=True

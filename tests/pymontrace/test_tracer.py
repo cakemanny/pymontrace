@@ -8,12 +8,12 @@ import pytest
 def test_parse_script():
     from pymontrace.tracer import parse_script
 
-    single_probe_script = 'line:*path/to/file.py:56 {{ pmt.print("yo") }}'
+    single_probe_script = 'line:*path/to/file.py:56 {{ print("yo") }}'
 
     probe_actions = parse_script(single_probe_script)
 
     assert probe_actions == [
-        (('line', '*path/to/file.py', '56'), 'pmt.print("yo") ')
+        (('line', '*path/to/file.py', '56'), 'print("yo") ')
     ]
 
 
@@ -23,20 +23,20 @@ def test_parse_script__two_probes():
     two_probe_script = """
     line:*path/to/file.py:56
     {{
-        pmt.print("yo")
+        print("yo")
     }}
 
     line:*another.py:999
     {{
-        pmt.print(a, b, c)
-        pmt.print()
+        print(ctx.a, ctx.b, ctx.c)
+        print()
     }}
     """
     two_probe_script = textwrap.dedent(two_probe_script)
 
     assert parse_script(two_probe_script) == [
-        (('line', '*path/to/file.py', '56'), '\npmt.print("yo")\n'),
-        (('line', '*another.py', '999'), '\npmt.print(a, b, c)\npmt.print()\n'),
+        (('line', '*path/to/file.py', '56'), '\nprint("yo")\n'),
+        (('line', '*another.py', '999'), '\nprint(ctx.a, ctx.b, ctx.c)\nprint()\n'),
     ]
 
 
@@ -60,12 +60,12 @@ def test_parse_script__begin_and_end():
 def test_parse_script__func():
     from pymontrace.tracer import parse_script
 
-    script = 'func:*.foo:start {{ pmt.print("hi") }}'
+    script = 'func:*.foo:start {{ print("hi") }}'
 
     probe_actions = parse_script(script)
 
     assert probe_actions == [
-        (('func', '*.foo', 'start'), 'pmt.print("hi") ')
+        (('func', '*.foo', 'start'), 'print("hi") ')
     ]
 
     with pytest.raises(Exception) as exc:
