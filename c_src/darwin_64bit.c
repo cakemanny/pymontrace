@@ -1203,6 +1203,7 @@ attach_and_execute(const int pid, const char* python_code)
 
     bool safe_point_hit = false;
     bool code_execd = false;
+    bool target_exited = false;
     for (;;) {
         if (code_execd) {
             break;
@@ -1317,6 +1318,7 @@ attach_and_execute(const int pid, const char* python_code)
                 log_err("target exited: exit status unknown\n");
             }
             err = ATT_FAIL;
+            target_exited = true;
             for (int i = 0; i < (int)thread_count; i++) {
                 thrds[i].running = 1; // not true, but confuses the exit code
                                       // less
@@ -1364,7 +1366,8 @@ out:
     // Right now, this doesn't deal with the possibility of the task
     // having ended for whatever reason.
 
-    if (restore_exception_handling(task, &old_exc_ports) != 0) {
+    if (!target_exited &&
+            restore_exception_handling(task, &old_exc_ports) != 0) {
         err = ATT_UNKNOWN_STATE;
     }
     if ((kr = mach_port_deallocate(mach_task_self(), exception_port))) {
