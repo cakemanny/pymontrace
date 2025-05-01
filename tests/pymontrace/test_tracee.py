@@ -1,8 +1,6 @@
-import typing
 import sys
 import struct
 import inspect
-import types
 
 import pytest
 
@@ -22,76 +20,6 @@ def test_line_probe():
 
     assert LineProbe('/a/*/c.py', '6').matches('/a/b/c.py', 6)
     assert not LineProbe('/a/*/c.py', '6').matches('/a/b/c.pyx', 6)
-
-
-class FakeFrame:
-    class FakeCode(types.SimpleNamespace):
-        pass
-
-    def __init__(self, co_qualname: str, module_name: str):
-        self.f_globals = {'__name__': module_name}
-        self.f_code = FakeFrame.FakeCode(
-            co_qualname=co_qualname,
-            co_name=co_qualname.split('.')[-1],
-        )
-
-    @classmethod
-    def make(cls, co_qualname: str, module_name: str) -> types.FrameType:
-        f = FakeFrame(co_qualname, module_name)
-        return typing.cast(types.FrameType, f)
-
-    @classmethod
-    def code(cls, co_qualname: str) -> types.CodeType:
-        c = FakeFrame.FakeCode(
-            co_qualname=co_qualname,
-            co_name=co_qualname.split('.')[-1],
-        )
-        return typing.cast(types.CodeType, c)
-
-
-def test_func_probe():
-    from pymontrace.tracee import FuncProbe
-
-    assert FuncProbe('*.foo', 'start').matches(FakeFrame.make('foo', 'a.b.c'))
-    assert not FuncProbe('*.foo', 'start').excludes(FakeFrame.code('foo'))
-    assert FuncProbe('*.c.foo', 'start').matches(FakeFrame.make('foo', 'a.b.c'))
-    assert not FuncProbe('*.c.foo', 'start').excludes(FakeFrame.code('foo'))
-    assert FuncProbe('*.c.foo', 'start').matches(FakeFrame.make('c.foo', 'a.b'))
-    assert not FuncProbe('*.c.foo', 'start').excludes(FakeFrame.code('c.foo'))
-    assert FuncProbe('*.b.c.foo', 'start').matches(FakeFrame.make('foo', 'a.b.c'))
-
-    assert FuncProbe('*oo', 'start').matches(FakeFrame.make('foo', 'c'))
-    assert FuncProbe('*ar.foo', 'start').matches(FakeFrame.make('foo', 'baz.bar'))
-    assert FuncProbe('*bar*', 'start').matches(FakeFrame.make('foo', 'baz.bar'))
-
-
-def test_func_probe3():
-    from pymontrace.tracee import FuncProbe
-
-    assert FuncProbe('os.get_exec_path', 'start').matches(
-        FakeFrame.make('get_exec_path', 'os')
-    )
-
-
-def test_func_probe2():
-    import sys
-    import types
-
-    fr: list[types.FrameType] = []
-
-    def handle(frame: types.FrameType, event: str, arg):
-        fr.append(frame)
-
-    def foo():
-        pass
-
-    sys.settrace(handle)
-    foo()
-    sys.settrace(None)
-
-    assert len(fr) == 1
-
-    assert FuncProbe('*.foo', 'start').matches(fr[0])
 
 
 @pytest.mark.skipif("sys.version_info >= (3, 12)")

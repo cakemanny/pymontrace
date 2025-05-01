@@ -48,7 +48,9 @@ class LineProbe:
         self.isregex = False
         if star_count > 0 and not self.is_path_endswith:
             self.isregex = True
-            self.regex = re.compile('^' + path.replace('*', '.*') + '$')
+            self.regex = re.compile(
+                '^' + re.escape(path).replace('\\*', '.*') + '$'
+            )
 
     def matches(self, co_filename: str, line_number: int):
         if line_number != self.lineno:
@@ -123,8 +125,11 @@ class FuncProbe:
         elif star_count > 0:
             self.isregex = True
             self.regex = re.compile(
-                '^' + qpath.replace('.', '\\.').replace('*', '.*') + '$'
+                '^' + re.escape(qpath).replace('\\*', '.*') + '$'
             )
+
+    def __repr__(self):
+        return f'FuncProbe(qpath={self.qpath!r}, site={self.site!r})'
 
     def excludes(self, code: CodeType) -> bool:
         """fast path for when we don't have the frame yet"""
@@ -140,20 +145,36 @@ class FuncProbe:
         if self.is_name_match:
             return frame.f_code.co_name == self.name
 
-        co_name = frame.f_code.co_name
-        # FIXME: this is broken on 3.9
-        co_qualname = frame.f_code.co_qualname
-
         if '__name__' not in frame.f_globals:
             # can happen if an eval/exec gets traced
-            qpath = co_qualname
+            module_name = ''
+            # TEMP: check whether inspect gets values when name is missing
+            assert not (mn := inspect.getmodulename(frame.f_code.co_filename)), \
+                f"module_name={mn}"
         else:
-            qpath = frame.f_globals['__name__'] + '.' + co_qualname
+            module_name = frame.f_globals['__name__']
 
-        if self.is_suffix_path:
-            if co_name != self.name:
-                return False
-            return qpath.endswith(self.suffix)
+        co_name = frame.f_code.co_name
+
+        if sys.version_info >= (3, 11):
+            co_qualname = frame.f_code.co_qualname
+            qpath = '.'.join(filter(bool, [module_name, co_qualname]))
+
+            if self.is_suffix_path:
+                if co_name != self.name:
+                    return False
+                return qpath.endswith(self.suffix)
+        else:
+            if self.is_suffix_path:
+                if co_name != self.name:
+                    return False
+            # This is expensive, that's why we've split the is_suffix_path
+            # condition into two parts.
+            co_qualname = self._get_qualname(frame)
+            qpath = '.'.join(filter(bool, [module_name, co_qualname]))
+            if self.is_suffix_path:
+                # Unsure if this should actually be a return if match
+                return qpath.endswith(self.suffix)
 
         if self.isregex:
             return bool(self.regex.match(qpath))
@@ -164,6 +185,34 @@ class FuncProbe:
                 return True
 
         return self.qpath == qpath
+
+    # 3.9 and 3.10 only
+    def _get_qualname(self, frame: FrameType):
+        co_name = frame.f_code.co_name
+        if 'self' in frame.f_locals:
+            classname = frame.f_locals['self'].__class__.__qualname__
+            co_qualname = f"{classname}.{co_name}"
+            return co_qualname
+
+        # Is/was it a locally defined function?
+        if (parent := frame.f_back) is not None:
+            if (func := parent.f_locals.get(co_name)) is not None and \
+                    inspect.isfunction(func):
+                if frame.f_code is func.__code__:
+                    return func.__qualname__
+            if (func := parent.f_globals.get(co_name)) is not None and \
+                    inspect.isfunction(func):
+                if frame.f_code is func.__code__:
+                    return func.__qualname__
+
+            for v in parent.f_locals.values():
+                if inspect.isfunction(func := v) and \
+                        frame.f_code is func.__code__:
+                    return func.__qualname__
+            # There is another case where it might be a renamed
+            # import but this is starting to get rather desperate
+        # Fallback
+        return co_name
 
 
 ProbeDescriptor = namedtuple('ProbeDescriptor', ('id', 'name', 'construtor'))
@@ -435,6 +484,9 @@ class pmt:
     def qualname(self):
         if self._frame is None:
             return None
+        if sys.version_info < (3, 11):
+            # TODO ?
+            raise NotImplementedError
         module_name = self._frame.f_globals.get('__name__')
         if module_name:
             return module_name + '.' + self._frame.f_code.co_qualname
