@@ -16,7 +16,7 @@ import threading
 import traceback
 from collections import namedtuple
 from types import CodeType, FrameType, SimpleNamespace
-from typing import Literal, NoReturn, Optional, Sequence, Union
+from typing import Any, Callable, Literal, NoReturn, Optional, Sequence, Union
 
 TOOL_ID = sys.monitoring.DEBUGGER_ID if sys.version_info >= (3, 12) else 0
 
@@ -148,9 +148,9 @@ class FuncProbe:
         if '__name__' not in frame.f_globals:
             # can happen if an eval/exec gets traced
             module_name = ''
-            # TEMP: check whether inspect gets values when name is missing
-            assert not (mn := inspect.getmodulename(frame.f_code.co_filename)), \
-                f"module_name={mn}"
+            # It would be interesting to know if there are cases where
+            # __name__ is not there but inspect.getmodulename can deduce
+            # the name...
         else:
             module_name = frame.f_globals['__name__']
 
@@ -170,7 +170,7 @@ class FuncProbe:
                     return False
             # This is expensive, that's why we've split the is_suffix_path
             # condition into two parts.
-            co_qualname = self._get_qualname(frame)
+            co_qualname = Frame.get_qualname(frame)
             qpath = '.'.join(filter(bool, [module_name, co_qualname]))
             if self.is_suffix_path:
                 # Unsure if this should actually be a return if match
@@ -186,8 +186,12 @@ class FuncProbe:
 
         return self.qpath == qpath
 
+
+class Frame:
+
     # 3.9 and 3.10 only
-    def _get_qualname(self, frame: FrameType):
+    @staticmethod
+    def get_qualname(frame: FrameType):
         co_name = frame.f_code.co_name
         if 'self' in frame.f_locals:
             classname = frame.f_locals['self'].__class__.__qualname__
@@ -481,16 +485,18 @@ class pmt:
             return None
         return self._frame.f_code.co_name
 
-    def qualname(self):
-        if self._frame is None:
+    def qualname(self, Frame=Frame):
+        frame = self._frame
+        if frame is None:
             return None
+        module_name = frame.f_globals.get('__name__')
         if sys.version_info < (3, 11):
-            # TODO ?
-            raise NotImplementedError
-        module_name = self._frame.f_globals.get('__name__')
+            co_qualname = Frame.get_qualname(frame)
+        else:
+            co_qualname = frame.f_code.co_qualname
         if module_name:
-            return module_name + '.' + self._frame.f_code.co_qualname
-        return self._frame.f_code.co_qualname
+            return f'{module_name}.{co_qualname}'
+        return co_qualname
 
     _end_actions: list[tuple[PymontraceProbe, CodeType, str]] = []
 
@@ -599,6 +605,9 @@ def _handle_eval_error(
     pmt.print(buf.getvalue(), end='', file=sys.stderr)
 
 
+TraceFunction = Callable[[FrameType, str, Any], Union['TraceFunction', None]]
+
+
 # Handlers for 3.11 and earlier - TODO: should this be guarded?
 def create_event_handlers(
     probe_actions: Sequence[tuple[Union[LineProbe, FuncProbe], CodeType, str]],
@@ -624,9 +633,9 @@ def create_event_handlers(
                     lineno = max(lineno, this_lineno)
             return lineno - f_code.co_firstlineno
 
-    def make_local_handler(probe, action, snippet):
+    def make_local_handler(probe, action: CodeType, snippet: str) -> TraceFunction:
         if isinstance(probe, LineProbe):
-            def handle_local(frame, event, _arg):
+            def handle_local(frame, event, _arg) -> Optional[TraceFunction]:
                 if event != 'line' or probe.lineno != frame.f_lineno:
                     return handle_local
                 safe_eval(action, frame, snippet)
@@ -635,23 +644,24 @@ def create_event_handlers(
         elif isinstance(probe, FuncProbe) and probe.site == 'return':
             # BUG: Both this event and 'exception' fire during an
             # exception
-            def handle_local(frame, event, _arg):
+            def handle_local(frame, event, _arg) -> Optional[TraceFunction]:
                 if event == 'return':
                     safe_eval(action, frame, snippet)
                     return None
                 return handle_local
+            return handle_local
 
         elif isinstance(probe, FuncProbe) and probe.site == 'unwind':
-            def handle_local(frame, event, _arg):
+            def handle_local(frame, event, _arg) -> Optional[TraceFunction]:
                 if event == 'exception':
                     safe_eval(action, frame, snippet)
                     return None
                 return handle_local
-
+            return handle_local
         else:
-            def handle_local(frame, event, _arg):
+            def handle_local(frame, event, _arg) -> Optional[TraceFunction]:
                 return handle_local
-
+            return handle_local
         return handle_local
 
     def combine_handlers(handlers):
@@ -681,7 +691,7 @@ def create_event_handlers(
     ]
 
     if count_line_probes > 0 and (count_start_probes == 0 and count_exit_probes == 0):
-        def handle_call(frame: FrameType, event, arg):
+        def handle_call(frame: FrameType, event, arg) -> Union[TraceFunction, None]:
             for probe, action, snippet, local_handler in probes_and_handlers:
                 assert isinstance(probe, LineProbe)
                 if probe.lineno < frame.f_lineno:
@@ -696,7 +706,7 @@ def create_event_handlers(
         return handle_call
 
     if count_line_probes == 0:
-        def handle_call(frame: FrameType, event, arg):
+        def handle_call(frame: FrameType, event, arg) -> Union[TraceFunction, None]:
             local_handlers = []
             for probe, action, snippet, local_handler in probes_and_handlers:
                 assert isinstance(probe, FuncProbe)
@@ -718,7 +728,7 @@ def create_event_handlers(
             return None
         return handle_call
 
-    def handle_call(frame: FrameType, event, arg):
+    def handle_call(frame: FrameType, event, arg) -> Union[TraceFunction, None]:
         local_handlers = []
         for probe, action, snippet, local_handler in probes_and_handlers:
             if isinstance(probe, LineProbe):
