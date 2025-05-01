@@ -87,8 +87,8 @@ def parse_script(script_text: str):
 
     parse_colon = expect(':')
     parse_probe_name = regex_parser(r'[^:\s]+', 'probe name')
-    parse_arg1 = regex_parser(r'[^:\s]*')
-    parse_arg2 = regex_parser(r'[^:\s{]+')
+    parse_arg = regex_parser(r'[^:\s]*')
+    parse_last_arg = regex_parser(r'[^:\s{]+')
 
     def parse_probe_spec(i):
         name, i = parse_probe_name(i)
@@ -101,18 +101,30 @@ def parse_script(script_text: str):
         arg1_desc = {
             'line': 'file path',
             'pymontrace': 'nothing',
-            'func': 'qualified function path (qpath)'
+            'func': 'module path'
         }[name]
         arg2_desc = {
             'line': 'line number',
             'pymontrace': 'BEGIN or END',
+            'func': 'qualified function/method name'
+        }[name]
+        arg3_desc = {
+            'line': '',
+            'pymontrace': '',
             'func': 'func probe point'
         }[name]
 
         _, i = parse_colon(i)
-        arg1, i = parse_arg1(i, arg1_desc)
+        arg1, i = parse_arg(i, arg1_desc)
         _, i = parse_colon(i)
-        arg2, i = parse_arg2(i, arg2_desc)
+        if name == 'func':
+            arg2, i = parse_arg(i, arg2_desc)
+            _, i = parse_colon(i)
+            arg3, i = parse_last_arg(i, arg3_desc)
+        else:
+            arg2, i = parse_last_arg(i, arg2_desc)
+            arg3 = None
+
         if name == 'line':
             _ = int(arg2)  # just validate
         elif name == 'pymontrace':
@@ -125,11 +137,16 @@ def parse_script(script_text: str):
         elif name == 'func':
             if any(not (c.isalnum() or c in '*._') for c in arg1):
                 raise ParseError(f'Invalid qpath glob: {arg1!r}')
-            if arg2 not in ('start', 'yield', 'resume', 'return', 'unwind'):
-                raise ParseError(f'Invalid func probe point {arg2!r}')
+            if any(not (c.isalnum() or c in '*._') for c in arg2):
+                raise ParseError(f'Invalid qpath glob: {arg1!r}')
+            if arg3 not in ('start', 'yield', 'resume', 'return', 'unwind'):
+                raise ParseError(f'Invalid func probe point {arg3!r}')
         else:
             assert_never(name)
-        return (name, arg1, arg2), i
+        if name == 'func':
+            return (name, arg1, arg2, arg3), i
+        else:
+            return (name, arg1, arg2), i
 
     parse_action_start = expect('{{')
     parse_action_body = whilenot('}}')

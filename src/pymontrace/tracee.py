@@ -26,6 +26,90 @@ def assert_never(arg: NoReturn) -> NoReturn:
     raise AssertionError(f"assert_never: got {arg!r}")
 
 
+class GlobMatcher:
+
+    class StarMatcher:
+        def matches(self, string: str) -> bool:
+            return True
+
+    class RegexMatcher:
+        def __init__(self, glob_pattern: str):
+            escaped = re.escape(glob_pattern)
+            self.regex = re.compile('^' + escaped.replace('\\*', '.*') + '$')
+
+        def matches(self, string):
+            return bool(self.regex.match(string))
+
+    class PrefixMatcher:
+        def __init__(self, prefix: str):
+            self.prefix = prefix
+
+        def matches(self, string: str):
+            return string.startswith(self.prefix)
+
+    class SuffixMatcher:
+        def __init__(self, suffix: str):
+            self.suffix = suffix
+
+        def matches(self, string: str):
+            return string.endswith(self.suffix)
+
+    class InMatcher:
+        def __init__(self, needle: str):
+            self.needle = needle
+
+        def matches(self, string: str):
+            return self.needle in string
+
+    @classmethod
+    def from_pattern(cls, pattern: str):
+        if pattern in ('', '*'):
+            return cls.StarMatcher()
+
+        star_count = sum(map(lambda c: c == '*', pattern))
+        if star_count == 1:
+            if pattern.startswith('*'):
+                return cls.SuffixMatcher(pattern[1:])
+            if pattern.endswith('*'):
+                return cls.PrefixMatcher(pattern[:-1])
+        if star_count == 2:
+            if pattern.startswith('*') and pattern.endswith('*'):
+                return cls.InMatcher(pattern[1:-1])
+        return cls.RegexMatcher(glob_pattern=pattern)
+
+    @staticmethod
+    def _split_pattern(pattern):
+        # 0: normal
+        # 1: star
+        # 2: escaped
+        state: Literal[0, 1, 2] = 0
+        parts = [[]]
+        i = 0
+        for c in pattern:
+            if state == 0:
+                if c == '\\':
+                    state = 2
+                elif c == '*':
+                    state = 1
+                else:
+                    parts[i].append(c)
+            elif state == 1:
+                if c == '*':
+                    continue
+                else:
+                    if c == '\\':
+                        state = 2
+                    else:
+                        state = 0
+                    parts.append([])
+                    i += 1
+            else:
+                parts[i].append(c)
+                state = 0
+        split = list(map(lambda chars: ''.join(chars), parts))
+        return split
+
+
 class InvalidProbe:
     def __init__(self) -> None:
         raise IndexError('Invalid probe ID')
@@ -89,81 +173,84 @@ class FuncProbe:
     return_sites = ('yield', 'return')
     unwind_sites = ('unwind')
 
-    def __init__(self, qpath: str, site: _FUNC_PROBE_EVENT) -> None:
-        for c in qpath:
+    def __init__(self, module: str, func: str, site: _FUNC_PROBE_EVENT) -> None:
+        for c in module:
             if not (c.isalnum() or c in '*._'):
-                raise ValueError('invalid qpath glob: {qpath!r}')
-        self.qpath = qpath
+                raise ValueError('invalid module glob: {module!r}')
+        self.module = module
+        self.func = func
         self.site = site
+        self.module_matcher = GlobMatcher.from_pattern(module)
+        self.func_matcher = GlobMatcher.from_pattern(func)
 
-        self.name = ""
-        self.is_name_match = False
-        self.is_star_match = False
-        self.is_suffix_path = False
-        self.suffix = ""
-        self.isregex = False
-
-        star_count = sum(map(lambda c: c == '*', qpath))
-        dot_count = sum(map(lambda c: c == '.', qpath))
-
-        if qpath == '*':
-            self.is_star_match = True
-
-        # Example: *.foo
-        elif qpath.startswith('*.') and star_count == 1 and dot_count == 1:
-            self.is_name_match = True
-            self.name = qpath[2:]
-
-        # Example: *.bar.foo
-        elif qpath.startswith('*.') and star_count == 1 and dot_count > 1:
-            self.is_suffix_path = True
-            self.suffix = qpath[2:]
-            self.name = self.suffix.split('.')[-1]
-
-        elif star_count > 0:
-            self.isregex = True
-            self.regex = re.compile(
-                '^' + qpath.replace('.', '\\.').replace('*', '.*') + '$'
-            )
+    def __repr__(self) -> str:
+        return f"FuncProbe(module={self.module!r},func={self.func!r},site={self.site!r})"
 
     def excludes(self, code: CodeType) -> bool:
         """fast path for when we don't have the frame yet"""
-        if self.is_star_match:
-            return False
-        if self.is_name_match:
-            return code.co_name != self.name
+        # This is kind broken between 3.10 and 3.11 ...
+        if isinstance(self.func_matcher, GlobMatcher.SuffixMatcher):
+            if '.' not in self.func_matcher.suffix:
+                return not self.func_matcher.matches(code.co_name)
+        # TODO: bring back the .
         return False
 
+    # FIXME: TODO: use <modulepath>:<qualnam>, : instead of .
     def matches(self, frame: FrameType) -> bool:
-        if self.is_star_match:
-            return True
-        if self.is_name_match:
-            return frame.f_code.co_name == self.name
+        if '__name__' not in frame.f_globals:
+            # FIXME: maybe this can use inspect.getmodulename(co_filename) ?
+            # can happen if an eval/exec gets traced
+            module_name = ''
+        else:
+            module_name = frame.f_globals['__name__']
+
+        if not self.module_matcher.matches(module_name):
+            return False
 
         co_name = frame.f_code.co_name
-        # FIXME: this is broken on 3.9
-        co_qualname = frame.f_code.co_qualname
-
-        if '__name__' not in frame.f_globals:
-            # can happen if an eval/exec gets traced
-            qpath = co_qualname
-        else:
-            qpath = frame.f_globals['__name__'] + '.' + co_qualname
-
-        if self.is_suffix_path:
-            if co_name != self.name:
+        # FIXME: this is broken on 3.10
+        if sys.version_info < (3, 11):
+            if self.excludes(frame.f_code):
                 return False
-            return qpath.endswith(self.suffix)
+            # optimize for being a top level function:
+            if (top_level := frame.f_globals.get(co_name)) is not None:
+                if inspect.isfunction(top_level) and top_level.__code__ is frame.f_code:
+                    return self.func_matcher.matches(top_level.__qualname__)
 
-        if self.isregex:
-            return bool(self.regex.match(qpath))
+            # TODO: I think we need an exclusion test!
+            if 'self' in frame.f_locals:
+                classname = frame.f_locals['self'].__class__.__qualname__
+                co_qualname = f"{classname}.{co_name}"
+                return self.func_matcher.matches(co_qualname)
+            # Is/was it a locally defined function?
+            if (parent := frame.f_back) is not None:
+                if (func := parent.f_locals.get(co_name)) is not None and \
+                        inspect.isfunction(func):
+                    if frame.f_code is func.__code__:
+                        co_qualname = func.__qualname__
+                        return self.func_matcher.matches(co_qualname)
+                if (func := parent.f_globals.get(co_name)) is not None and \
+                        inspect.isfunction(func):
+                    if frame.f_code is func.__code__:
+                        co_qualname = func.__qualname__
+                        return self.func_matcher.matches(co_qualname)
+                for v in parent.f_locals.values():
+                    if inspect.isfunction(func := v) and frame.f_code is func.__code__:
+                        co_qualname = func.__qualname__
+                        return self.func_matcher.matches(co_qualname)
 
-        # make it simpler to trace simple scripts:
-        if frame.f_globals.get('__name__') == '__main__':
-            if self.qpath == co_qualname:
-                return True
+            # Fallback
+            co_qualname = co_name
+            return self.func_matcher.matches(co_name) or (
+                self.func_matcher.matches(f".{co_name}")
+            )
+        else:
+            co_qualname = frame.f_code.co_qualname
 
-        return self.qpath == qpath
+        if not self.func_matcher.matches(co_qualname):
+            return False
+        return True
+
 
 
 ProbeDescriptor = namedtuple('ProbeDescriptor', ('id', 'name', 'construtor'))
@@ -432,13 +519,22 @@ class pmt:
             return None
         return self._frame.f_code.co_name
 
-    def qualname(self):
-        if self._frame is None:
-            return None
-        module_name = self._frame.f_globals.get('__name__')
-        if module_name:
-            return module_name + '.' + self._frame.f_code.co_qualname
-        return self._frame.f_code.co_qualname
+    if sys.version_info < (3, 11):
+        def qualname(self):
+            if self._frame is None:
+                return None
+            module_name = self._frame.f_globals.get('__name__')
+            if module_name:
+                return module_name + ':' + self._frame.f_code.co_name
+            return self._frame.f_code.co_name
+    else:
+        def qualname(self):
+            if self._frame is None:
+                return None
+            module_name = self._frame.f_globals.get('__name__')
+            if module_name:
+                return module_name + ':' + self._frame.f_code.co_qualname
+            return self._frame.f_code.co_qualname
 
     _end_actions: list[tuple[PymontraceProbe, CodeType, str]] = []
 
