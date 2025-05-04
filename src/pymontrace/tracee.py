@@ -4,6 +4,7 @@ The module that is imported in the tracee.
 This is a single large file to simplify injecting into the target (tracee).
 All imports are from the standard library.
 """
+import atexit
 import inspect
 import io
 import os
@@ -458,6 +459,9 @@ class MapNS(SimpleNamespace):
     def __setitem__(self, key, value, /) -> None:
         return getattr(self, '@').__setitem__(key, value)
 
+    def __delitem__(self, key):
+        return getattr(self, '@').__delitem__(key)
+
 
 class pmt:
     """
@@ -891,6 +895,8 @@ def settrace(encoded_program: bytes, is_initial=True):
 
             sys.monitoring.set_events(TOOL_ID, event_set)
 
+        atexit.register(unsettrace)
+
     except Exception as e:
         try:
             buf = io.StringIO()
@@ -939,6 +945,7 @@ def unsettrace():
 
         pmt._reset()
         remote.close()
+        atexit.unregister(unsettrace)
     except Exception:
         print(f'{__name__}.unsettrace failed', file=sys.stderr)
         traceback.print_exc(file=sys.stderr)

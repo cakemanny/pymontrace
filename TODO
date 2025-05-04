@@ -33,13 +33,15 @@ In priority order:
 - [ ] Trace many targets at once. Main need: trace forking servers.
 
 - [ ] Firm up the language / interface.
-      - [ ] Create buffer spaces to support aggregations?
-      - [o] multiple probes
+      - [o] Create buffer spaces to support aggregations?
+        (we have in-target buffers but not out of process buffers)
+      - [x] multiple probes
       - [ ] per-thread/per-context storage to store some amount of data.
-- [ ] func probes (entry, exit, exception, yield, unwind, resume, ...)
+- [x] func probes (entry, exit, exception, yield, unwind, resume, ...)
 
-- [ ] our own signal handlers, to be able to sneak out maps as the program
+- [o] our own signal handlers, to be able to sneak out maps as the program
       is about to end...?
+      (We have added an atexit handler - that's)
 - [ ] Support FreeBSD + jails , Illumos + zones, ...
 - [ ] musl support on Linux ...
 - [ ] Rewrite the C code in Rust?
