@@ -34,9 +34,9 @@ Terminal 1
 
 Terminal 2
 
-    pymontrace -p $(pgrep python) 'line:*debug.py:15' 'print(ctx.msg, end="")'
+    pymontrace -p $(pgrep python) -e 'line:*debug.py:8 {{ print(ctx.msg, end="") }}'
     # or on macOS
-    sudo pymontrace -p $(pgrep Python) 'line:*debug.py:15' 'print(ctx.msg, end="")'
+    sudo pymontrace -p $(pgrep Python) -e 'line:*debug.py:8 {{ print(ctx.msg, end="") }}'
 
 
 ## `threaded_server.py`
@@ -49,9 +49,9 @@ Terminal 1
 
 Terminal 2
 
-    pymontrace -p "$(pgrep python)" 'line:*server.py:16' 'print(ctx.self)'
+    pymontrace -p "$(pgrep python)" -e 'line:*server.py:16 {{ print(ctx.self) }}'
     # or on macOS
-    sudo pymontrace -p "$(pgrep Python)" 'line:*server.py:16' 'print(ctx.self)'
+    sudo pymontrace -p "$(pgrep Python)" -e 'line:*server.py:16 {{ print(ctx.self) }}'
 
 Terminal 3
 
