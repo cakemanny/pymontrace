@@ -73,7 +73,7 @@ def test_attach_and_exec__bad_code(single_threaded_subprocess):
     from pymontrace import attacher
 
     p = single_threaded_subprocess
-    with pytest.raises(Exception):
+    with pytest.raises(attacher.AttachError):
         attacher.attach_and_exec(p.pid, 'pppprint("oh noh typoh")')
 
 
@@ -167,7 +167,7 @@ def test_program_ends_during_attach():
     )
     wait_for_started(p)
 
-    with pytest.raises(RuntimeError) as exc:
+    with pytest.raises(attacher.AttachError) as exc:
         attacher.attach_and_exec(p.pid, 'print("hello")')
 
     assert str(exc.value) == 'Error occurred installing/uninstalling probes.'
@@ -193,7 +193,7 @@ def test_program_dies_during_attach():
     )
     wait_for_started(p)
 
-    with pytest.raises(RuntimeError) as exc:
+    with pytest.raises(attacher.AttachError) as exc:
         attacher.attach_and_exec(p.pid, 'print("hello")')
 
     assert str(exc.value) == 'Error occurred installing/uninstalling probes.'

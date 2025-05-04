@@ -270,7 +270,9 @@ def decode_pymontrace_program(encoded: bytes):
 class Message:
     PRINT = 1
     ERROR = 2
-    THREADS = 3  # Additional threads the tracer must attach to
+    THREADS = 3     # Additional threads the tracer must attach to
+    EXIT = 4        # The tracee is exiting (atexit)
+    END_EARLY = 5   # The tracing code called the pmt.exit function
 
 
 class TracerRemote:
@@ -344,6 +346,14 @@ class TracerRemote:
         """
         to_write = self._encode_threads(tids)
         self.sendall(to_write)
+
+    def notify_exit(self):
+        body_size = 0
+        self.sendall(struct.pack('=HH', Message.EXIT, body_size))
+
+    def notify_end_early(self):
+        body_size = 0
+        self.sendall(struct.pack('=HH', Message.END_EARLY, body_size))
 
 
 remote = TracerRemote()
@@ -478,7 +488,7 @@ class pmt:
     @staticmethod
     def exit(status=None):
         # FIXME: this is not re-entrant
-        unsettrace()
+        unsettrace(preclose=remote.notify_end_early())
 
     def __init__(self, frame: Optional[FrameType]):
         self._frame = frame
@@ -895,7 +905,7 @@ def settrace(encoded_program: bytes, is_initial=True):
 
             sys.monitoring.set_events(TOOL_ID, event_set)
 
-        atexit.register(unsettrace)
+        atexit.register(exithook)
 
     except Exception as e:
         try:
@@ -921,7 +931,12 @@ def synctrace():
         pass  # sys.monitoring should already have all threads covered.
 
 
-def unsettrace():
+def exithook():
+    unsettrace(preclose=remote.notify_exit)
+
+
+def unsettrace(preclose=None):
+    atexit.unregister(exithook)
     # This can fail if installing probes failed.
     try:
         if sys.version_info < (3, 12):
@@ -944,8 +959,9 @@ def unsettrace():
         pmt.printmaps()
 
         pmt._reset()
+        if preclose is not None:
+            preclose()
         remote.close()
-        atexit.unregister(unsettrace)
     except Exception:
         print(f'{__name__}.unsettrace failed', file=sys.stderr)
         traceback.print_exc(file=sys.stderr)

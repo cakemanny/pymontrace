@@ -1,9 +1,11 @@
 import argparse
 import atexit
+import enum
 import os
 import socket
 import subprocess
 import sys
+import time
 
 import pymontrace.attacher
 from pymontrace import tracer
@@ -44,18 +46,57 @@ def force_unlink(path):
         pass
 
 
-def receive_and_print_until_interrupted(s: socket.socket):
+class EndReason(enum.Enum):
+    DISCONNECTED = enum.auto()
+    EXITED = enum.auto()
+    ENDED_EARLY = enum.auto()
+    INTERRUPTED = enum.auto()
+
+
+def receive_and_print_until_interrupted(s: socket.socket) -> EndReason:
     print('Probes installed. Hit CTRL-C to end...', file=sys.stderr)
     try:
-        decode_and_print_forever(s)
-        print('Target disconnected.', file=sys.stderr)
+        outcome = decode_and_print_forever(s)
+        if outcome == tracer.DecodeEndReason.DISCONNECTED:
+            print('Target disconnected.', file=sys.stderr)
+            return EndReason.DISCONNECTED
+        elif outcome == tracer.DecodeEndReason.EXITED:
+            print('Target exited.', file=sys.stderr)
+            return EndReason.EXITED
+        elif outcome == tracer.DecodeEndReason.ENDED_EARLY:
+            return EndReason.ENDED_EARLY
+        else:
+            tracer.assert_never(outcome)
     except KeyboardInterrupt:
-        pass
-    print('Removing probes...', file=sys.stderr)
+        return EndReason.INTERRUPTED
+
+
+class PIDState(enum.Enum):
+    GONE = enum.auto()
+    STILL_THERE = enum.auto()
+
+
+def wait_till_gone(pid: int, timeout=1.0) -> PIDState:
+    # TODO: better would be to write some code in c to attach
+    # and reap the process / find out the exit code
+    start = time.monotonic()
+    sleep_time = 0.01
+    while time.monotonic() < start + timeout:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return PIDState.GONE
+        else:
+            time.sleep(sleep_time)
+            sleep_time *= 1.5
+    return PIDState.STILL_THERE
 
 
 def tracepid(pid: int, encoded_script: bytes):
-    os.kill(pid, 0)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        parser.error(f"no such process: {pid}")
 
     tracer.install_signal_handler()
 
@@ -74,16 +115,19 @@ def tracepid(pid: int, encoded_script: bytes):
             ),
         )
 
-        # TODO: this needs a timeout
+        ss.settimeout(1.0)
         s, _ = ss.accept()
         # TODO: verify the connected party is pid
         os.unlink(comms.localpath)
 
-        receive_and_print_until_interrupted(s)
-        pymontrace.attacher.attach_and_exec(
-            pid,
-            format_untrace_snippet(),
-        )
+        outcome = receive_and_print_until_interrupted(s)
+        if (outcome == EndReason.INTERRUPTED
+                or wait_till_gone(pid) == PIDState.STILL_THERE):
+            print('Removing probes...', file=sys.stderr)
+            pymontrace.attacher.attach_and_exec(
+                pid,
+                format_untrace_snippet(),
+            )
         decode_and_print_remaining(s)
 
 
@@ -92,13 +136,13 @@ def subprocess_entry(progpath, encoded_script: bytes):
     import time
     import shlex
 
-    from pymontrace.tracee import connect, settrace, unsettrace
+    from pymontrace.tracee import connect, settrace, unsettrace, remote
 
     sys.argv = shlex.split(progpath)
 
     comm_file = CommsFile(os.getpid()).remotepath
     while not os.path.exists(comm_file):
-        time.sleep(1)
+        time.sleep(0.1)
     connect(comm_file)
 
     # Avoid code between settrace and starting the target program
@@ -108,7 +152,7 @@ def subprocess_entry(progpath, encoded_script: bytes):
     except KeyboardInterrupt:
         pass
     finally:
-        unsettrace()
+        unsettrace(preclose=remote.notify_exit)
 
 
 def tracesubprocess(progpath: str, prog_text):

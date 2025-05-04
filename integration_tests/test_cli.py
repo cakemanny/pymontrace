@@ -17,6 +17,7 @@ def test_dash_c_mode():
     )
     p.check_returncode()
     assert b'a 1\na 2\na 3\n' in p.stdout
+    assert b'Traceback' not in p.stderr
 
 
 def test_func_probe():
@@ -34,3 +35,4 @@ def test_func_probe():
     )
     p.check_returncode()
     assert b'a 1\na 2\na 3\n' in p.stdout
+    assert b'Traceback' not in p.stderr

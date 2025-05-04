@@ -8,8 +8,46 @@
  */
 enum { MAX_THREADS = 16 };
 
+#define ATTACH_ERR_MSG  "Error occurred installing/uninstalling probes."
+#define UNKNOWN_STATE_ERR_MSG  \
+    (ATTACH_ERR_MSG " Target process may be in an unknown state.")
+
+// Module state
+typedef struct {
+    PyObject *AttachError_Type;
+    PyObject *UnknownStateError_Type;
+    PyObject *InterruptedError_Type;
+} attacher_state;
+
+
+static void
+set_python_error(PyObject *module, int err)
+{
+    attacher_state *state = PyModule_GetState(module);
+    if (state == NULL) {
+        // The calling code will return null for us
+        return;
+    }
+    PyObject* type;
+    char* msg;
+    switch (err) {
+        case ATT_UNKNOWN_STATE:
+            type = state->UnknownStateError_Type;
+            msg = UNKNOWN_STATE_ERR_MSG;
+            break;
+        case ATT_INTERRUPTED:
+            type = state->InterruptedError_Type;
+            msg = ATTACH_ERR_MSG;
+        default:
+            type = state->AttachError_Type;
+            msg = ATTACH_ERR_MSG;
+            break;
+    }
+    PyErr_SetString(type, msg);
+}
+
 static PyObject *
-attacher_attach_and_exec(PyObject *self, PyObject *args)
+attacher_attach_and_exec(PyObject *module, PyObject *args)
 {
     int pid;
     const char *command;
@@ -20,11 +58,7 @@ attacher_attach_and_exec(PyObject *self, PyObject *args)
     }
     err = attach_and_execute(pid, command);
     if (err != 0) {
-        char* msg = (err == ATT_UNKNOWN_STATE)
-            ? "Error occurred installing/uninstalling probes. "
-                "Target process may be in an unknown state."
-            : "Error occurred installing/uninstalling probes.";
-        PyErr_SetString(PyExc_RuntimeError, msg);
+        set_python_error(module, err);
         return NULL;
     }
 
@@ -62,7 +96,7 @@ convert_tids(PyObject *arg, uint64_t* tids)
 }
 
 static PyObject *
-attacher_exec_in_threads(PyObject *self, PyObject *args)
+attacher_exec_in_threads(PyObject *module, PyObject *args)
 {
     int pid;
     const char *command;
@@ -89,18 +123,13 @@ attacher_exec_in_threads(PyObject *self, PyObject *args)
 
     err = 0;
     if (err != 0) {
-        char* msg = (err == ATT_UNKNOWN_STATE)
-            ? "Error occurred installing/uninstalling probes. "
-                "Target process may be in an unknown state."
-            : "Error occurred installing/uninstalling probes.";
-        PyErr_SetString(PyExc_RuntimeError, msg);
-        return NULL;
+        set_python_error(module, err);
     }
 
     Py_RETURN_NONE;
 }
 
-static PyMethodDef AttacherMethods[] = {
+static PyMethodDef attacher_methods[] = {
     {"attach_and_exec",  attacher_attach_and_exec, METH_VARARGS,
      "attach_and_exec(pid: int, python_code: str)"},
     {"exec_in_threads",  attacher_exec_in_threads, METH_VARARGS,
@@ -109,21 +138,81 @@ static PyMethodDef AttacherMethods[] = {
 };
 
 
-static struct PyModuleDef attachermodule = {
-    PyModuleDef_HEAD_INIT,
-    "pymontrace.attacher",   /* name of module */
-    "\
+// The module itself
+
+PyDoc_STRVAR(module_doc, "\
 Platform specific code to attach to running python processes and execute\n\
 code to bootstrap pymontrace\n\
-", /* module documentation, may be NULL */
-    -1,       /* size of per-interpreter state of the module,
-                 or -1 if the module keeps state in global variables. */
-    AttacherMethods
+");
+
+static int
+attacher_modexec(PyObject *m)
+{
+    attacher_state *state = PyModule_GetState(m);
+
+#define ADD_EXC(MOD, NAME, VAR, BASE) do {                                    \
+    state->VAR = PyErr_NewException("pymontrace.attacher." NAME, BASE, NULL); \
+    if (state->VAR == NULL) {                                                 \
+        return -1;                                                            \
+    }                                                                         \
+    if (PyModule_AddType(m, (PyTypeObject*)state->VAR) < 0) {                 \
+        return -1;                                                            \
+    }                                                                         \
+} while (0)
+
+    ADD_EXC(m, "AttachError", AttachError_Type, NULL);
+    ADD_EXC(m, "UnknownStateError", UnknownStateError_Type, state->AttachError_Type);
+    ADD_EXC(m, "InterruptedError", InterruptedError_Type, state->AttachError_Type);
+
+#undef ADD_EXC
+
+
+    return 0;
+}
+
+static PyModuleDef_Slot attacher_slots[] = {
+    {Py_mod_exec, attacher_modexec},
+    {0, NULL}
+};
+
+static int
+attacher_traverse(PyObject *module, visitproc visit, void *arg)
+{
+    attacher_state *state = PyModule_GetState(module);
+    Py_VISIT(state->AttachError_Type);
+    Py_VISIT(state->UnknownStateError_Type);
+    Py_VISIT(state->InterruptedError_Type);
+    return 0;
+}
+
+static int
+attacher_clear(PyObject *module)
+{
+    attacher_state *state = PyModule_GetState(module);
+    Py_CLEAR(state->InterruptedError_Type);
+    Py_CLEAR(state->UnknownStateError_Type);
+    // We clear this one last because it's the base type
+    Py_CLEAR(state->AttachError_Type);
+    return 0;
+}
+
+static struct PyModuleDef attachermodule = {
+    PyModuleDef_HEAD_INIT,
+    .m_name = "pymontrace.attacher",
+    .m_doc = module_doc,
+    .m_size = sizeof(attacher_state),
+    .m_methods = attacher_methods,
+    .m_slots = attacher_slots,
+    .m_traverse = attacher_traverse,
+    .m_clear = attacher_clear,
+    /* m_free is not necessary here: xx_clear clears all references,
+     * and the module state is deallocated along with the module.
+     */
 };
 
 
 PyMODINIT_FUNC
 PyInit_attacher(void)
 {
-    return PyModule_Create(&attachermodule);
+    return PyModuleDef_Init(&attachermodule);
 }

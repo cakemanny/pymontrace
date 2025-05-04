@@ -1,3 +1,4 @@
+import enum
 import inspect
 import os
 import pathlib
@@ -13,8 +14,7 @@ from contextlib import contextmanager
 from tempfile import TemporaryDirectory
 from typing import NoReturn
 
-from pymontrace import _darwin
-from pymontrace import attacher
+from pymontrace import _darwin, attacher
 from pymontrace.tracee import PROBES_BY_NAME
 
 
@@ -377,6 +377,12 @@ def install_signal_handler():
         signal.signal(signo, signal_handler)
 
 
+class DecodeEndReason(enum.Enum):
+    DISCONNECTED = enum.auto()
+    EXITED = enum.auto()
+    ENDED_EARLY = enum.auto()
+
+
 def decode_and_print_forever(s: socket.socket, only_print=False):
     from pymontrace.tracee import Message
 
@@ -386,8 +392,9 @@ def decode_and_print_forever(s: socket.socket, only_print=False):
         while True:
             header = s.recv(header_fmt.size)
             if header == b'':
-                break
+                return DecodeEndReason.DISCONNECTED
             (kind, size) = header_fmt.unpack(header)
+            # FIXME: what would happen if we were interrupted at this point
             body = s.recv(size)
             if kind in (Message.PRINT, Message.ERROR,):
                 line = body
@@ -403,6 +410,10 @@ def decode_and_print_forever(s: socket.socket, only_print=False):
                 t = threading.Thread(target=settrace_in_threads,
                                      args=(pid, thread_ids), daemon=True)
                 t.start()
+            elif kind == Message.EXIT:
+                return DecodeEndReason.EXITED
+            elif kind == Message.END_EARLY:
+                return DecodeEndReason.ENDED_EARLY
             else:
                 print('unknown message kind:', kind, file=sys.stderr)
     finally:
