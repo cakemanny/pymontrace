@@ -1313,7 +1313,8 @@ attach_and_execute(const int pid, const char* python_code)
         } else if (eventlist[0].filter == EVFILT_PROC &&
                 (eventlist[0].fflags & NOTE_EXIT)) {
             if (eventlist[0].fflags & NOTE_EXITSTATUS) {
-                log_err("target exited: exit status %llu\n", eventlist[0].data);
+                log_err("target exited: exit status %u\n",
+                        WEXITSTATUS(eventlist[0].data));
             } else {
                 log_err("target exited: exit status unknown\n");
             }
@@ -1711,5 +1712,88 @@ out:
         thrds[i].running = 1;
     }
 
+    return err;
+}
+
+int
+reap_process(int pid, int timeout_ms, int *exitstatus, int* signum)
+{
+    enum reap_result err = 0;
+    assert(pid > 0);
+    assert(exitstatus != NULL);
+    assert(signum != NULL);
+    if (timeout_ms < 1) {
+        return REAP_BADARG;
+    }
+
+    int kq = kqueue();
+    if (-1 == kq) {
+        log_err("kqueue");
+        return REAP_FAIL;
+    }
+
+    struct kevent64_s changelist[] = {
+        {
+            .ident = pid,
+            .filter = EVFILT_PROC,
+            .flags = EV_ADD | EV_ENABLE,
+            .fflags = NOTE_EXIT | NOTE_EXITSTATUS,
+        },
+        {
+            .ident = 1,
+            .filter = EVFILT_TIMER,
+            .flags = EV_ADD | EV_ENABLE,
+            .fflags = 0, // No note means milliseconds
+            .data = timeout_ms,
+        },
+    };
+
+    int nevents = kevent64(kq, changelist, NELEMS(changelist), NULL, 0, 0, NULL);
+    if (-1 == nevents) {
+        if (errno == ESRCH) {
+            err = REAP_GONE;
+            goto out;
+        }
+        log_err("kevent64");
+        err = REAP_FAIL;
+        goto out;
+    }
+
+    struct kevent64_s event = {};
+    int num_events = kevent64(kq, NULL, 0, &event, 1, 0, NULL);
+    if (-1 == num_events) {
+        log_err("kevent64");
+        err = REAP_FAIL;
+        goto out;
+    }
+    if (0 == num_events) {
+        err = REAP_FAIL;
+        goto out;
+    }
+    switch (event.filter) {
+    case EVFILT_PROC:
+        if (event.fflags & (NOTE_EXIT | NOTE_EXITSTATUS)) {
+            if (WIFEXITED(event.data)) {
+                *exitstatus = WEXITSTATUS(event.data);
+                err = REAP_SUCCESS;
+            } else if (WIFSIGNALED(event.data)) {
+                *signum = WTERMSIG(event.data);
+                err = REAP_SIGNALLED;
+            } else {
+                log_err("bad exitstatus: 0x%llx\n", event.data);
+                err = REAP_FAIL;
+            }
+        } else {
+            log_err("bad note: 0x%x\n", event.fflags);
+            err = REAP_FAIL;
+        }
+        break;
+    case EVFILT_TIMER:
+        err = REAP_TIMEOUT;
+        break;
+    }
+
+out:
+    close(kq);
     return err;
 }

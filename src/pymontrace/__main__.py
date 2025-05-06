@@ -5,7 +5,6 @@ import os
 import socket
 import subprocess
 import sys
-import time
 
 import pymontrace.attacher
 from pymontrace import tracer
@@ -61,7 +60,6 @@ def receive_and_print_until_interrupted(s: socket.socket) -> EndReason:
             print('Target disconnected.', file=sys.stderr)
             return EndReason.DISCONNECTED
         elif outcome == tracer.DecodeEndReason.EXITED:
-            print('Target exited.', file=sys.stderr)
             return EndReason.EXITED
         elif outcome == tracer.DecodeEndReason.ENDED_EARLY:
             return EndReason.ENDED_EARLY
@@ -77,19 +75,19 @@ class PIDState(enum.Enum):
 
 
 def wait_till_gone(pid: int, timeout=1.0) -> PIDState:
-    # TODO: better would be to write some code in c to attach
-    # and reap the process / find out the exit code
-    start = time.monotonic()
-    sleep_time = 0.01
-    while time.monotonic() < start + timeout:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return PIDState.GONE
-        else:
-            time.sleep(sleep_time)
-            sleep_time *= 1.5
-    return PIDState.STILL_THERE
+    try:
+        exitstatus = pymontrace.attacher.reap_process(pid, int(timeout * 1000))
+        print(f'Target exited with status {exitstatus}.', file=sys.stderr)
+        return PIDState.GONE
+    except TimeoutError:
+        os.kill(pid, 0)  # A kind of assert
+        return PIDState.STILL_THERE
+    except ProcessLookupError:
+        return PIDState.GONE
+    except pymontrace.attacher.SignalledError as e:
+        signum, desc = e.args
+        print(f'Target killed by signal: {desc} ({signum})')
+        return PIDState.GONE
 
 
 def tracepid(pid: int, encoded_script: bytes):

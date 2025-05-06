@@ -15,6 +15,7 @@
 #include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/wait.h>
@@ -27,7 +28,14 @@
 #include <linux/elf.h>
 #include <sys/uio.h>
 
+// Ensure assertions are not compiled out.
+#ifdef NDEBUG
+#undef NDEBUG
 #include <assert.h>
+#define NDEBUG
+#else
+#include <assert.h>
+#endif
 
 #include "attacher.h"
 
@@ -486,9 +494,7 @@ wait_for_stop(pid_t pid, int signo, int* pwstatus)
         // TODO: timeout ?
         pid_t tid;
         if ((tid = waitpid(pid, pwstatus, 0)) == -1) {
-            int esaved = errno;
             log_err("waitpid: %d", pid);
-            errno = esaved;
             return -1;
         }
         if (pid > 0 && tid != pid) {
@@ -515,9 +521,7 @@ wait_for_stop(pid_t pid, int signo, int* pwstatus)
         }
         if (WIFSTOPPED(*pwstatus) && WSTOPSIG(*pwstatus) != signo) {
             if (ptrace(PTRACE_CONT, tid, 0, WSTOPSIG(*pwstatus)) == -1) {
-                int esaved = errno;
                 log_err("ptrace cont: %d", tid);
-                errno = esaved;
                 return -1;
             }
             continue;
@@ -1116,9 +1120,7 @@ get_user_regs(pid_t tid, struct user_regs_struct* user_regs)
 {
     struct iovec iov = {.iov_base = user_regs, .iov_len = sizeof *user_regs};
     if (-1 == ptrace(PTRACE_GETREGSET, tid, NT_PRSTATUS, &iov)) {
-        int esaved = errno;
         log_err("ptrace getregset: tid=%d", tid);
-        errno = esaved;
         return -1;
     }
     if (iov.iov_len != sizeof *user_regs) {
@@ -1133,9 +1135,7 @@ set_user_regs(pid_t tid, struct user_regs_struct* user_regs)
 {
     struct iovec iov = {.iov_base = user_regs, .iov_len = sizeof *user_regs};
     if (-1 == ptrace(PTRACE_SETREGSET, tid, NT_PRSTATUS, &iov)) {
-        int esaved = errno;
         log_err("ptrace setregset: tid=%d", tid);
-        errno = esaved;
         return -1;
     }
     return 0;
@@ -1768,7 +1768,6 @@ execute_in_threads(
     /* Actually we could use wait_for_stop, if it doesn't print anything */
     while (count_attached_threads(thrds, count_tids) > 0) {
         int status;
-        errno = 0;
         log_dbg("waiting for bp hit");
         pid_t tid = (tid = waitpid(-1, &status, 0));
         if (-1 == tid && errno != EINTR) {
@@ -1875,4 +1874,125 @@ out:
 
     return -1; /* not implemented */
 #endif /* __aarch64__ */
+}
+
+int
+reap_process(int pid, int timeout_ms, int* pstatus, int* psignum)
+{
+    if (pid < 0) {
+        return REAP_BADARG;
+    }
+    if (timeout_ms < 1) {
+        return REAP_BADARG;
+    }
+    if (pstatus == NULL || psignum == NULL) {
+        return REAP_BADARG;
+    }
+
+    int err = REAP_FAIL;
+
+    /* setup a parent child relationship to be able to await exit status */
+    if (-1 == ptrace(PTRACE_SEIZE, pid, 0, 0)) {
+        if (errno == ESRCH) {
+            return REAP_GONE;
+        }
+        log_err("ptrace seize: pid=%d", pid);
+        return REAP_FAIL;
+    }
+
+    struct sigaction on_alrm_saved = {};
+    struct sigaction on_alrm = {.sa_handler = &signal_handler};
+    g_got_signal = 0;
+    if (-1 == sigaction(SIGALRM, &on_alrm, &on_alrm_saved)) {
+        log_err("sigaction");
+        abort(); // programming error
+    }
+
+    struct itimerval timeout_timer = {
+        .it_value = {
+            .tv_sec = timeout_ms / 1000,
+            .tv_usec = (timeout_ms % 1000) * 1000,
+        },
+    };
+    struct itimerval oldvalue = {};
+    if (-1 == setitimer(ITIMER_REAL, &timeout_timer, &oldvalue)) {
+        log_err("setitimer");
+        err = REAP_FAIL;
+        goto detach;
+    }
+
+    for (;;) {
+        int status = 0;
+        if (-1 == waitpid(pid, &status, 0)) {
+            if (errno == EINTR) {
+                err = REAP_TIMEOUT;
+                goto detach;
+            }
+            log_err("waitpid: pid=%d", pid);
+            err = REAP_FAIL;
+            goto detach;
+        }
+        if (WIFEXITED(status)) {
+            *pstatus = WEXITSTATUS(status);
+            err = REAP_SUCCESS;
+            goto nodetach;
+        } else if (WIFSIGNALED(status)) {
+            *psignum = WTERMSIG(status);
+            err = REAP_SIGNALLED;
+            goto nodetach;
+        } else if (WIFSTOPPED(status)) {
+            int signum = WSTOPSIG(status);
+            log_dbg("WSTOPSIG(status) = %s (%d)", strsignal(signum), signum);
+            if (ptrace(PTRACE_CONT, pid, 0, signum) == -1) {
+                log_err("ptrace cont: pid=%d, signum=%d", pid, signum);
+                err = REAP_UNKNOWN;
+                goto detach;
+            }
+        } else {
+            log_err("unknown child stop reason, status = 0x%x\n", status);
+            assert(0 && "unknown child stop reason");
+            abort(); // in case assertions are compiled out;
+        }
+    }
+
+detach:
+    // Need to stop the main thread in order to detach (unless we exit).
+    if (-1 == ptrace(PTRACE_INTERRUPT, pid, 0, 0)) {
+        if (ESRCH == errno) {
+            err = REAP_GONE;
+            goto nodetach;
+        }
+        log_err("ptrace interrupt: pid=%d", pid);
+        err = REAP_UNKNOWN;
+        goto nodetach;
+    }
+    int wstatus = 0;
+    if (wait_for_stop(pid, SIGTRAP, &wstatus) == -1) {
+        if (WIFEXITED(wstatus)) {
+            err = REAP_SUCCESS;
+            *pstatus = WEXITSTATUS(wstatus);
+        } else if (WIFSIGNALED(wstatus)) {
+            err = REAP_SIGNALLED;
+            *psignum = WTERMSIG(wstatus);
+        } else {
+            err = REAP_UNKNOWN;
+        }
+        goto nodetach;
+    }
+    if (-1 == ptrace(PTRACE_DETACH, pid, 0, 0)) {
+        if (ESRCH == errno) {
+            err = REAP_GONE;
+        }
+        log_err("ptrace detach: pid=%d", pid);
+    }
+nodetach:
+    if (-1 == setitimer(ITIMER_REAL, &oldvalue, NULL)) {
+        log_err("setitimer oldvalue");
+    }
+    if (-1 == sigaction(SIGALRM, &on_alrm_saved, NULL)) {
+        log_err("sigaction restore");
+        abort();
+    }
+
+    return err;
 }
