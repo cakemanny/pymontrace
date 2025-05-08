@@ -332,54 +332,6 @@ out:
 }
 
 
-static uintptr_t
-find_libc_start(pid_t pid)
-{
-    uintptr_t libc_addr = 0;
-    char mapspath[PATH_MAX];
-    snprintf(mapspath, PATH_MAX, "/proc/%d/maps", pid);
-
-    FILE* f = fopen(mapspath, "r");
-    if (!f) {
-        log_err("fopen: %s", mapspath);
-        return 0;
-    }
-
-    size_t len = 0;
-    char* line = NULL;
-    while (getline(&line, &len, f) != -1) {
-        proc_map_t map;
-        if (parse_proc_map(line, &map) != 0) {
-            log_err("failed parsing a procmap line\n");
-            continue;
-        }
-        // We only care about code
-        if (!perms_has_exec(map) || map.pathname == NULL) {
-            continue;
-        }
-
-        char* bname = basename(map.pathname);
-
-        // consider libc.so.6 and also libc-2.31.so
-        if (!(strstr(bname, "libc.so")
-                    || (strcmp(bname, "libc-0") > 0
-                        // ':' is the ascii character after '9'
-                        && strcmp(bname, "libc-:") < 0))) {
-            continue;
-        }
-
-        assert(map.offset == 0);
-        // todo: check basename?
-        // check for dups?
-        libc_addr = map.addr_start;
-        break;
-    }
-
-    fclose(f);
-    return libc_addr;
-}
-
-
 static bool
 in_other_mount_ns(pid_t pid)
 {
@@ -1490,20 +1442,23 @@ static int
 exec_python_code(pid_t pid, pid_t tid, const char* python_code)
 {
     int err;
-    // There is a build-id at the start of glibc that we can overwrite
-    // temporarily (idea from the readme of kubo/injector)
-    uintptr_t libc_start_addr = find_libc_start(pid);
-    if (libc_start_addr == 0) {
-        log_err("could not find libc\n");
+    /*
+     * We make a sensible assumption that Py_Main, which is called immediately
+     * in main and only on Windows, will not be called by some thread or some
+     * fork during the injection.
+     */
+    uintptr_t pymain_start_addr = find_pyfn(pid, "Py_Main");
+    if (pymain_start_addr == 0) {
+        log_err("could not find Py_Main\n");
         return ATT_FAIL;
     }
-    log_dbg("libc_start_addr = %lx", libc_start_addr);
+    log_dbg("pymain_start_addr = %lx", pymain_start_addr);
 
 
     // This is the point at which we can start to do our work.
     uintptr_t mapped_addr = 0;
     size_t length = sysconf(_SC_PAGESIZE);
-    if ((err = call_mmap_in_target(pid, tid, libc_start_addr, length,
+    if ((err = call_mmap_in_target(pid, tid, pymain_start_addr, length,
                     &mapped_addr)) != 0) {
         log_err("call_mmap_in_target failed");
         return err;
@@ -1516,13 +1471,13 @@ exec_python_code(pid_t pid, pid_t tid, const char* python_code)
         goto out;
     }
 
-    if ((err = call_pyrun_simplestring(pid, tid, libc_start_addr, mapped_addr))
+    if ((err = call_pyrun_simplestring(pid, tid, pymain_start_addr, mapped_addr))
             != 0) {
         goto out;
     }
 
 out:
-    if (call_munmap_in_target(pid, tid, libc_start_addr, mapped_addr, length)
+    if (call_munmap_in_target(pid, tid, pymain_start_addr, mapped_addr, length)
             != 0) {
         // This is non-fatal.
     }
