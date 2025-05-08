@@ -24,6 +24,9 @@ enum reap_result {
     REAP_SIGNALLED,
 };
 
+/* The return type here is int rather than enum reap_result to avoid giving
+   false impressions that the compiler will prevent us returning something
+   not in that enum. */
 int reap_process(int pid, int timeout_ms, int *exitstatus, int* signum);
 
 #endif /* ATTACHER_H */

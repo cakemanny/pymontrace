@@ -41,7 +41,9 @@ In priority order:
 
 - [o] our own signal handlers, to be able to sneak out maps as the program
       is about to end...?
-      (We have added an atexit handler - that's)
+      (We have added an atexit handler - that's half of it)
+      (though to get maps after signal its better to just have persisted that
+       assuming the file continue to exist)
 - [ ] Support FreeBSD + jails , Illumos + zones, ...
 - [ ] musl support on Linux ...
 - [ ] Rewrite the C code in Rust?

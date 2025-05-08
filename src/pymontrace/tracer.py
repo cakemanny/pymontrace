@@ -232,28 +232,31 @@ def to_remote_path(pid: int, path):
 
 def format_bootstrap_snippet(encoded_script: bytes, comm_file, site_extension):
 
-    import_snippet = textwrap.dedent(
-        """
-        import sys
-        try:
-            import pymontrace.tracee
-        except Exception:
-            sys.path.append('{0}')
+    # Running settrace in a nested function does two things
+    #  1. it keeps the locals dictionary clean in the injection site
+    #  2. it fixes a bug that means that the top level of an interactive
+    #  session could not be traced.
+    return textwrap.dedent(
+        f"""
+        def _pymontrace_bootstrap():
+            import sys
+            do_unload = 'pymontrace.tracee' not in sys.modules
             try:
                 import pymontrace.tracee
-            finally:
-                sys.path.remove('{0}')
-        """
-    ).format(site_extension)
-
-    settrace_snippet = textwrap.dedent(
-        f"""
-        pymontrace.tracee.connect({comm_file!r})
-        pymontrace.tracee.settrace({encoded_script!r})
+                pymontrace.tracee.do_unload = do_unload
+            except Exception:
+                sys.path.append('{site_extension}')
+                try:
+                    import pymontrace.tracee
+                    pymontrace.tracee.do_unload = do_unload
+                finally:
+                    sys.path.remove('{site_extension}')
+            pymontrace.tracee.connect({comm_file!r})
+            pymontrace.tracee.settrace({encoded_script!r})
+        _pymontrace_bootstrap()
+        del _pymontrace_bootstrap
         """
     )
-
-    return '\n'.join([import_snippet, settrace_snippet])
 
 
 def format_additional_thread_snippet():
@@ -262,6 +265,7 @@ def format_additional_thread_snippet():
         try:
             import pymontrace.tracee
             pymontrace.tracee.synctrace()
+            del pymontrace
         except Exception:
             pass
         """
@@ -269,7 +273,16 @@ def format_additional_thread_snippet():
 
 
 def format_untrace_snippet():
-    return 'import pymontrace.tracee; pymontrace.tracee.unsettrace()'
+    return textwrap.dedent(
+        """
+        import pymontrace.tracee
+        pymontrace.tracee.unsettrace()
+        if getattr(pymontrace.tracee, 'do_unload', False):
+            del __import__('sys').modules['pymontrace.tracee']
+            del __import__('sys').modules['pymontrace']
+        del pymontrace
+        """
+    )
 
 
 class CommsFile:

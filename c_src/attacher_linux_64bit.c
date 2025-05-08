@@ -1583,7 +1583,12 @@ attach_and_execute(const int pid, const char* python_code)
 {
     int err = 0;
 
-    // TODO: check python_code size < page size
+    long pagesize = sysconf(_SC_PAGESIZE);
+    assert(pagesize > 1);
+    if (strlen(python_code) + 1 > (size_t)pagesize) {
+        log_err("python code exceeds max size: %lu\n", (size_t)pagesize - 1);
+        return ATT_FAIL;
+    }
 
     uintptr_t breakpoint_addr = find_pyfn(pid, SAFE_POINT);
     if (breakpoint_addr == 0) {
