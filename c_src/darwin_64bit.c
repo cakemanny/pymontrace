@@ -19,8 +19,14 @@
 #include <signal.h>
 #include <unistd.h>
 
-
+// Ensure assertions are not compiled out.
+#ifdef NDEBUG
+#undef NDEBUG
 #include <assert.h>
+#define NDEBUG
+#else
+#include <assert.h>
+#endif
 
 #include "attacher.h"
 
