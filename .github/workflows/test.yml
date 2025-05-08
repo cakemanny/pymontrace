@@ -106,10 +106,13 @@ jobs:
         fi
         # Linux
         test -d /proc && cat /proc/sys/kernel/core_pattern
-        if [ -f core ]; then
-          gdb --batch -ex 'backtrace' "$( which python${{ matrix.python-version }} )" core
-        fi
         if [ -d /var/lib/systemd/coredump/ ]; then
           find /var/lib/systemd/coredump/ -type f
-          coredumpctl list && coredumpctl -1 info
+          coredumpctl list && coredumpctl -1 info && coredumpctl -1 dump --output=core
+        fi
+        if [ -f core ]; then
+            echo "::group::Install gdb"
+            sudo apt-get update && sudo apt-get install -y gdb
+            echo "::endgroup::"
+          gdb --batch -ex 'backtrace' "$( which python${{ matrix.python-version }} )" core
         fi
