@@ -46,19 +46,24 @@ jobs:
       run: |
         brew uninstall -f --ignore-dependencies python@${{ matrix.python-version }}
         brew install --overwrite python@${{ matrix.python-version }}
+    - name: Install the latest version of uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        version: "latest"
     - name: Print Versions
       run: |
         uname -a
         python${{ matrix.python-version }} -VV
         file "$( which python${{ matrix.python-version }} )"
+        uv --version
     - name: Create virtualenv
       run: |
         python${{ matrix.python-version }} -m venv .venv
+
     - name: Install dependencies
       run: |
         source .venv/bin/activate
-        python3 -m pip install --upgrade pip
-        python3 -m pip install -e '.[test]' pyright
+        uv pip install -e '.[test]' pyright
     - name: Lint with flake8
       run: |
         source .venv/bin/activate
@@ -85,12 +90,26 @@ jobs:
         else
           pytest integration_tests
         fi
+
+    - if: ${{ env.ACT == 'true' }}
+      name: Install gdb and systemd-coredump
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gdb systemd-coredump
+
     - name: Check for core files
       if: always()
       run: |
+        # macOS
         if [ -d /cores/ ]; then
           find /cores -type f -print0 | xargs -0 -r lldb --batch -o 'backtrace' -c
         fi
+        # Linux
+        test -d /proc && cat /proc/sys/kernel/core_pattern
         if [ -f core ]; then
           gdb --batch -ex 'backtrace' "$( which python${{ matrix.python-version }} )" core
+        fi
+        if [ -d /var/lib/systemd/coredump/ ]; then
+          find /var/lib/systemd/coredump/ -type f
+          coredumpctl list && coredumpctl -1 info
         fi
