@@ -95,7 +95,7 @@ jobs:
       name: Install gdb and systemd-coredump
       run: |
         sudo apt-get update
-        sudo apt-get install -y gdb systemd-coredump
+        sudo apt-get install -y systemd-coredump
 
     - name: Check for core files
       if: always()
@@ -108,11 +108,19 @@ jobs:
         test -d /proc && cat /proc/sys/kernel/core_pattern
         if [ -d /var/lib/systemd/coredump/ ]; then
           find /var/lib/systemd/coredump/ -type f
-          coredumpctl list && coredumpctl -1 info && coredumpctl -1 dump --output=core
+          if coredumpctl list; then
+            coredumpctl -1 info
+            [ "$RUNNER_DEBUG" = "1" ] && coredumpctl -1 dump --output=core
+          fi
         fi
         if [ -f core ]; then
+          if [ "$RUNNER_DEBUG" = "1" ]; then
             echo "::group::Install gdb"
             sudo apt-get update && sudo apt-get install -y gdb
             echo "::endgroup::"
-          gdb --batch -ex 'backtrace' "$( which python${{ matrix.python-version }} )" core
+            gdb --batch -ex 'backtrace' "$( which python${{ matrix.python-version }} )" core
+          else
+            echo "$(tput setaf 6)Rerun the workflow with debugging enabled" \
+                 "to dump the stacktrace with gdb $(tput sgr0)"
+          fi
         fi
