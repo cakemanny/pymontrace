@@ -199,6 +199,38 @@ def test_program_dies_during_attach():
     assert str(exc.value) == 'Error occurred installing/uninstalling probes.'
 
 
+def test_program_forks_during_attach():
+    from pymontrace import attacher
+
+    program = textwrap.dedent(
+        """
+        import os, time, signal, sys
+        os.write(1, b'started\\n')
+        time.sleep(0.1)
+        if os.fork() == 0:
+            print("hi")
+            time.sleep(0.1)  # child dies here before fix
+            print("child")
+        else:
+            print("ho")
+            time.sleep(0.1)  # breakpoint tends to hit here
+            print("parent")
+            child, wstatus = os.wait()
+            exit_code = os.waitstatus_to_exitcode(wstatus)
+            sys.exit(exit_code)
+        """
+    )
+
+    p = subprocess.Popen(
+        [sys.executable, '-u', '-c', program], stdout=subprocess.PIPE,
+    )
+    wait_for_started(p)
+
+    attacher.attach_and_exec(p.pid, 'print("hello")')
+
+    assert p.wait(timeout=0.5) == 0
+
+
 def test_exec_in_threads():
     # TODO: exclude riscv
 
