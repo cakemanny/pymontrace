@@ -443,7 +443,6 @@ wait_for_stop(pid_t pid, int signo, int* pwstatus)
         pwstatus = &wstatus;
     }
     for (;;) {
-        // TODO: timeout ?
         pid_t tid;
         if ((tid = waitpid(pid, pwstatus, 0)) == -1) {
             log_err("waitpid: %d", pid);
@@ -487,6 +486,16 @@ continue_sgl_thread(pid_t tid)
 {
     if (ptrace(PTRACE_CONT, tid, 0, 0) == -1) {
         log_err("ptrace cont: tid=%d", tid);
+        return -1;
+    }
+    return 0;
+}
+
+static int
+detach_sgl_thread(pid_t tid)
+{
+    if (-1 == ptrace(PTRACE_DETACH, tid, 0, 0)) {
+        log_err("ptrace detach: tid=%d", tid);
         return -1;
     }
     return 0;
@@ -552,7 +561,10 @@ attach_threads(struct tgt_thrd* thrds, int count)
     int i = 0;
     for (; i < count; i++) {
         __auto_type t = &thrds[i];
-        if ((err = ptrace(PTRACE_SEIZE, t->tid, 0, 0)) == -1) {
+        if ((err = ptrace(PTRACE_SEIZE, t->tid, 0,
+                        // TODO: Should these really be set when attaching
+                        // to specific threads?
+                        PTRACE_O_TRACEFORK | PTRACE_O_TRACECLONE)) == -1) {
             log_err("ptrace attach: tid=%d", t->tid);
             goto error;
         }
@@ -1596,38 +1608,112 @@ attach_and_execute(const int pid, const char* python_code)
         goto detach;
     }
 
-    pid_t tid;
-    if ((tid = wait_for_stop(-1, SIGTRAP, NULL)) == -1) {
-        // If this gets interrupted (EINTR), it means the user is impatient.
-        // We would be better to remove the trap instruction before leaving.
-        fprintf(stderr, "Cancelling...\n");
+    pid_t tid = 0;
+    for (;;) {
+        int wstatus;
+        if ((tid = wait_for_stop(-1, SIGTRAP, &wstatus)) == -1) {
+            // If this gets interrupted (EINTR), it means the user is impatient.
+            // We would be better to remove the trap instruction before leaving.
+            fprintf(stderr, "Cancelling...\n");
 
-        if ((err = interrupt_threads(thrds, nthreads)) != 0) {
-            goto detach;
-        }
+            if ((err = interrupt_threads(thrds, nthreads)) != 0) {
+                goto detach;
+            }
 
-        // Check if target no longer exists. In reality this could be for
-        // both expected and unexpected reasons.
-        if (kill(pid, 0) == -1 && errno == ESRCH) {
+            // Check if target no longer exists. In reality this could be for
+            // both expected and unexpected reasons.
+            if (kill(pid, 0) == -1 && errno == ESRCH) {
+                err = ATT_INTERRUPTED;
+                goto detach;
+            }
+
+            if (-1 == restore_instrs(pid, &saved_instrs)) {
+                err = ATT_UNKNOWN_STATE;
+                goto detach;
+            }
+            log_err("cancelled.\n");
             err = ATT_INTERRUPTED;
             goto detach;
         }
+        #define SET_RUNNING(_tid, _running) do { \
+            for (int i = 0; i < nthreads; i++) { \
+                if (thrds[i].tid == (_tid)) { \
+                    thrds[i].running = (_running); \
+                } \
+            } \
+        } while (0)
+        SET_RUNNING(tid, 0);
 
-        if (-1 == restore_instrs(pid, &saved_instrs)) {
+        if ((wstatus >> 8) == ((PTRACE_EVENT_FORK << 8) | SIGTRAP)) {
+
+            // The target has called fork. Our job is remove the patched
+            // instructions from the new child's address space and detach from
+            // it.
+
+            unsigned long event_data = 0;
+            if (-1 == ptrace(PTRACE_GETEVENTMSG, tid, 0, &event_data)) {
+                log_err("ptrace geteventmsg: tid=%d", tid);
+                err = ATT_UNKNOWN_STATE;
+                goto detach;
+            }
+            assert(event_data > 0 && event_data < INT_MAX);
+            pid_t child_tid = event_data;
+
             err = ATT_UNKNOWN_STATE;
+            if (-1 == wait_for_stop(child_tid, SIGTRAP, NULL)) {
+                goto cancel_no_overwrite;
+            }
+            if (-1 == restore_instrs(child_tid, &saved_instrs)) {
+                goto cancel_no_overwrite;
+            }
+            if (-1 == detach_sgl_thread(child_tid)) {
+                goto cancel_no_overwrite;
+            }
+            err = 0;
+            log_dbg("saved child: pid/tid=%d", child_tid);
+
+            // This wasn't th breakpoint, so we continue the stopped target
+            // thread.
+            if (-1 == continue_sgl_thread(tid)) {
+                err = ATT_UNKNOWN_STATE;
+                goto cancel_no_overwrite;
+            }
+            SET_RUNNING(tid, 1);
+            continue;
+        }
+        if ((wstatus >> 8) == ((PTRACE_EVENT_CLONE << 8) | SIGTRAP)) {
+
+            // This can mean a lot of things. Maybe the target has created a
+            // new thread or perhaps it could be creating a new process with
+            // some fancy options like a new pid namespace. In either case
+            // the safest action is to restore instructions in the clone and
+            // also in the target.
+
+            log_err("target called clone(2) - this is not currently handled");
+            abort();
+        }
+        break;
+
+cancel_no_overwrite:
+        // Cancel without overwriting err.
+        if (interrupt_threads(thrds, nthreads) != 0) {
             goto detach;
         }
-        log_err("cancelled.\n");
-        err = ATT_INTERRUPTED;
+        (void)restore_instrs(pid, &saved_instrs);
+        goto detach;
+
+        goto cancel_overwrite; /* UNUSED */
+cancel_overwrite:
+        // Cancel and overwrite err
+        if ((err = interrupt_threads(thrds, nthreads)) != 0) {
+            goto detach;
+        }
+        if (-1 == restore_instrs(pid, &saved_instrs)) {
+            err = ATT_UNKNOWN_STATE;
+        }
         goto detach;
     }
     log_dbg("have a target thread at breakpoint: tid=%d", tid);
-
-    for (int i = 0; i < nthreads; i++) {
-        if (thrds[i].tid == tid) {
-            thrds[i].running = 0;
-        }
-    }
 
     // TODO: we should check the PC that it's at (or just after) the
     // breakpoint.
