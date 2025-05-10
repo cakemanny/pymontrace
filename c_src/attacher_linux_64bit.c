@@ -433,6 +433,9 @@ find_pyfn(pid_t pid, const char* symbol)
     return find_symbol(pid, symbol, "python");
 }
 
+#define is_ptrace_event(_wstatus, _event) \
+    (((_wstatus) >> 8) == ((( _event) << 8) | SIGTRAP))
+
 
 /* returns -1 on error */
 static pid_t
@@ -631,7 +634,7 @@ interrupt_threads(struct tgt_thrd* thrds, int nthreads)
     int err = 0;
     for (int i = 0; i < nthreads; i++) {
         __auto_type t = &thrds[i];
-        if (!t->attached) {
+        if (!t->attached || !t->running) {
             continue; // should only be exited threads.
         }
         if (ptrace(PTRACE_INTERRUPT, t->tid, 0, 0) == -1) {
@@ -654,7 +657,8 @@ interrupt_threads(struct tgt_thrd* thrds, int nthreads)
                 return ATT_UNKNOWN_STATE;
             }
         }
-        if ((t->wstatus >> 8) != ((PTRACE_EVENT_STOP << 8) | SIGTRAP)) {
+        t->running = 0;
+        if (!is_ptrace_event(t->wstatus, PTRACE_EVENT_STOP)) {
             // TODO: this might be our breakpoint and not the event-stop.
             // If on x86, we may need to roll back the instruction pointer
             // a byte.
@@ -812,7 +816,7 @@ save_instrs(pid_t tid, saved_instrs_t* psaved)
 }
 
 static int
-restore_instrs(pid_t tid, saved_instrs_t* psaved)
+restore_instrs(pid_t tid, const saved_instrs_t* psaved)
 {
     if (-1 == ptrace(PTRACE_POKETEXT, tid, psaved->addr, psaved->instrs.u64)) {
         log_err("restore_instrs: ptrace poketext: tid=%d", tid);
@@ -1496,6 +1500,36 @@ out:
     return err;
 }
 
+enum {
+    SAVE_STOPWAIT,
+    SAVE_NOSTOPWAIT,
+};
+
+static int
+save_fork_clone_child(pid_t parent_tid, saved_instrs_t saved_instrs, int stop)
+{
+    unsigned long event_data = 0;
+    if (-1 == ptrace(PTRACE_GETEVENTMSG, parent_tid, 0, &event_data)) {
+        log_err("ptrace geteventmsg: tid=%d", parent_tid);
+        return ATT_UNKNOWN_STATE;
+    }
+    assert(event_data > 0 && event_data < INT_MAX);
+    pid_t child_tid = event_data;
+
+    if (stop == SAVE_STOPWAIT &&
+            -1 == wait_for_stop(child_tid, SIGTRAP, NULL)) {
+        return ATT_UNKNOWN_STATE;
+    }
+    if (-1 == restore_instrs(child_tid, &saved_instrs)) {
+        return ATT_UNKNOWN_STATE;
+    }
+    if (-1 == detach_sgl_thread(child_tid)) {
+        return ATT_UNKNOWN_STATE;
+    }
+    log_dbg("saved child: pid/tid=%d", child_tid);
+    return 0;
+}
+
 // we should not do this, it's re-entrant ...
 static volatile sig_atomic_t g_got_signal;
 static void
@@ -1544,6 +1578,8 @@ remove_signal_handler(saved_sigaction_t* oldactions)
         }
     }
 }
+
+
 
 int
 attach_and_execute(const int pid, const char* python_code)
@@ -1635,53 +1671,74 @@ attach_and_execute(const int pid, const char* python_code)
             err = ATT_INTERRUPTED;
             goto detach;
         }
-        #define SET_RUNNING(_tid, _running) do { \
-            for (int i = 0; i < nthreads; i++) { \
-                if (thrds[i].tid == (_tid)) { \
-                    thrds[i].running = (_running); \
-                } \
-            } \
-        } while (0)
-        SET_RUNNING(tid, 0);
+        struct tgt_thrd* t = find_thread(thrds, nthreads, tid);
+        if (t == NULL) {
+            // TODO: find a way to rewrite this to deal with having multiple
+            // expected events. (ideas: keep an expected events list, or...)
 
-        if ((wstatus >> 8) == ((PTRACE_EVENT_FORK << 8) | SIGTRAP)) {
+            // This could mean that we are processing the PTRACE_EVENT_STOP
+            // of a new child before seeing the fork/clone event in the parent
+            assert(is_ptrace_event(wstatus, PTRACE_EVENT_STOP));
+            log_dbg("assuming fork/clone child: tid=%d", tid);
+
+            // We should get the fork event next but there is no guarantee
+            // if there are more multiple threads. I'm not able to think
+            // of a guaranteed way to get the tid of the thread that might
+            // have called fork/clone.
+            int next_tid;
+            int next_status;
+            if ((next_tid = wait_for_stop(-1, SIGTRAP, &next_status)) == -1) {
+                err = ATT_UNKNOWN_STATE;
+                goto detach;
+            }
+            if (!is_ptrace_event(next_status, PTRACE_EVENT_FORK)
+                    && !is_ptrace_event(next_status, PTRACE_EVENT_CLONE)) {
+                log_err("before-unseen thread hit and next event was not "
+                        "fork or clone: tid=%d, next_tid=%d\n", tid, next_tid);
+                err = ATT_UNKNOWN_STATE;
+                goto detach;
+            }
+            t = find_thread(thrds, nthreads, next_tid);
+            assert(t != NULL); // we must have known about the forker
+            t->running = 0;
+            // The child already stopped so we don't need to wait for that
+            if ((err = save_fork_clone_child(next_tid, saved_instrs,
+                            SAVE_NOSTOPWAIT)) != 0) {
+                goto cancel_no_overwrite;
+            }
+            if (is_ptrace_event(next_status, PTRACE_EVENT_CLONE)) {
+                log_err("target called clone(2) - cancelling\n");
+                err = ATT_FAIL;
+                goto cancel_overwrite;
+            } else {
+                assert(is_ptrace_event(next_status, PTRACE_EVENT_FORK));
+                if ((err = continue_threads(t, 1)) != 0) {
+                    goto cancel_no_overwrite;
+                }
+                continue;
+            }
+        }
+        t->running = 0;
+
+        if (is_ptrace_event(wstatus, PTRACE_EVENT_FORK)) {
 
             // The target has called fork. Our job is remove the patched
             // instructions from the new child's address space and detach from
             // it.
 
-            unsigned long event_data = 0;
-            if (-1 == ptrace(PTRACE_GETEVENTMSG, tid, 0, &event_data)) {
-                log_err("ptrace geteventmsg: tid=%d", tid);
-                err = ATT_UNKNOWN_STATE;
-                goto detach;
+            if ((err = save_fork_clone_child(tid, saved_instrs,
+                            SAVE_STOPWAIT)) != 0) {
+                goto cancel_no_overwrite;
             }
-            assert(event_data > 0 && event_data < INT_MAX);
-            pid_t child_tid = event_data;
 
-            err = ATT_UNKNOWN_STATE;
-            if (-1 == wait_for_stop(child_tid, SIGTRAP, NULL)) {
-                goto cancel_no_overwrite;
-            }
-            if (-1 == restore_instrs(child_tid, &saved_instrs)) {
-                goto cancel_no_overwrite;
-            }
-            if (-1 == detach_sgl_thread(child_tid)) {
-                goto cancel_no_overwrite;
-            }
-            err = 0;
-            log_dbg("saved child: pid/tid=%d", child_tid);
-
-            // This wasn't th breakpoint, so we continue the stopped target
+            // This wasn't the breakpoint, so we continue the stopped target
             // thread.
-            if (-1 == continue_sgl_thread(tid)) {
-                err = ATT_UNKNOWN_STATE;
+            if ((err = continue_threads(t, 1)) != 0) {
                 goto cancel_no_overwrite;
             }
-            SET_RUNNING(tid, 1);
             continue;
         }
-        if ((wstatus >> 8) == ((PTRACE_EVENT_CLONE << 8) | SIGTRAP)) {
+        if (is_ptrace_event(wstatus, PTRACE_EVENT_CLONE)) {
 
             // This can mean a lot of things. Maybe the target has created a
             // new thread or perhaps it could be creating a new process with
@@ -1689,12 +1746,21 @@ attach_and_execute(const int pid, const char* python_code)
             // the safest action is to restore instructions in the clone and
             // also in the target.
 
-            log_err("target called clone(2) - this is not currently handled");
+            log_err("target called clone(2) - cancelling\n");
+            if ((err = save_fork_clone_child(tid, saved_instrs,
+                            SAVE_STOPWAIT)) != 0) {
+                goto cancel_no_overwrite;
+            }
+            err = ATT_FAIL;
+            goto cancel_overwrite;
+        }
+        if (is_ptrace_event(wstatus, PTRACE_EVENT_STOP)) {
+            log_err("fatal: expected normal sigtrap\n");
             abort();
         }
         break;
 
-cancel_no_overwrite:
+    cancel_no_overwrite:
         // Cancel without overwriting err.
         if (interrupt_threads(thrds, nthreads) != 0) {
             goto detach;
@@ -1702,10 +1768,10 @@ cancel_no_overwrite:
         (void)restore_instrs(pid, &saved_instrs);
         goto detach;
 
-        goto cancel_overwrite; /* UNUSED */
-cancel_overwrite:
-        // Cancel and overwrite err
-        if ((err = interrupt_threads(thrds, nthreads)) != 0) {
+    cancel_overwrite:
+        // Cancel and overwrite err if a new one happens.
+        if (interrupt_threads(thrds, nthreads) != 0) {
+            err = ATT_UNKNOWN_STATE;
             goto detach;
         }
         if (-1 == restore_instrs(pid, &saved_instrs)) {
@@ -1743,18 +1809,11 @@ cancel_overwrite:
     }
 
     // stop the running threads so that they can be detached
-    for (int i = 0; i < nthreads; i++) {
-        __auto_type t = &thrds[i];
-        if (!t->attached || !t->running) {
-            // thread may have exited or it's the one one we exec'd code in
-            continue;
-        }
-        int err2 = interrupt_threads(t, 1);
+    {
+        int err2 = interrupt_threads(thrds, nthreads);
         if (err2 != 0) {
             err = err2;
-            continue;
         }
-        t->running = 0;
     }
 
 detach:
