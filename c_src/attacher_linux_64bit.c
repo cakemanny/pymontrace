@@ -555,19 +555,24 @@ get_threads(pid_t pid, struct tgt_thrd* thrd, int *numthrds)
     return 0;
 }
 
+enum {
+    ATTACH_NOFOLLOW = 0,
+    ATTACH_FOLLOW,
+};
 
 static int
-attach_threads(struct tgt_thrd* thrds, int count)
+attach_threads(struct tgt_thrd* thrds, int count, int opts)
 {
     int err = 0;
+
+    uintptr_t pt_opts = opts == ATTACH_FOLLOW
+        ? PTRACE_O_TRACEFORK | PTRACE_O_TRACECLONE
+        : 0;
 
     int i = 0;
     for (; i < count; i++) {
         __auto_type t = &thrds[i];
-        if ((err = ptrace(PTRACE_SEIZE, t->tid, 0,
-                        // TODO: Should these really be set when attaching
-                        // to specific threads?
-                        PTRACE_O_TRACEFORK | PTRACE_O_TRACECLONE)) == -1) {
+        if ((err = ptrace(PTRACE_SEIZE, t->tid, 0, pt_opts)) == -1) {
             log_err("ptrace attach: tid=%d", t->tid);
             goto error;
         }
@@ -763,7 +768,7 @@ attach_all_threads(
             err = ATT_FAIL;
             goto error;
         }
-        err = attach_threads(thrds, nthreads);
+        err = attach_threads(thrds, nthreads, ATTACH_FOLLOW);
         if (err != 0) {
             goto error;
         }
@@ -1848,7 +1853,7 @@ execute_in_threads(
     }
 
     // TODO: maybe we need to tolerate not all threads still being there.
-    if ((err = attach_threads(thrds, count_tids)) != 0) {
+    if ((err = attach_threads(thrds, count_tids, 0)) != 0) {
         return err;
     }
     log_dbg("attached to %d threads", count_tids);
