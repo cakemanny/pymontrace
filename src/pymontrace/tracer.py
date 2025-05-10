@@ -403,11 +403,14 @@ def decode_and_print_forever(s: socket.socket, only_print=False):
     try:
         header_fmt = struct.Struct('=HH')
         while True:
+            # FIXME: we should use a selector that selects on this socket
+            # being ready vs a signal having arrived and then ensure that
+            # we don't read half a message before raising. See bottom
+            # of signal module docs online.
             header = s.recv(header_fmt.size)
             if header == b'':
                 return DecodeEndReason.DISCONNECTED
             (kind, size) = header_fmt.unpack(header)
-            # FIXME: what would happen if we were interrupted at this point
             body = s.recv(size)
             if kind in (Message.PRINT, Message.ERROR,):
                 line = body
