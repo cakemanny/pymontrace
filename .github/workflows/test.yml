@@ -2,7 +2,7 @@ name: Test
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "*" ]
   pull_request:
     branches: [ "master" ]
 
@@ -18,13 +18,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
         runner: ["macos-13", "macos-latest", "ubuntu-latest"]
         include:
-          # pymontrace doesn' work on macOS with the python3.13 that brew
-          # installs. (nor is 3.13 on macos-13 as at writing).
-          - python-version: "3.13"
-            runner: "ubuntu-latest"
+          # pymontrace seems to hang attaching to Python 3.13 on the arm runner
+          # so we just test a couple of versions for now.
+          - python-version: "3.9"
+            runner: "ubuntu-24.04-arm"
+          - python-version: "3.12"
+            runner: "ubuntu-24.04-arm"
 
     runs-on: ${{ matrix.runner }}
 
@@ -73,6 +75,7 @@ jobs:
         source .venv/bin/activate
         pyright src
     - name: Test with pytest
+      timeout-minutes: 1
       run: |
         source .venv/bin/activate
         ulimit -c unlimited

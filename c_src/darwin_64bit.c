@@ -38,10 +38,30 @@ const bool debug = false;
 
 #define NELEMS(A) ((sizeof A) / sizeof A[0])
 
-// this does not seem to be called as often as I'd hoped
-// maybe drop_gil is better...
-//#define SAFE_POINT "PyErr_CheckSignals"
-#define SAFE_POINT  "PyEval_SaveThread"
+/*
+ * Since we use hardware breakpoints, there is a maximum of six on x86 chips.
+ * But on Linux only 4 of those are available for userspace so we use that
+ * limit to make it easier to match functionaliy.
+ * macOS doesn't expose the number of aarch64 debug registers to userspace
+ * but in Linux the limit on my M1 is 6.
+ */
+#define MAX_SAFEPOINTS  4
+const char* safepoints[MAX_SAFEPOINTS] = {
+    /*
+     * PyEval_SaveThread should be safe as it is called when the thread
+     * is done with the python interpreter and wants to release the GIL.
+     */
+    "PyEval_SaveThread",
+    /*
+     * This one is more experimental.
+     * According to https://peps.python.org/pep-0578/ PySys_Audit should be
+     * called when the GIL is held.
+     */
+    "PySys_Audit",
+
+    NULL,
+    NULL,
+};
 
 
 typedef struct {
@@ -74,7 +94,7 @@ static __thread struct state_slot {
 
 
 struct pyfn_addrs {
-    vm_address_t breakpoint_addr;
+    vm_address_t breakpoint_addrs[MAX_SAFEPOINTS];
     vm_address_t PyRun_SimpleString;
 };
 
@@ -271,9 +291,10 @@ restore_page(task_t task, page_restore_t* r)
 
 
 static int
-set_hw_breakpoint(struct tgt_thread* thrd, uintptr_t bp_addr)
+set_hw_breakpoint(struct tgt_thread* thrd, uintptr_t bp_addr, int slot)
 {
     kern_return_t kr;
+    assert(slot >= 0 && slot < MAX_SAFEPOINTS);
 
     __auto_type thread = thrd->act;
 #if defined(__arm64__)
@@ -294,8 +315,8 @@ set_hw_breakpoint(struct tgt_thread* thrd, uintptr_t bp_addr)
 
 #if defined(__arm64__)
 
-    if (debug_state.__bvr[0] != 0) {
-        log_err("debug registers in use");
+    if (debug_state.__bvr[slot] != 0) {
+        log_err("debug register %d in use\n", slot);
         // I mean... who else is using them?
         return ATT_FAIL;
     }
@@ -305,30 +326,36 @@ set_hw_breakpoint(struct tgt_thread* thrd, uintptr_t bp_addr)
     ctrl |= (0b10 << 1); /* PMC: Select EL0 only */
     ctrl |= 1; /* Enable breakpoint */
 
-    debug_state.__bcr[0] = ctrl;
-    debug_state.__bvr[0] = bp_addr;
+    debug_state.__bcr[slot] = ctrl;
+    debug_state.__bvr[slot] = bp_addr;
 
     log_dbg("state:\n");
-    for (int i = 0; i < 1; i++) {
+    for (int i = 0; i < MAX_SAFEPOINTS; i++) {
         log_dbg("bvr[%02d] = 0x%llx\n", i, debug_state.__bvr[i]);
         log_dbg("bcr[%02d] = 0x%llx\n", i, debug_state.__bcr[i]);
     }
 
 #elif defined(__x86_64__)
 
-    if (debug_state.__dr0 != 0) {
-        log_err("debug registers in use");
+    uint64_t* pdrs[] = {
+        &debug_state.__dr0, &debug_state.__dr1,
+        &debug_state.__dr2, &debug_state.__dr4
+    };
+    __auto_type pdr = pdrs[slot];
+
+    if (*pdr != 0) {
+        log_err("debug register %d in use\n", slot);
         return ATT_FAIL;
     }
 
-    int dr_idx = 0;  // will change if we ever decide to probe for free reg.
+    int dr_idx = slot;
 
     uint64_t ctrl = debug_state.__dr7;
     // See linux code for comments
     ctrl |= (1 << (2 * dr_idx));
     ctrl &= ~((0b1111 << (dr_idx * 4)) << 16);
 
-    debug_state.__dr0 = bp_addr;
+    *pdr = bp_addr;
     debug_state.__dr7 = ctrl;
 
 #endif /* __arm64__ */
@@ -343,9 +370,10 @@ set_hw_breakpoint(struct tgt_thread* thrd, uintptr_t bp_addr)
 }
 
 static int
-remove_hw_breakpoint(struct tgt_thread* thrd)
+remove_hw_breakpoint(struct tgt_thread* thrd, int slot)
 {
     kern_return_t kr;
+    assert(slot >= 0 && slot < MAX_SAFEPOINTS);
 
     __auto_type thread = thrd->act;
 #if defined(__arm64__)
@@ -366,27 +394,33 @@ remove_hw_breakpoint(struct tgt_thread* thrd)
 
 #if defined(__arm64__)
 
-    if (debug_state.__bvr[0] == 0 && debug_state.__bcr[0] == 0) {
-        log_err("hw bp not set :/");
+    if (debug_state.__bvr[slot] == 0 && debug_state.__bcr[slot] == 0) {
+        log_err("hw bp %d not set :/\n", slot);
         thrd->hw_bp_set = 0;
         return 0;
     }
 
-    debug_state.__bcr[0] = 0ULL;
-    debug_state.__bvr[0] = 0ULL;
+    debug_state.__bcr[slot] = 0ULL;
+    debug_state.__bvr[slot] = 0ULL;
 
 #elif defined(__x86_64__)
 
-    if (debug_state.__dr0 == 0) {
-        log_err("hw bp not set :/");
+    uint64_t* pdrs[] = {
+        &debug_state.__dr0, &debug_state.__dr1,
+        &debug_state.__dr2, &debug_state.__dr4
+    };
+    __auto_type pdr = pdrs[slot];
+
+    if (*pdr == 0) {
+        log_err("hw bp %d not set :/\n", slot);
         thrd->hw_bp_set = 0;
         return 0;
     }
 
-    int dr_idx = 0;
+    int dr_idx = slot;
     // Clear local enable bit. See linux code for better comments.
     debug_state.__dr7 &= ~(1 << (2 * dr_idx));
-    debug_state.__dr0 = 0;
+    *pdr = 0;
 
 #endif /* __arm64__ */
 
@@ -397,6 +431,22 @@ remove_hw_breakpoint(struct tgt_thread* thrd)
     }
     thrd->hw_bp_set = 0;
     return 0;
+}
+
+static int
+remove_hw_breakpoints(struct tgt_thread* thrd)
+{
+    int err = 0;
+    // TODO: We could fuse this with the above
+    for (int i = 0; i < MAX_SAFEPOINTS && safepoints[i] != NULL; i++) {
+        // This has a bug in the sense that if it fails on the second
+        // call onwards thrd->hw_bp_set will be incorrect.
+        int err2 = remove_hw_breakpoint(thrd, i);
+        if (err2 != 0) {
+            err = err2;
+        }
+    }
+    return err;
 }
 
 
@@ -705,8 +755,14 @@ catch_mach_exception_raise_state_identity(
         #elif defined(__x86_64__)
             state->__rip;
         #endif
-    __auto_type bp_addr = handler->pyfn_addrs.breakpoint_addr;
-    if (pc >= bp_addr && pc < bp_addr + 2) { // it's a range because of x86
+    for (int i = 0; i < MAX_SAFEPOINTS; i++) {
+        __auto_type bp_addr = handler->pyfn_addrs.breakpoint_addrs[i];
+        if (bp_addr == 0) {
+            continue;
+        }
+        if (!(pc >= bp_addr && pc < bp_addr + 2)) { // it's a range because of x86
+            continue;
+        }
         log_dbg("pc = %llx", pc);
         int bp_kind = BPK_AT_SAFE_POINT;
 
@@ -722,7 +778,7 @@ catch_mach_exception_raise_state_identity(
         }
 #endif
         struct tgt_thread thrd = { .act = thread, };
-        if (remove_hw_breakpoint(&thrd) != 0) {
+        if (remove_hw_breakpoints(&thrd) != 0) {
             return handler_result(KERN_FAILURE, thread, ATT_UNKNOWN_STATE,
                     bp_kind);
         }
@@ -801,7 +857,10 @@ catch_mach_exception_raise_state_identity(
 
         return handler_result(KERN_SUCCESS, thread, ATT_SUCCESS,
                 BPK_AT_SAFE_POINT);
-    } else {
+    }
+
+    // Was not one of our safepoints.
+    {
         /*
          * We've come back from PyRun_SimpleString
          */
@@ -1007,10 +1066,15 @@ find_needed_python_funcs(task_t task, struct pyfn_addrs* addrs)
     // FIXME: we should pause the task before doing this, in order to
     // get a consistent read
 
-    addrs->breakpoint_addr = find_pyfn(task, SAFE_POINT);
-    if (!addrs->breakpoint_addr) {
-        log_err("could not find %s in shared libs\n", SAFE_POINT);
-        return ATT_FAIL;
+    for (int i = 0; i < MAX_SAFEPOINTS && safepoints[i] != NULL; i++) {
+        const char* symbol_name = safepoints[i];
+        addrs->breakpoint_addrs[i] = find_pyfn(task, symbol_name);
+        if (!addrs->breakpoint_addrs[i]) {
+            log_err("could not find %s in shared libs\n", symbol_name);
+            return ATT_FAIL;
+        }
+        log_dbg("%s is at %p in target\n", symbol_name,
+                (void*)addrs->breakpoint_addrs[i]);
     }
     addrs->PyRun_SimpleString = find_pyfn(task, "PyRun_SimpleString");
     if (!addrs->PyRun_SimpleString) {
@@ -1103,11 +1167,6 @@ attach_and_execute(const int pid, const char* python_code)
         return ATT_FAIL;
     }
 
-    vm_address_t breakpoint_addr = pyfn_addrs.breakpoint_addr;
-    log_dbg(SAFE_POINT " is at %p in process %d\n",
-            (void*)breakpoint_addr, pid);
-
-
     // Attach and set breakpoint
     if ((kr = task_suspend(task)) != KERN_SUCCESS) {
         log_mach("task_suspend", kr);
@@ -1159,8 +1218,14 @@ attach_and_execute(const int pid, const char* python_code)
     }
 
     for (int i = 0; i < (int)thread_count; i++) {
-        if ((err = set_hw_breakpoint(&thrds[i], breakpoint_addr))) {
-            goto out;
+        for (int j = 0; j < MAX_SAFEPOINTS; j++) {
+            vm_address_t bp_addr = pyfn_addrs.breakpoint_addrs[j];
+            if (bp_addr == 0) {
+                continue;
+            }
+            if ((err = set_hw_breakpoint(&thrds[i], bp_addr, j))) {
+                goto out;
+            }
         }
     }
 
@@ -1281,7 +1346,7 @@ attach_and_execute(const int pid, const char* python_code)
                             }
                         }
                         thrds[i].running = 0;
-                        if (remove_hw_breakpoint(&thrds[i]) != 0) {
+                        if (remove_hw_breakpoints(&thrds[i]) != 0) {
                             err = ATT_UNKNOWN_STATE;
                         }
                         if ((kr = thread_resume(thrds[i].act))
@@ -1361,7 +1426,7 @@ out:
             }
             thrds[i].running = 0;
         }
-        if (remove_hw_breakpoint(&thrds[i])) {
+        if (remove_hw_breakpoints(&thrds[i])) {
             err = ATT_UNKNOWN_STATE;
         }
     }
@@ -1527,8 +1592,6 @@ execute_in_threads(
         return ATT_FAIL;
     }
 
-    vm_address_t breakpoint_addr = pyfn_addrs.breakpoint_addr;
-
     for (int i = 0; i < count_tids; i++) {
         log_dbg("tids[i] = %"PRIu64"\n", tids[i]);
     }
@@ -1539,8 +1602,14 @@ execute_in_threads(
     }
 
     for (int i = 0; i < found_threads; i++) {
-        if ((err = set_hw_breakpoint(&thrds[i], breakpoint_addr))) {
-            goto out;
+        for (int j = 0; j < MAX_SAFEPOINTS; j++) {
+            vm_address_t bp_addr = pyfn_addrs.breakpoint_addrs[j];
+            if (bp_addr == 0) {
+                continue;
+            }
+            if ((err = set_hw_breakpoint(&thrds[i], bp_addr, j))) {
+                goto out;
+            }
         }
     }
 
@@ -1689,7 +1758,7 @@ out:
             }
             thrds[i].running = 0;
         }
-        if (remove_hw_breakpoint(&thrds[i])) {
+        if (remove_hw_breakpoints(&thrds[i])) {
             err = ATT_UNKNOWN_STATE;
         }
     }

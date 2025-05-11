@@ -667,6 +667,8 @@ interrupt_threads(struct tgt_thrd* thrds, int nthreads)
             // TODO: this might be our breakpoint and not the event-stop.
             // If on x86, we may need to roll back the instruction pointer
             // a byte.
+            // TODO: This might be a fork or a clone, in which case we need
+            // not bail on x86.
             log_err("not event-stop!!!\n");
             // Maybe we should just kill the target until we've addressed
             // this TODO.
