@@ -63,6 +63,8 @@ jobs:
         python${{ matrix.python-version }} -m venv .venv
 
     - name: Install dependencies
+      env:
+        PYMONTRACE_DEBUG: ${{ runner.debug && '1' || '' }}
       run: |
         source .venv/bin/activate
         uv pip install -e '.[test]' pyright
@@ -76,13 +78,15 @@ jobs:
         pyright src
     - name: Test with pytest
       timeout-minutes: 1
+      env:
+        PYTEST_ADDOPTS: ${{ runner.debug && '-vv -s' || '' }}
       run: |
         source .venv/bin/activate
         ulimit -c unlimited
         if [[ $(uname) == "Darwin" ]]; then
-          sudo pytest
+          sudo pytest -v --color=yes
         else
-          pytest
+          pytest -v --color=yes
         fi
     - name: Run Integration tests
       run: |
@@ -113,11 +117,11 @@ jobs:
           find /var/lib/systemd/coredump/ -type f
           if coredumpctl list; then
             coredumpctl -1 info
-            [ "$RUNNER_DEBUG" = "1" ] && coredumpctl -1 dump --output=core
+            [ "$RUNNER_DEBUG" = 1 ] && coredumpctl -1 dump --output=core
           fi
         fi
         if [ -f core ]; then
-          if [ "$RUNNER_DEBUG" = "1" ]; then
+          if [ "$RUNNER_DEBUG" = 1 ]; then
             echo "::group::Install gdb"
             sudo apt-get update && sudo apt-get install -y gdb
             echo "::endgroup::"

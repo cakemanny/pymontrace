@@ -1,3 +1,4 @@
+import os
 import sys
 from setuptools import Extension, setup
 
@@ -20,11 +21,17 @@ elif sys.platform == 'linux':
 else:
     print(sys.platform, 'is not currently supported...', file=sys.stderr)
 
+# Undefining NDEBUG enables some debug logging.
+undef_macros = []
+if os.getenv("PYMONTRACE_DEBUG") in ("1", "true", "True", "yes"):
+    undef_macros = ["NDEBUG"]
+
 setup(
     ext_modules=[
         Extension(
             name="pymontrace.attacher",
             sources=sources,
+            undef_macros=undef_macros
         )
     ]
 )
