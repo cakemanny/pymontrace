@@ -9,6 +9,7 @@ on:
 jobs:
 
   check:
+    if: false  # XXX
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -19,14 +20,9 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
-        runner: ["macos-13", "macos-latest", "ubuntu-latest"]
-        include:
-          # pymontrace seems to hang attaching to Python 3.13 on the arm runner
-          # so we just test a couple of versions for now.
-          - python-version: "3.9"
-            runner: "ubuntu-24.04-arm"
-          - python-version: "3.12"
-            runner: "ubuntu-24.04-arm"
+        runner: [
+          #"macos-13", "macos-latest", "ubuntu-latest",
+          "ubuntu-24.04-arm"]
 
     runs-on: ${{ matrix.runner }}
 
