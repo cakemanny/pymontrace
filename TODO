@@ -27,7 +27,7 @@ In priority order:
       error code may be hard, since it uses two threads.
 - [ ] Darwin: look into mach_notify_no_senders or mach_notify_port_deleted ...
       for closing things down better.
-- [ ] Install SIGINT handler instead of catching KeyboardInterrupt
+- [x] Install SIGINT handler instead of catching KeyboardInterrupt
 
 - [o] Factor code into tracer and tracee parts
 - [ ] add a -w 'unsafe' flag, and then make the default mode safe

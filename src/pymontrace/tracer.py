@@ -4,6 +4,7 @@ import os
 import pathlib
 import re
 import shutil
+import selectors
 import signal
 import socket
 import struct
@@ -375,14 +376,25 @@ def settrace_in_threads(pid: int, thread_ids: 'tuple[int]'):
         )
 
 
+signal_read, signal_write = socket.socketpair()
+
+
 def signal_handler(signo: int, frame):
-    # We implement the default behaviour, i.e. terminating. But
-    # we raise SystemExit so that finally blocks are run and atexit.
-    raise SystemExit(128 + signo)
+    try:
+        signal_write.send(signo.to_bytes(1))
+        # We close the write end of the pair so that we can exit it the
+        # decode and print loop hangs due to a misbehaving tracee and the user
+        # or OS sends a second "I'm impatient" signal
+        signal_write.close()
+    except OSError:
+        # We implement the default behaviour, i.e. terminating. But
+        # we raise SystemExit so that finally blocks are run and atexit.
+        raise SystemExit(128 + signo)
 
 
 def install_signal_handler():
     for signo in [
+            signal.SIGINT,
             signal.SIGHUP,
             signal.SIGTERM,
             signal.SIGQUIT
@@ -396,17 +408,36 @@ class DecodeEndReason(enum.Enum):
     ENDED_EARLY = enum.auto()
 
 
+def wait_till_ready_or_got_signal(s: socket.socket, sel: selectors.BaseSelector):
+    for key, _ in sel.select():
+        if key.fileobj == signal_read:
+            signo = int.from_bytes(signal_read.recv(1))
+            if signo == signal.SIGINT:
+                raise KeyboardInterrupt
+            else:
+                raise SystemExit(128 + signo)
+
+        assert key.fileobj == s
+    # If we make it out of that for loop it means s is ready
+
+
 def decode_and_print_forever(s: socket.socket, only_print=False):
     from pymontrace.tracee import Message
+    EVENT_READ = selectors.EVENT_READ
+
+    sel = selectors.DefaultSelector()
+    sel.register(signal_read, EVENT_READ)
+    sel.register(s, EVENT_READ)
 
     t = None
     try:
         header_fmt = struct.Struct('=HH')
         while True:
-            # FIXME: we should use a selector that selects on this socket
-            # being ready vs a signal having arrived and then ensure that
-            # we don't read half a message before raising. See bottom
-            # of signal module docs online.
+            # We check for signals between message receipt so that s remains
+            # in a good state to read final shutdown messages (e.g. from
+            # the pymontrace::END probe)
+            wait_till_ready_or_got_signal(s, sel)
+
             header = s.recv(header_fmt.size)
             if header == b'':
                 return DecodeEndReason.DISCONNECTED
