@@ -381,7 +381,7 @@ signal_read, signal_write = socket.socketpair()
 
 def signal_handler(signo: int, frame):
     try:
-        signal_write.send(signo.to_bytes(1))
+        signal_write.send(signo.to_bytes(1, sys.byteorder))
         # We close the write end of the pair so that we can exit it the
         # decode and print loop hangs due to a misbehaving tracee and the user
         # or OS sends a second "I'm impatient" signal
@@ -411,7 +411,7 @@ class DecodeEndReason(enum.Enum):
 def wait_till_ready_or_got_signal(s: socket.socket, sel: selectors.BaseSelector):
     for key, _ in sel.select():
         if key.fileobj == signal_read:
-            signo = int.from_bytes(signal_read.recv(1))
+            signo = int.from_bytes(signal_read.recv(1), sys.byteorder)
             if signo == signal.SIGINT:
                 raise KeyboardInterrupt
             else:
