@@ -34,7 +34,11 @@
 #error "Platform not yet supported"
 #endif
 
+#ifdef NDEBUG
 const bool debug = false;
+#else
+const bool debug = true;
+#endif // NDEBUG
 
 #define NELEMS(A) ((sizeof A) / sizeof A[0])
 
