@@ -87,6 +87,7 @@ jobs:
           sudo pytest -v --color=yes
         else
           for _ in {1..5}; do
+            { sleep 9; ps $(pgrep python); } &
             timeout --signal=ABRT 10s pytest -v --color=yes -s
           done
         fi
