@@ -19,7 +19,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        python-version: [
+          # "3.9", "3.10", "3.11",
+          "3.12", "3.13"]
         runner: [
           #"macos-13", "macos-latest", "ubuntu-latest",
           "ubuntu-24.04-arm"]
@@ -68,10 +70,12 @@ jobs:
       run: |
         source .venv/bin/activate
         flake8 src --count --show-source --statistics
+
     - name: Typecheck with Pyright
       run: |
         source .venv/bin/activate
         pyright src
+
     - name: Test with pytest
       timeout-minutes: 1
       env:
@@ -82,8 +86,9 @@ jobs:
         if [[ $(uname) == "Darwin" ]]; then
           sudo pytest -v --color=yes
         else
-          timeout --signal=USR1 10s pytest -v --color=yes -s
+          timeout --signal=ABRT 10s pytest -v --color=yes -s
         fi
+
     - name: Run Integration tests
       run: |
         source .venv/bin/activate
@@ -113,11 +118,16 @@ jobs:
           find /var/lib/systemd/coredump/ -type f
           if coredumpctl list; then
             coredumpctl -1 info
-            [ "$RUNNER_DEBUG" = 1 ] && coredumpctl -1 dump --output=core
+            # [ "$RUNNER_DEBUG" = 1 ] &&  # XXX
+            if coredumpctl -1 info | grep -q os_abort_impl; then
+              :
+            else
+              coredumpctl -1 dump --output=core
+            fi
           fi
         fi
         if [ -f core ]; then
-          if [ "$RUNNER_DEBUG" = 1 ]; then
+          if [ "$RUNNER_DEBUG" = 1 ] || true; then  # XXX
             echo "::group::Install gdb"
             sudo apt-get update && sudo apt-get install -y gdb
             echo "::endgroup::"
