@@ -1881,7 +1881,7 @@ execute_in_threads(
     while (count_attached_threads(thrds, count_tids) > 0) {
         int status;
         log_dbg("waiting for bp hit");
-        pid_t tid = (tid = waitpid(-1, &status, 0));
+        pid_t tid = waitpid(-1, &status, 0);
         if (-1 == tid && errno != EINTR) {
             log_err("waitpid");
             err = ATT_UNKNOWN_STATE;
@@ -1909,6 +1909,7 @@ execute_in_threads(
                 err = ATT_UNKNOWN_STATE;
                 goto out;
             }
+            continue;
         }
         if (!WIFSTOPPED(status)) {
             log_err("unexpected child status: %x\n", status);
