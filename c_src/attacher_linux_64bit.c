@@ -1467,13 +1467,13 @@ exec_python_code(pid_t pid, pid_t tid, const char* python_code)
 {
     int err;
     /*
-     * We make a sensible assumption that Py_Main, which is called immediately
-     * in main and only on Windows, will not be called by some thread or some
-     * fork during the injection.
+     * We make a sensible assumption that PyRun_InteractiveLoop will not be
+     * called by some thread or some fork during the injection. It's not called
+     * from elsewhere within CPython.
      */
-    uintptr_t pymain_start_addr = find_pyfn(pid, "Py_Main");
+    uintptr_t pymain_start_addr = find_pyfn(pid, "PyRun_InteractiveLoop");
     if (pymain_start_addr == 0) {
-        log_err("could not find Py_Main\n");
+        log_err("could not find PyRun_InteractiveLoop\n");
         return ATT_FAIL;
     }
     log_dbg("pymain_start_addr = %lx", pymain_start_addr);
