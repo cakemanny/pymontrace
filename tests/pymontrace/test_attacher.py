@@ -267,7 +267,7 @@ def test_exec_in_threads():
         attacher.exec_in_threads(
             p.pid,
             (tid0, tid1),
-            'import threading;\n'
+            # 'import threading;\n'
             'tid = threading.get_native_id()\n'
             'print(f"hello{tid}\\n", end="", flush=True)\n'
         )
