@@ -120,7 +120,7 @@ jobs:
         if [ -d /var/lib/systemd/coredump/ ]; then
           find /var/lib/systemd/coredump/ -type f
           if coredumpctl list ; then
-            for pid in $(coredumpctl list --json=short | jq '.[] | .pid'; do
+            for pid in $(coredumpctl list --json=short | jq '.[] | .pid'); do
               coredumpctl -1 info $pid
               # [ "$RUNNER_DEBUG" = 1 ] &&  # XXX
               if coredumpctl -1 info $pid | grep -q os_abort_impl; then
@@ -132,6 +132,7 @@ jobs:
                 echo "::endgroup::"
                 gdb --batch -ex 'backtrace' "$( which python${{ matrix.python-version }} )" core
               fi
+            done
           fi
         fi
         if [ -f core ]; then
