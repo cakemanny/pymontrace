@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdarg.h>
 
+#include <execinfo.h>
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/errno.h>
@@ -1832,6 +1833,15 @@ detach:
     return err;
 }
 
+void on_SIGUSR1(int)
+{
+    #define BT_BUF_SIZE 100
+    void* buffer[BT_BUF_SIZE];
+    int nptrs = backtrace(buffer, BT_BUF_SIZE);
+    backtrace_symbols_fd(buffer, nptrs, STDERR_FILENO);
+    #undef BT_BUF_SIZE
+}
+
 int
 execute_in_threads(
         int pid, uint64_t* tids, int count_tids, const char* python_code)
@@ -1843,6 +1853,17 @@ execute_in_threads(
     if (count_tids > MAX_THRDS) {
         log_err("too many tids\n");
         return ATT_FAIL;
+    }
+
+    {
+        // We have to call backtrace once in order than libgcc is loaded and
+        // calling it in our signal handler will be async-signal-safe.
+        void* buffer[100];
+        (void)backtrace(buffer, 100);
+        if(SIG_ERR == signal(SIGUSR1, on_SIGUSR1)) {
+            log_err("signal");
+            return ATT_FAIL;
+        }
     }
 
     for (int i = 0; i < count_tids; i++) {

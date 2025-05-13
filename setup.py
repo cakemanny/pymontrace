@@ -31,7 +31,10 @@ setup(
         Extension(
             name="pymontrace.attacher",
             sources=sources,
-            undef_macros=undef_macros
+            undef_macros=undef_macros,
+            extra_compile_args=["-fno-omit-frame-pointer"],
+            # not sure if we need this.
+            extra_link_args=["-rdynamic"]
         )
     ]
 )

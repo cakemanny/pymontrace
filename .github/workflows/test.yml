@@ -82,7 +82,7 @@ jobs:
         if [[ $(uname) == "Darwin" ]]; then
           sudo pytest -v --color=yes
         else
-          pytest -v --color=yes
+          timeout --signal=USR1 10s pytest -v --color=yes -s
         fi
     - name: Run Integration tests
       run: |
