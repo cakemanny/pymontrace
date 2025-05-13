@@ -54,6 +54,8 @@ minversion = "6.0"
 testpaths = [
   "tests",
 ]
+# print stacktraces if a test takes longer than 10s
+faulthandler_timeout = 10
 
 #[tool.maturin]
 #python-source = "src"
