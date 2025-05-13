@@ -118,13 +118,13 @@ jobs:
         test -d /proc && cat /proc/sys/kernel/core_pattern
         if [ -d /var/lib/systemd/coredump/ ]; then
           find /var/lib/systemd/coredump/ -type f
-          if coredumpctl list; then
-            coredumpctl -1 info
+          if coredumpctl list pytest; then
+            coredumpctl -1 info pytest
             # [ "$RUNNER_DEBUG" = 1 ] &&  # XXX
-            if coredumpctl -1 info | grep -q os_abort_impl; then
+            if coredumpctl -1 info pytest | grep -q os_abort_impl; then
               :
             else
-              coredumpctl -1 dump --output=core
+              coredumpctl -1 dump pytest --output=core
             fi
           fi
         fi
