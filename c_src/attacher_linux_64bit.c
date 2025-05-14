@@ -1926,13 +1926,30 @@ execute_in_threads(
         // TODO: we should verify that it was our breakpoint that caused the
         // trap... (on x86 this mean checking and resetting DR6).
 
-        int tidx = find_thread_idx(thrds, count_tids, tid);
 
-        if (-1 == remove_hw_breakpoint(tid, &saved_dbg_state[tidx])) {
+        // Remove breakpoints from all attached threads so that none can
+        // aquire locks and then get stuck waiting.
+
+        if ((err = interrupt_threads(thrds, count_tids)) != 0) {
             err = ATT_UNKNOWN_STATE;
             goto out;
         }
-        t->hw_bp_set = 0;
+        for (int i = 0; i < count_tids; i++) {
+            __auto_type t = &thrds[i];
+            if (t->attached && t->hw_bp_set) {
+                if (-1 == remove_hw_breakpoint(t->tid, &saved_dbg_state[i])) {
+                    err = ATT_UNKNOWN_STATE;
+                    goto out;
+                }
+                t->hw_bp_set = 0;
+                if (t->tid != tid) {
+                    if ((err = continue_threads(t, 1)) != 0) {
+                        goto out;
+                    }
+                }
+            }
+        }
+
 
         err = exec_python_code(pid, tid, python_code);
         if (err != 0) {
@@ -1940,12 +1957,33 @@ execute_in_threads(
         }
         log_dbg("executed python code (tid=%d)", tid);
 
-        if (-1 == detach_threads(&thrds[tidx], 1)) {
+        if (-1 == detach_threads(t, 1)) {
             err = ATT_UNKNOWN_STATE;
             goto out;
         }
         t->attached = 0;
         log_dbg("detached (tid=%d)", tid);
+
+        // Reset the breakpoints for remaining attached threads.
+        if ((err = interrupt_threads(thrds, count_tids)) != 0) {
+            err = ATT_UNKNOWN_STATE;
+            goto out;
+        }
+        for (int i = 0; i < count_tids; i++) {
+            __auto_type t = &thrds[i];
+            if (t->attached && !t->hw_bp_set) {
+                if (set_hw_breakpoint(t->tid, breakpoint_addr,
+                        &saved_dbg_state[i]) != 0) {
+                    err = ATT_UNKNOWN_STATE;
+                    goto out;
+                }
+                t->hw_bp_set = 1;
+                if ((err = continue_threads(&thrds[i], 1)) != 0) {
+                    goto out;
+                }
+            }
+        }
+
     }
 
 out:
