@@ -623,6 +623,9 @@ continue_threads(struct tgt_thrd* thrds, int count)
 {
     int err = 0;
     for (int i = 0; i < count; i++) {
+        if (!thrds[i].attached) {
+            continue;
+        }
         err = ptrace(PTRACE_CONT, thrds[i].tid, 0, 0);
         if (err == -1) {
             log_err("ptrace cont: tid=%d", thrds[i].tid);
@@ -1089,6 +1092,41 @@ remove_hw_breakpoint(pid_t tid, hw_bp_ctx_t* oldctx)
 }
 
 #endif // defined(__aarch64__)
+
+static int
+set_hw_breakpoints(
+        struct tgt_thrd* thrds, int nthreads, uintptr_t breakpoint_addr,
+        hw_bp_ctx_t* oldctxs)
+{
+    for (int i = 0; i < nthreads; i++) {
+        struct tgt_thrd* t = &thrds[i];
+        if (!t->attached) {
+            continue;
+        }
+        if (set_hw_breakpoint(t->tid, breakpoint_addr, &oldctxs[i]) != 0) {
+            return ATT_UNKNOWN_STATE;
+        }
+        t->hw_bp_set = 1;
+    }
+    return 0;
+}
+
+static int
+remove_hw_breakpoints(
+        struct tgt_thrd* thrds, int nthreads, hw_bp_ctx_t* oldctxs)
+{
+    for (int i = 0; i < nthreads; i++) {
+        struct tgt_thrd* t = &thrds[i];
+        if (!t->attached) {
+            continue;
+        }
+        if (remove_hw_breakpoint(t->tid, &oldctxs[i]) != 0) {
+            return ATT_UNKNOWN_STATE;
+        }
+        t->hw_bp_set = 0;
+    }
+    return 0;
+}
 
 static int
 get_user_regs(pid_t tid, struct user_regs_struct* user_regs)
@@ -1861,16 +1899,10 @@ execute_in_threads(
     log_dbg("attached to %d threads", count_tids);
 
     hw_bp_ctx_t saved_dbg_state[MAX_THRDS] = {};
-    for (int i = 0; i < count_tids; i++) {
-        __auto_type t = &thrds[i];
-        if (set_hw_breakpoint(t->tid, breakpoint_addr,
-                    &saved_dbg_state[i]) != 0) {
-            err = ATT_UNKNOWN_STATE;
-            goto out;
-        }
-        t->hw_bp_set = 1;
+    if ((err = set_hw_breakpoints(thrds, count_tids, breakpoint_addr,
+                    saved_dbg_state)) != 0) {
+        goto out;
     }
-
     if ((err = continue_threads(thrds, count_tids)) != 0) {
         goto out;
     }
@@ -1934,18 +1966,15 @@ execute_in_threads(
             err = ATT_UNKNOWN_STATE;
             goto out;
         }
+        if ((err = remove_hw_breakpoints(thrds, count_tids, saved_dbg_state))
+                != 0) {
+            goto out;
+        }
         for (int i = 0; i < count_tids; i++) {
-            __auto_type t = &thrds[i];
-            if (t->attached && t->hw_bp_set) {
-                if (-1 == remove_hw_breakpoint(t->tid, &saved_dbg_state[i])) {
-                    err = ATT_UNKNOWN_STATE;
+            if (thrds[i].tid != tid) {
+                err = continue_threads(&thrds[i], 1);
+                if (err != 0) {
                     goto out;
-                }
-                t->hw_bp_set = 0;
-                if (t->tid != tid) {
-                    if ((err = continue_threads(t, 1)) != 0) {
-                        goto out;
-                    }
                 }
             }
         }
@@ -1969,21 +1998,13 @@ execute_in_threads(
             err = ATT_UNKNOWN_STATE;
             goto out;
         }
-        for (int i = 0; i < count_tids; i++) {
-            __auto_type t = &thrds[i];
-            if (t->attached && !t->hw_bp_set) {
-                if (set_hw_breakpoint(t->tid, breakpoint_addr,
-                        &saved_dbg_state[i]) != 0) {
-                    err = ATT_UNKNOWN_STATE;
-                    goto out;
-                }
-                t->hw_bp_set = 1;
-                if ((err = continue_threads(&thrds[i], 1)) != 0) {
-                    goto out;
-                }
-            }
+        if ((err = set_hw_breakpoints(thrds, count_tids, breakpoint_addr,
+                        saved_dbg_state)) != 0) {
+            goto out;
         }
-
+        if ((err = continue_threads(thrds, count_tids)) != 0) {
+            goto out;
+        }
     }
 
 out:
