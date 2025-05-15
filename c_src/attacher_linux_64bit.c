@@ -1093,6 +1093,8 @@ remove_hw_breakpoint(pid_t tid, hw_bp_ctx_t* oldctx)
 
 #endif // defined(__aarch64__)
 
+#if defined(__aarch64__) || defined(__x86_64__)
+
 static int
 set_hw_breakpoints(
         struct tgt_thrd* thrds, int nthreads, uintptr_t breakpoint_addr,
@@ -1127,6 +1129,8 @@ remove_hw_breakpoints(
     }
     return 0;
 }
+
+#endif // __aarch64__ || __x86_64__
 
 static int
 get_user_regs(pid_t tid, struct user_regs_struct* user_regs)
