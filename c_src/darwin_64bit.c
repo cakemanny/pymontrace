@@ -540,7 +540,7 @@ setup_exception_handling(
         return ATT_FAIL;
     }
 
-    task_flavor_t flavor =
+    thread_state_flavor_t flavor =
 #if defined(__arm64__)
         ARM_THREAD_STATE64
 #elif defined(__x86_64__)
@@ -590,7 +590,7 @@ setup_thread_exc_handling(thread_act_t thread, mach_port_t* exc_port,
     exception_mask_t mask = EXC_MASK_BREAKPOINT;
     mach_msg_type_number_t count = 1; /* only 1 mask to be replaced  */
 
-    task_flavor_t flavor =
+    thread_state_flavor_t flavor =
 #if defined(__arm64__)
         ARM_THREAD_STATE64
 #elif defined(__x86_64__)
