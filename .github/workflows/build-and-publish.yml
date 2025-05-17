@@ -32,7 +32,7 @@ jobs:
     - uses: actions/checkout@v4
     - name: Build package
       run: |
-        for V in 3.9 3.10 3.11 3.12 3.13; do
+        for V in 3.9; do
           python${V} -m build --installer=uv
         done
     - name: Run auditwheel
@@ -52,7 +52,7 @@ jobs:
     - uses: actions/checkout@v4
     - name: Build package
       run: |
-        for V in 3.9 3.10 3.11 3.12 3.13; do
+        for V in 3.9; do
           python${V} -m build --installer=uv
         done
     - name: Run auditwheel
