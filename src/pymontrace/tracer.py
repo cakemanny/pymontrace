@@ -3,8 +3,8 @@ import inspect
 import os
 import pathlib
 import re
-import shutil
 import selectors
+import shutil
 import signal
 import socket
 import struct

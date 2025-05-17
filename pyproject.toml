@@ -43,7 +43,7 @@ test = [
 dev = [
   "black        ~= 25.0",
   "isort        ~= 6.0",
-  "pyright",
+  "pyright      ~= 1.0",
 #  "maturin",
 ]
 
@@ -60,3 +60,7 @@ faulthandler_timeout = 10
 
 #[tool.maturin]
 #python-source = "src"
+
+[tool.isort]
+#profile = "black"
+multi_line_output = 5

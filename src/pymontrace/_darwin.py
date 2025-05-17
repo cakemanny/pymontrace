@@ -1,6 +1,6 @@
+import ctypes
 import sys
 from ctypes.util import find_library
-import ctypes
 from typing import cast
 
 libc = ctypes.cdll.LoadLibrary(cast(str, find_library("c")))

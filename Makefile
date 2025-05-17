@@ -11,6 +11,7 @@ dev-setup:
 lint:
 	flake8 src
 	pyright src
+	isort src --check --diff
 
 
 .PHONY: check
