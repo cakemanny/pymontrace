@@ -9,7 +9,7 @@ class FakeFrame:
         self.f_globals = mod.__dict__
         self.f_locals = {}
 
-        co_filename = f"{module_name.replace('.','/')}.py"
+        co_filename = f"{module_name.replace('.', '/')}.py"
 
         names = co_qualname.split('.')
         co_name = names.pop()

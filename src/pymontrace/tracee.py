@@ -383,6 +383,10 @@ class aggregation:
         def __init__(self, value):
             self.value = value
 
+    class Quantize:
+        def __init__(self, value):
+            self.value = value
+
 
 class agg:
     @staticmethod
@@ -400,6 +404,56 @@ class agg:
     @staticmethod
     def max(value):
         return aggregation.Max(value)
+
+    @staticmethod
+    def quantize(value):
+        return aggregation.Quantize(value)
+
+
+class Quantization:
+    from dataclasses import dataclass
+
+    @dataclass
+    class Bucket:
+        value: int
+        count: int
+
+    def __init__(self) -> None:
+        self.buckets = []  # 0, 1, 2, 4, ...
+        self.neg_buckets = []  # -1, -2, -4, -8, ...
+
+    def add(self, value):
+        if not isinstance(value, (int, float)):
+            raise TypeError(f"quantize: not int or float: {value!r}")
+        # The highest power of two less than or equal to value
+
+        value = int(value)
+        bucket_idx = self.bucket_idx(value)
+        if bucket_idx >= 64:
+            # perhaps introduce some kind of "scale" property ?
+            raise ValueError('large number not yet quantizable: {value!r}')
+        if value < 0:
+            self.neg_buckets[bucket_idx] += 1
+        else:
+            if len(self.buckets) <= bucket_idx:
+                self.buckets.extend((1 + bucket_idx - len(self.buckets)) * [0])
+            self.buckets[bucket_idx] += 1
+
+    @staticmethod
+    def quantize(value: int) -> int:
+        if value == 0:
+            return 0
+        if value > 0:
+            return 2 ** (value.bit_length() - 1)
+        if value < 0:
+            return -(2 ** ((-value).bit_length() - 1))
+
+    @staticmethod
+    def bucket_idx(value: int) -> int:
+        if value >= 0:
+            return value.bit_length()
+        else:
+            return value.bit_length() - 1
 
 
 class VarNS(SimpleNamespace):
@@ -419,6 +473,11 @@ class VarNS(SimpleNamespace):
         elif isinstance(value, aggregation.Max):
             current = getattr(self, name, value.value)
             object.__setattr__(self, name, max(current, value.value))
+        elif isinstance(value, aggregation.Quantize):
+            if (current := getattr(self, name, None)) is None:
+                current = Quantization()
+            current.add(value.value)
+            object.__setattr__(self, name, current)
         else:
             object.__setattr__(self, name, value)
 
@@ -438,6 +497,11 @@ class PMTMap(dict):  # Should be collections.MutableMapping
         elif isinstance(value, aggregation.Max):
             current = self.get(key, value.value)
             return super().__setitem__(key, max(current, value.value))
+        elif isinstance(value, aggregation.Quantize):
+            if (current := self.get(key, None)) is None:
+                current = Quantization()
+            current.add(value.value)
+            return super().__setitem__(key, current)
         else:
             return super().__setitem__(key, value)
 
@@ -535,6 +599,8 @@ class pmt:
 
     @staticmethod
     def printmaps():
+        # In the future we should send the data to the tracer to print
+        # instead.
         try:
             for name, mapp in vars(pmt.maps).items():
                 pmt.print(name, "\n")

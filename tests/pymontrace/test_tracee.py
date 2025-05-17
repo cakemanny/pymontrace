@@ -137,3 +137,116 @@ def test_decode_pymontrace_program():
     assert decoded == [
         (LineProbe('path.py', '23'), 'print(x) '),
     ]
+
+
+# Aggregations
+
+
+def test_agg_count():
+    from pymontrace.tracee import agg, pmt
+
+    pmt.maps.county['a'] = agg.count()
+    assert pmt.maps.county['a'] == 1
+    pmt.maps.county['a'] = agg.count()
+    assert pmt.maps.county['a'] == 2
+
+    pmt.maps[(1, 2)] = agg.count()
+    pmt.maps[(1, 2)] = agg.count()
+    pmt.maps[(1, 2)] = agg.count()
+    assert pmt.maps[(1, 2)] == 3
+
+
+def test_agg_sum():
+    from pymontrace.tracee import agg, pmt
+
+    pmt.maps.summy['a'] = agg.sum(1)
+    pmt.maps.summy['a'] = agg.sum(2)
+    pmt.maps.summy['a'] = agg.sum(3)
+
+    assert pmt.maps.summy['a'] == 6
+
+
+def test_agg_min():
+    from pymontrace.tracee import agg, pmt
+
+    pmt.maps.minny['a'] = agg.min(1)
+    pmt.maps.minny['a'] = agg.min(2)
+    pmt.maps.minny['a'] = agg.min(3)
+
+    assert pmt.maps.minny['a'] == 1
+
+    pmt.maps.minny['b'] = agg.min(3)
+    pmt.maps.minny['b'] = agg.min(2)
+    pmt.maps.minny['b'] = agg.min(1)
+
+    assert pmt.maps.minny['b'] == 1
+
+
+def test_agg_max():
+    from pymontrace.tracee import agg, pmt
+
+    pmt.maps.maxxy['a'] = agg.max(1)
+    pmt.maps.maxxy['a'] = agg.max(2)
+    pmt.maps.maxxy['a'] = agg.max(3)
+
+    assert pmt.maps.maxxy['a'] == 3
+
+    pmt.maps.maxxy['b'] = agg.max(3)
+    pmt.maps.maxxy['b'] = agg.max(2)
+    pmt.maps.maxxy['b'] = agg.max(1)
+
+    assert pmt.maps.maxxy['b'] == 3
+
+
+class TestQuantization:
+
+    @staticmethod
+    def test_quantize():
+        from pymontrace.tracee import Quantization
+
+        assert Quantization.quantize(0) == 0
+        assert Quantization.quantize(1) == 1
+        assert Quantization.quantize(2) == 2
+        assert Quantization.quantize(3) == 2
+
+        assert [Quantization.quantize(x) for x in range(10)] == [
+            0, 1, 2, 2, 4, 4, 4, 4, 8, 8
+        ]
+
+        #                    v       v   v   v       v
+        negative = [-1, -2, -3, -4, -5, -6, -7, -8, -9]
+        expected = [-1, -2, -2, -4, -4, -4, -4, -8, -8]
+        assert [Quantization.quantize(x) for x in negative] == expected
+
+    @staticmethod
+    def test_bucket_idx():
+        from pymontrace.tracee import Quantization
+
+        assert Quantization.bucket_idx(0) == 0
+        assert Quantization.bucket_idx(1) == 1
+        assert Quantization.bucket_idx(2) == 2
+        assert Quantization.bucket_idx(3) == 2
+        assert Quantization.bucket_idx(4) == 3
+
+        assert [Quantization.bucket_idx(x) for x in range(10)] == [
+            0, 1, 2, 2, 3, 3, 3, 3, 4, 4
+        ]
+
+        #            -   -----   -------------   -----
+        negative = [-1, -2, -3, -4, -5, -6, -7, -8, -9]
+        expected = [ 0,  1,  1,  2,  2,  2,  2,  3,  3]  # noqa
+        assert [Quantization.bucket_idx(x) for x in negative] == expected
+
+
+def test_agg_quantize():
+    from pymontrace.tracee import agg, pmt
+
+    pmt.maps.quanty['a'] = agg.quantize(0)
+    assert pmt.maps.quanty['a'].buckets == [1]
+    pmt.maps.quanty['a'] = agg.quantize(0)
+    assert pmt.maps.quanty['a'].buckets == [2]
+    pmt.maps.quanty['a'] = agg.quantize(1)
+    assert pmt.maps.quanty['a'].buckets == [2, 1]
+    pmt.maps.quanty['a'] = agg.quantize(2)
+    pmt.maps.quanty['a'] = agg.quantize(3)
+    assert pmt.maps.quanty['a'].buckets == [2, 1, 2]
