@@ -445,8 +445,8 @@ class Quantization:
             return 0
         if value > 0:
             return 2 ** (value.bit_length() - 1)
-        if value < 0:
-            return -(2 ** ((-value).bit_length() - 1))
+        assert value < 0
+        return -(2 ** ((-value).bit_length() - 1))
 
     @staticmethod
     def bucket_idx(value: int) -> int:

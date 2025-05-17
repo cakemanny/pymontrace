@@ -41,8 +41,9 @@ test = [
   "flake8       ~= 7.0",
 ]
 dev = [
-  "black        ==23.12.1",
-  "isort        ~= 5.0",
+  "black        ~= 25.0",
+  "isort        ~= 6.0",
+  "pyright",
 #  "maturin",
 ]
 

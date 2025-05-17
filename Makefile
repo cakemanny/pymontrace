@@ -10,6 +10,7 @@ dev-setup:
 .PHONY: lint
 lint:
 	flake8 src
+	pyright src
 
 
 .PHONY: check
