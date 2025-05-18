@@ -1036,10 +1036,20 @@ find_pyfn(task_t task, const char* symbol)
         #define PYTHON_SO_BASENAME  "Python"
         // uv managed python has them named like libpython3.12.dylib
         #define PYTHON_DYLIB_PREFIX "libpython"
+        // or it's possible to build without a shared library
+        #define PYTHON_STATIC_PREFIX "python3"
 
-        if (strcmp(basename(bn), PYTHON_SO_BASENAME) == 0
-                || strncmp(basename(bn), PYTHON_DYLIB_PREFIX,
-                           strlen(PYTHON_DYLIB_PREFIX)) == 0
+        if (basename_r(it.filepath, bn) == NULL) {
+            log_err("basename_r");
+            continue;
+        }
+
+        #define startswith(large, small) \
+            (strncmp(large, small, strlen(small)) == 0)
+
+        if (strcmp(bn, PYTHON_SO_BASENAME) == 0
+                || startswith(bn, PYTHON_DYLIB_PREFIX)
+                || startswith(bn, PYTHON_STATIC_PREFIX)
         ) {
             log_dbg("looking in %s", it.filepath);
 
@@ -1056,8 +1066,10 @@ find_pyfn(task_t task, const char* symbol)
                 break;
             }
         }
+        #undef startswith
         #undef PYTHON_SO_BASENAME
         #undef PYTHON_DYLIB_PREFIX
+        #undef PYTHON_STATIC_PREFIX
     }
     errno = 0; // that search process above leaves the errno dirty
     return fn_addr;
