@@ -1,10 +1,12 @@
 OS = $(shell uname)
 
+PIP ?= uv pip
+
 .PHONY: dev-setup
 dev-setup:
 	test -n "$$VIRTUAL_ENV"
 	type uv || "$$VIRTUAL_ENV"/bin/pip install uv
-	uv pip install -e '.[dev,test]'
+	$(PIP) install -e '.[dev,test]' setuptools
 
 
 .PHONY: lint
@@ -14,18 +16,32 @@ lint:
 	isort src --check --diff
 
 
+TO_CHECK = c_src/attachermodule.c c_src/mapbuffermodule.c
+
 .PHONY: check
 ifeq "$(OS)" "Darwin"
+
+TO_CHECK += c_src/darwin_64bit.c
+PY_INCLUDE := $(shell python3 -c 'import sysconfig; print(sysconfig.get_path("include"), end="")')
+CFLAGS = -Wall -Wsign-compare -Wvla -Werror -I$(PY_INCLUDE)
+
 # Pre-flight the linux code when working on mac
 check:
-	cc -c -target x86_64-apple-macos10.13 -Wall -Wsign-compare -Wvla -Werror -o /dev/null c_src/darwin_64bit.c
+	set -eu; for F in $(TO_CHECK); do \
+		cc -c -target x86_64-apple-macos10.13 $(CFLAGS) -o /dev/null $$F; \
+	done
 	./hack/bash-aarch64.sh -c 'make check'
 
 else
 
-CFLAGS = -Wall -Wsign-compare -Wvla -Werror
+TO_CHECK += c_src/attacher_linux_64bit.c
+PY_INCLUDE := $(shell python3 -c 'import sysconfig; print(sysconfig.get_path("include"), end="")')
+
+CFLAGS = -Wall -Wsign-compare -Wvla -Werror -I$(PY_INCLUDE)
 check:
-	$(CC) -fsyntax-only $(CFLAGS) c_src/attacher_linux_64bit.c
+	set -eu; for F in $(TO_CHECK); do \
+		$(CC) -fsyntax-only $(CFLAGS) $$F; \
+	done
 	type riscv64-linux-gnu-gcc || apt update
 	type riscv64-linux-gnu-gcc || \
 		apt install --yes \
@@ -47,7 +63,7 @@ test:
 
 .PHONY: build
 build:
-	pip install --upgrade build twine
+	$(PIP) install --upgrade build twine
 	python3 -m build
 
 .PHONY: publish

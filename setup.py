@@ -33,7 +33,13 @@ setup(
             sources=sources,
             undef_macros=undef_macros,
             py_limited_api=True,
-        )
+        ),
+        Extension(
+            name="pymontrace._mapbuffer",
+            sources=["c_src/mapbuffermodule.c"],
+            undef_macros=undef_macros,
+            py_limited_api=True,
+        ),
     ],
     # https://github.com/pypa/setuptools/issues/4741
     options={'bdist_wheel': {'py_limited_api': 'cp39'}},
