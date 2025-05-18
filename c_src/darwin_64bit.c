@@ -1211,7 +1211,7 @@ attach_and_execute(const int pid, const char* python_code)
     sigset_t old_mask = 0;
     sigset_t signal_mask = init_signal_mask();
     if ((errno = sigprocmask(SIG_BLOCK, &signal_mask, &old_mask)) != 0) {
-        log_err("pthread_sigmask");
+        log_err("sigprocmask");
         return ATT_FAIL;
     }
 
@@ -1468,7 +1468,7 @@ out:
 
 restore_mask:
     if ((errno = sigprocmask(SIG_SETMASK, &old_mask, NULL))) {
-        log_err("BUG: pthread_sigmask");
+        log_err("BUG: sigprocmask");
         abort();  // can only be EINVAL
     }
     return err;
