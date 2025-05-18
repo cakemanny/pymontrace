@@ -39,18 +39,16 @@ PY_INCLUDE := $(shell python3 -c 'import sysconfig; print(sysconfig.get_path("in
 
 CFLAGS = -Wall -Wsign-compare -Wvla -Werror -I$(PY_INCLUDE)
 check:
-	set -eu; for F in $(TO_CHECK); do \
-		$(CC) -fsyntax-only $(CFLAGS) $$F; \
-	done
+	$(CC) -fsyntax-only $(CFLAGS) $(TO_CHECK)
 	type riscv64-linux-gnu-gcc || apt update
 	type riscv64-linux-gnu-gcc || \
 		apt install --yes \
 			gcc-aarch64-linux-gnu \
 			gcc-x86-64-linux-gnu \
 			gcc-riscv64-linux-gnu
-	aarch64-linux-gnu-gcc -fsyntax-only $(CFLAGS) c_src/attacher_linux_64bit.c
-	x86_64-linux-gnu-gcc -fsyntax-only $(CFLAGS) c_src/attacher_linux_64bit.c
-	riscv64-linux-gnu-gcc -fsyntax-only $(CFLAGS) c_src/attacher_linux_64bit.c
+	aarch64-linux-gnu-gcc -fsyntax-only $(CFLAGS) $(TO_CHECK)
+	x86_64-linux-gnu-gcc -fsyntax-only $(CFLAGS) $(TO_CHECK)
+	riscv64-linux-gnu-gcc -fsyntax-only $(CFLAGS) $(TO_CHECK)
 
 endif # OS eq Darwin
 
