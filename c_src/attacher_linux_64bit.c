@@ -853,11 +853,12 @@ write_memory(pid_t pid, const void* laddr, uintptr_t raddr, ssize_t len)
     struct iovec local = { .iov_base = (void*)laddr, .iov_len=len };
     struct iovec remote = { .iov_base = (void*)raddr, .iov_len=len };
     errno = 0;
+    // TODO: handle partial writes
     if (process_vm_writev(pid, &local, 1, &remote, 1, 0) != len) {
         if (ENOSYS == errno) {
             goto useprocmem;
         }
-        perror("process_vm_writev");
+        log_err("process_vm_writev: pid=%d", pid);
         return -1;
     }
     return 0;
@@ -868,21 +869,17 @@ useprocmem:
 
     int fd = open(mempath, O_RDWR);
     if (-1 == fd) {
-        perror("open");
+        log_err("open: %s", mempath);
         return -1;
     }
 
-    if ((off_t)-1 == lseek(fd, raddr, SEEK_SET)) {
-        perror("lseek");
-        goto error;
-    }
-
-    if (write(fd, laddr, len) != len) {
-        perror("write");
+    // TODO: handle partial writes
+    if (pwrite(fd, laddr, len, raddr) != len) {
+        log_err("pwrite: pid=%d", pid);
         goto error;
     }
     if (-1 == close(fd)) {
-        perror("close");
+        log_err("close: %s", mempath);
         return -1;
     }
 
@@ -1525,13 +1522,13 @@ exec_python_code(pid_t pid, pid_t tid, const char* python_code)
     size_t length = sysconf(_SC_PAGESIZE);
     if ((err = call_mmap_in_target(pid, tid, pymain_start_addr, length,
                     &mapped_addr)) != 0) {
-        log_err("call_mmap_in_target failed");
+        log_err("call_mmap_in_target failed\n");
         return err;
     }
 
     ssize_t len = (1 + strlen(python_code));
     if (write_memory(pid, python_code, mapped_addr, len) != 0) {
-        log_err("writing python code to target memory failed");
+        log_err("writing python code to target memory failed\n");
         err = ATT_FAIL;
         goto out;
     }
