@@ -35,6 +35,12 @@ jobs:
     # the codesigned universal binaries from python.org. So we use homebrew
     # on macOS instead.
     steps:
+    - name: Disable man-db triggers
+      if: ${{ startsWith(matrix.runner, 'ubuntu-') }}
+      # https://github.com/actions/runner-images/issues/10977#issuecomment-2810713336
+      run: |
+        echo "set man-db/auto-update false" | sudo debconf-communicate
+        sudo dpkg-reconfigure man-db
     - uses: actions/checkout@v4
     - uses: actions/setup-python@v5
       if: ${{ ! startsWith(matrix.runner, 'macos-') }}
