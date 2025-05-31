@@ -16,7 +16,7 @@
 
 /*
  * The implementation must use atomics i.e. be lock free as going to
- * sleep on a cross-process mutex
+ * sleep on a cross-process mutex is unknown territory.
  */
 #if (ATOMIC_LONG_LOCK_FREE != 2) || (ATOMIC_LLONG_LOCK_FREE != 2)
 #error "Platform does not guarantee required atomic operations."
@@ -223,7 +223,6 @@ MapBuffer_read(PyObject *op, PyObject *args)
                 // we shall also come off cpu.
                 sched_yield();
             }
-            // TODO: Look into linux cpu_relax and rust's core::hint::spin_loop
             continue;
         }
 
