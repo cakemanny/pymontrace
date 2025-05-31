@@ -421,7 +421,11 @@ class DecodeEndReason(enum.Enum):
 def wait_till_ready_or_got_signal(s: socket.socket, sel: selectors.BaseSelector):
     for key, _ in sel.select():
         if key.fileobj == signal_read:
-            signo = int.from_bytes(signal_read.recv(1), sys.byteorder)
+            received = signal_read.recv(1)
+            if received == b'':
+                sel.unregister(signal_read)
+                continue
+            signo = int.from_bytes(received, sys.byteorder)
             if signo == signal.SIGINT:
                 raise KeyboardInterrupt
             else:
