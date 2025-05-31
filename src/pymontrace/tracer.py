@@ -2,6 +2,7 @@ import enum
 import inspect
 import os
 import pathlib
+import pickle
 import re
 import selectors
 import shutil
@@ -11,6 +12,7 @@ import struct
 import sys
 import textwrap
 import threading
+import traceback
 from contextlib import contextmanager
 from tempfile import TemporaryDirectory
 from typing import NoReturn
@@ -224,14 +226,28 @@ def install_pymontrace(pid: int) -> TemporaryDirectory:
     return tmpdir
 
 
-def to_remote_path(pid: int, path):
+def to_remote_path(pid: int, path: str) -> str:
     proc_root = f'/proc/{pid}/root'
     if path.startswith(f'{proc_root}/'):
         return path[len(proc_root):]
     return path
 
 
-def format_bootstrap_snippet(encoded_script: bytes, comm_file, site_extension):
+def from_remote_path(pid: int, remote_path: str) -> str:
+    """
+    Converts a path that makes sense for the tracee to one that represents
+    the same file from the perspective of the tracer
+    """
+    assert remote_path[0] == '/'
+    # Trailing slash needed otherwise it's the symbolic link
+    pidroot = f'/proc/{pid}/root/'
+    if (os.path.isdir(pidroot) and not os.path.samefile(pidroot, '/')):
+        return f'{pidroot}{remote_path[1:]}'
+    else:
+        return remote_path
+
+
+def format_bootstrap_snippet(encoded_script: bytes, comm_file: str, site_extension: str):
 
     # Running settrace in a nested function does two things
     #  1. it keeps the locals dictionary clean in the injection site
@@ -296,13 +312,7 @@ class CommsFile:
     def __init__(self, pid: int):
         # TODO: We should probably add a random component with mktemp...
         self.remotepath = f'/tmp/pymontrace-{pid}'
-
-        # Trailing slash needed otherwise it's the symbolic link
-        pidroot = f'/proc/{pid}/root/'
-        if (os.path.isdir(pidroot) and not os.path.samefile(pidroot, '/')):
-            self.localpath = f'{pidroot}{self.remotepath[1:]}'
-        else:
-            self.localpath = self.remotepath
+        self.localpath = from_remote_path(pid, self.remotepath)
 
 
 def get_proc_euid(pid: int):
@@ -421,7 +431,7 @@ def wait_till_ready_or_got_signal(s: socket.socket, sel: selectors.BaseSelector)
     # If we make it out of that for loop it means s is ready
 
 
-def decode_and_print_forever(s: socket.socket, only_print=False):
+def decode_and_print_forever(pid: int, s: socket.socket, only_print=False):
     from pymontrace.tracee import Message
     EVENT_READ = selectors.EVENT_READ
 
@@ -452,8 +462,6 @@ def decode_and_print_forever(s: socket.socket, only_print=False):
             elif kind == Message.THREADS:
                 count_threads = size // struct.calcsize('=Q')
                 thread_ids = struct.unpack('=' + (count_threads * 'Q'), body)
-                # This may not be the correct value if the target has forked
-                pid = get_peer_pid(s)
                 t = threading.Thread(target=settrace_in_threads,
                                      args=(pid, thread_ids), daemon=True)
                 t.start()
@@ -461,6 +469,10 @@ def decode_and_print_forever(s: socket.socket, only_print=False):
                 return DecodeEndReason.EXITED
             elif kind == Message.END_EARLY:
                 return DecodeEndReason.ENDED_EARLY
+            elif kind == Message.MAPS:
+                filepath = body.decode()
+                print_maps(from_remote_path(pid, filepath))
+                os.unlink(filepath)
             else:
                 print('unknown message kind:', kind, file=sys.stderr)
     finally:
@@ -473,6 +485,31 @@ def decode_and_print_forever(s: socket.socket, only_print=False):
             t.join()
 
 
-def decode_and_print_remaining(s: socket.socket):
+def decode_and_print_remaining(pid: int, s: socket.socket):
     # This should not block as the client should have disconnected
-    decode_and_print_forever(s, only_print=True)
+    decode_and_print_forever(pid, s, only_print=True)
+
+
+def print_maps(mapsfile_path):
+    with open(mapsfile_path, 'rb') as f:
+        maps = pickle.load(f)
+    for name, mapp in maps.items():
+        try:
+            print_map(name, mapp)
+        except Exception:
+            print(f"Failed to print map: {name}:", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+
+
+def print_map(name, mapp, out=sys.stdout):
+
+    print(name, "\n", file=out)
+    kwidth, vwidth = 0, 0
+    for k, v in mapp.items():
+        kwidth = max(kwidth, len(str(k)))
+        vwidth = max(vwidth, len(str(v)))
+    for k, v in sorted(mapp.items(), key=lambda kv: kv[1]):
+        if isinstance(k, (int, str)):
+            print(f"  {k:{kwidth}}: {v:{vwidth}}", file=out)
+        else:
+            print(f"  {k!s:{kwidth}}: {v:{vwidth}}", file=out)

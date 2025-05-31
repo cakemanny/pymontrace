@@ -8,6 +8,7 @@ import atexit
 import inspect
 import io
 import os
+import pickle
 import re
 import socket
 import struct
@@ -273,6 +274,7 @@ class Message:
     THREADS = 3     # Additional threads the tracer must attach to
     EXIT = 4        # The tracee is exiting (atexit)
     END_EARLY = 5   # The tracing code called the pmt.exit function
+    MAPS = 6        # A new map file is available
 
 
 class TracerRemote:
@@ -288,7 +290,7 @@ class TracerRemote:
         with self._lock:
             return self.comm_fh is not None
 
-    def connect(self, comm_file):
+    def connect(self, comm_file: str):
         if self.comm_fh is not None:
             # Maybe a previous settrace failed half-way through
             try:
@@ -354,6 +356,11 @@ class TracerRemote:
     def notify_end_early(self):
         body_size = 0
         self.sendall(struct.pack('=HH', Message.END_EARLY, body_size))
+
+    def notify_maps(self, filepath: str):
+        to_write = filepath.encode()
+        body_size = len(to_write)
+        self.sendall(struct.pack('=HH', Message.MAPS, body_size) + to_write)
 
 
 remote = TracerRemote()
@@ -520,8 +527,8 @@ class MapNS(SimpleNamespace):
         if not isinstance(value, PMTMap):
             # ... The user is probably messing up some syntax..
             raise EvaluationError(
-                f'cannot set attribute {name!r} on pmt.maps, '
-                f'use pmt.maps[...] = ... or pmt.vars.{name} instead'
+                f'cannot set attribute {name!r} on maps, '
+                f'use maps[...] = ... or vars.{name} instead'
             )
         super().__setattr__(name, value)
 
@@ -599,20 +606,21 @@ class pmt:
 
     @staticmethod
     def printmaps():
-        # In the future we should send the data to the tracer to print
-        # instead.
+        # This is not the final implementation! Just a stopgap one to reduce
+        # the chance that untrace jams up the tracee.
+
+        if remote.comm_fh is None:
+            return
+        dest: str = remote.comm_fh.getpeername() + '.maps'
+        assert os.path.isabs(dest), f"not absolute: {dest!r}"
+
+        if len(vars(pmt.maps)) == 0:
+            return
+
         try:
-            for name, mapp in vars(pmt.maps).items():
-                pmt.print(name, "\n")
-                kwidth, vwidth = 0, 0
-                for k, v in mapp.items():
-                    kwidth = max(kwidth, len(str(k)))
-                    vwidth = max(vwidth, len(str(v)))
-                for k, v in sorted(mapp.items(), key=lambda kv: kv[1]):
-                    if isinstance(k, (int, str)):
-                        pmt.print(f"  {k:{kwidth}}: {v:{vwidth}}")
-                    else:
-                        pmt.print(f"  {k!s:{kwidth}}: {v:{vwidth}}")
+            with open(dest, 'wb') as f:
+                pickle.dump(dict(vars(pmt.maps).items()), f)
+            remote.notify_maps(dest)
         except Exception:
             buf = io.StringIO()
             print(f'{__name__}.pmt.printmaps failed', file=buf)
@@ -835,7 +843,7 @@ def create_event_handlers(
     return handle_call
 
 
-def connect(comm_file):
+def connect(comm_file: str):
     """
     Connect back to the tracer.
     Tracer invokes this in the target when attaching to it.

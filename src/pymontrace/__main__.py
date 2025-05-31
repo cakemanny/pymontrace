@@ -52,10 +52,10 @@ class EndReason(enum.Enum):
     INTERRUPTED = enum.auto()
 
 
-def receive_and_print_until_interrupted(s: socket.socket) -> EndReason:
+def receive_and_print_until_interrupted(pid: int, s: socket.socket) -> EndReason:
     print('Probes installed. Hit CTRL-C to end...', file=sys.stderr)
     try:
-        outcome = decode_and_print_forever(s)
+        outcome = decode_and_print_forever(pid, s)
         if outcome == tracer.DecodeEndReason.DISCONNECTED:
             print('Target disconnected.', file=sys.stderr)
             return EndReason.DISCONNECTED
@@ -118,15 +118,16 @@ def tracepid(pid: int, encoded_script: bytes):
         # TODO: verify the connected party is pid
         os.unlink(comms.localpath)
 
-        outcome = receive_and_print_until_interrupted(s)
+        outcome = receive_and_print_until_interrupted(pid, s)
         if (outcome == EndReason.INTERRUPTED
                 or wait_till_gone(pid) == PIDState.STILL_THERE):
             print('Removing probes...', file=sys.stderr)
+            # BUG: this may hang if end probes send too much data
             pymontrace.attacher.attach_and_exec(
                 pid,
                 format_untrace_snippet(),
             )
-        decode_and_print_remaining(s)
+        decode_and_print_remaining(pid, s)
 
 
 def subprocess_entry(progpath, encoded_script: bytes):
@@ -165,11 +166,11 @@ def tracesubprocess(progpath: str, prog_text):
         s, _ = ss.accept()
         os.unlink(comms.localpath)
 
-        receive_and_print_until_interrupted(s)
+        receive_and_print_until_interrupted(p.pid, s)
         # The child will also have had a SIGINT at this point as it's
         # in the same terminal group. So should have ended unless it's
         # installed its own signal handlers.
-        decode_and_print_remaining(s)
+        decode_and_print_remaining(p.pid, s)
 
 
 def cli_main():
