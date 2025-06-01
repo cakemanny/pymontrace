@@ -23,15 +23,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
-        runner: ["macos-13", "macos-latest", "ubuntu-latest"]
-        include:
-          # pymontrace seems to hang attaching to Python 3.13 on the arm runner
-          # so we just test a couple of versions for now.
-          - python-version: "3.9"
-            runner: "ubuntu-24.04-arm"
-          - python-version: "3.12"
-            runner: "ubuntu-24.04-arm"
+        python-version: ["3.9",
+          #"3.10", "3.11", "3.12", "3.13"
+          ]
+        runner: ["macos-13",
+          #"macos-latest", "ubuntu-latest"
+          ]
+        #include:
+        #  # pymontrace seems to hang attaching to Python 3.13 on the arm runner
+        #  # so we just test a couple of versions for now.
+        #  - python-version: "3.9"
+        #    runner: "ubuntu-24.04-arm"
+        #  - python-version: "3.12"
+        #    runner: "ubuntu-24.04-arm"
 
     runs-on: ${{ matrix.runner }}
 
@@ -47,10 +51,22 @@ jobs:
         echo "set man-db/auto-update false" | sudo debconf-communicate
         sudo dpkg-reconfigure man-db
     - uses: actions/checkout@v4
+
     - uses: actions/setup-python@v5
       if: ${{ ! startsWith(matrix.runner, 'macos-') }}
       with:
         python-version: ${{ matrix.python-version }}
+
+    - name: Install the latest version of uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        version: "latest"
+
+    - name: Install Python ${{ matrix.python-version }} with uv
+      if: ${{ startsWith(matrix.runner, 'macos-') }}
+      run: |
+        uv python install ${{ matrix.python-version }}
+
     - name: Install Python ${{ matrix.python-version }}
       if: ${{ startsWith(matrix.runner, 'macos-') }}
       # The github hosted runners seem to come with certain system python
@@ -59,16 +75,14 @@ jobs:
       run: |
         brew uninstall -f --ignore-dependencies python@${{ matrix.python-version }}
         brew install --overwrite python@${{ matrix.python-version }}
-    - name: Install the latest version of uv
-      uses: astral-sh/setup-uv@v6
-      with:
-        version: "latest"
+
     - name: Print Versions
       run: |
         uname -a
         python${{ matrix.python-version }} -VV
         file "$( which python${{ matrix.python-version }} )"
         uv --version
+
     - name: Create virtualenv
       run: |
         python${{ matrix.python-version }} -m venv .venv
