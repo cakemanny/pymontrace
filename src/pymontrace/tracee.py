@@ -376,29 +376,49 @@ class EvaluationError(PMTError):
 
 
 class aggregation:
-    COUNT = object()
+    class Base:
+        def aggregate(self, current):
+            raise NotImplementedError
 
-    class Sum:
+    class Count(Base):
+        def aggregate(self, current: Optional[int]):
+            return (current or 0) + 1
+
+    class Sum(Base):
         def __init__(self, value):
             self.value = value
 
-    class Max:
+        def aggregate(self, current):
+            return (current or 0) + self.value
+
+    class Max(Base):
         def __init__(self, value):
             self.value = value
 
-    class Min:
+        def aggregate(self, current):
+            return self.value if current is None else max(current, self.value)
+
+    class Min(Base):
         def __init__(self, value):
             self.value = value
 
-    class Quantize:
+        def aggregate(self, current):
+            return self.value if current is None else min(current, self.value)
+
+    class Quantize(Base):
         def __init__(self, value):
             self.value = value
+
+        def aggregate(self, current: Optional['Quantization']):
+            quant = current or Quantization()
+            quant.add(self.value)
+            return quant
 
 
 class agg:
     @staticmethod
     def count():
-        return aggregation.COUNT
+        return aggregation.Count()
 
     @staticmethod
     def sum(value):
@@ -466,25 +486,11 @@ class Quantization:
 class VarNS(SimpleNamespace):
 
     def __setattr__(self, name: str, value, /) -> None:
-        if value is aggregation.COUNT:
-            # This would probably want / need to deal with threadlocalness /
-            # contextness
-            current = getattr(self, name, 0)
-            object.__setattr__(self, name, current + 1)
-        elif isinstance(value, aggregation.Sum):
-            current = getattr(self, name, 0)
-            object.__setattr__(self, name, current + value.value)
-        elif isinstance(value, aggregation.Min):
-            current = getattr(self, name, value.value)
-            object.__setattr__(self, name, min(current, value.value))
-        elif isinstance(value, aggregation.Max):
-            current = getattr(self, name, value.value)
-            object.__setattr__(self, name, max(current, value.value))
-        elif isinstance(value, aggregation.Quantize):
-            if (current := getattr(self, name, None)) is None:
-                current = Quantization()
-            current.add(value.value)
-            object.__setattr__(self, name, current)
+
+        current = getattr(self, name, None)
+        if isinstance(value, aggregation.Base):
+            new = value.aggregate(current)
+            object.__setattr__(self, name, new)
         else:
             object.__setattr__(self, name, value)
 
@@ -492,25 +498,12 @@ class VarNS(SimpleNamespace):
 class PMTMap(dict):  # Should be collections.MutableMapping
 
     def __setitem__(self, key, value, /) -> None:
-        if value is aggregation.COUNT:
-            current = self.get(key, 0)
-            return super().__setitem__(key, current + 1)
-        elif isinstance(value, aggregation.Sum):
-            current = self.get(key, 0)
-            return super().__setitem__(key, current + value.value)
-        elif isinstance(value, aggregation.Min):
-            current = self.get(key, value.value)
-            return super().__setitem__(key, min(current, value.value))
-        elif isinstance(value, aggregation.Max):
-            current = self.get(key, value.value)
-            return super().__setitem__(key, max(current, value.value))
-        elif isinstance(value, aggregation.Quantize):
-            if (current := self.get(key, None)) is None:
-                current = Quantization()
-            current.add(value.value)
-            return super().__setitem__(key, current)
+        current = self.get(key, None)
+        if isinstance(value, aggregation.Base):
+            new = value.aggregate(current)
+            super().__setitem__(key, new)
         else:
-            return super().__setitem__(key, value)
+            super().__setitem__(key, value)
 
 
 class MapNS(SimpleNamespace):

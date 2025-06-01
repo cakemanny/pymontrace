@@ -141,6 +141,25 @@ def test_decode_pymontrace_program():
 
 # Aggregations
 
+@pytest.fixture(autouse=True, scope="module")
+def reset_pmt():
+    from pymontrace.tracee import pmt
+    yield
+    pmt._reset()
+
+
+def test_vars():
+    from pymontrace.tracee import pmt
+
+    pmt.vars.xxx = 1
+    assert pmt.vars.xxx == 1
+
+    class Dumb:
+        aggregate = 7
+
+    pmt.vars.yyy = Dumb()
+    assert pmt.vars.yyy.aggregate == 7
+
 
 def test_agg_count():
     from pymontrace.tracee import agg, pmt
