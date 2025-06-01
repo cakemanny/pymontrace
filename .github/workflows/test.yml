@@ -67,25 +67,26 @@ jobs:
       run: |
         uv python install ${{ matrix.python-version }}
 
-    - name: Install Python ${{ matrix.python-version }}
-      if: ${{ startsWith(matrix.runner, 'macos-') }}
-      # The github hosted runners seem to come with certain system python
-      # version installed and linked into the brew cellar, so we must use
-      # brew reinstall.
+    #- name: Install Python ${{ matrix.python-version }}
+    #  if: ${{ startsWith(matrix.runner, 'macos-') }}
+    #  # The github hosted runners seem to come with certain system python
+    #  # version installed and linked into the brew cellar, so we must use
+    #  # brew reinstall.
+    #  run: |
+    #    brew uninstall -f --ignore-dependencies python@${{ matrix.python-version }}
+    #    brew install --overwrite python@${{ matrix.python-version }}
+
+    - name: Create virtualenv
       run: |
-        brew uninstall -f --ignore-dependencies python@${{ matrix.python-version }}
-        brew install --overwrite python@${{ matrix.python-version }}
+        uv venv -p ${{ matrix.python-version }} --managed-python
 
     - name: Print Versions
       run: |
+        source .venv/bin/activate
         uname -a
         python${{ matrix.python-version }} -VV
         file "$( which python${{ matrix.python-version }} )"
         uv --version
-
-    - name: Create virtualenv
-      run: |
-        python${{ matrix.python-version }} -m venv .venv
 
     - name: Install dependencies
       env:
