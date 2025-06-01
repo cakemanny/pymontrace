@@ -3,6 +3,8 @@ import pathlib
 import signal
 import subprocess
 import sys
+import textwrap
+from typing import Union
 
 import pytest
 
@@ -51,11 +53,23 @@ def wait_for_started(p: subprocess.Popen):
     assert stdout == b'started\n'
 
 
-def test_end_probe():
-    if os.uname().sysname == 'Darwin':
-        pytest.skip('needs root on darwin')
+def get_ptrace_scope() -> Union[int, None]:
+    scope_file = "/proc/sys/kernel/yama/ptrace_scope"
+    if os.path.isfile(scope_file):
+        with open(scope_file) as f:
+            return int(f.read().strip())
+    return None
 
-    import textwrap
+
+def test_end_probe():
+    if sys.platform == 'darwin' and os.getuid() != 0:
+        pytest.skip('needs root on darwin')
+    if str(sys.platform) == 'linux' and (scope := get_ptrace_scope()) not in (None, 0):
+        msg = f'need ptrace_scope: 0, found: {scope}'
+        if os.getenv("CI"):
+            pytest.fail(msg)
+        else:
+            pytest.skip(msg)
 
     target_program = textwrap.dedent(
         """

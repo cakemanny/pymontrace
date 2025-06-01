@@ -101,6 +101,7 @@ jobs:
         if [[ $(uname) == "Darwin" ]]; then
           sudo pytest integration_tests
         else
+          echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
           pytest integration_tests
         fi
 
