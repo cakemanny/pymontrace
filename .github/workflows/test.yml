@@ -23,11 +23,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9",
-          #"3.10", "3.11", "3.12", "3.13"
-          ]
-        runner: ["macos-13",
-          #"macos-latest", "ubuntu-latest"
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        runner: ["macos-13", "macos-latest",
+          #"ubuntu-latest"
           ]
         #include:
         #  # pymontrace seems to hang attaching to Python 3.13 on the arm runner
