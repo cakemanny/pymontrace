@@ -11,6 +11,11 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
+    - name: Disable man-db triggers
+      # https://github.com/actions/runner-images/issues/10977#issuecomment-2810713336
+      run: |
+        echo "set man-db/auto-update false" | sudo debconf-communicate
+        sudo dpkg-reconfigure man-db
     - uses: actions/checkout@v4
     - run: sudo make check
 
