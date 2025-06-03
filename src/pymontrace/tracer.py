@@ -475,8 +475,9 @@ def decode_and_print_forever(pid: int, s: socket.socket, only_print=False):
                 return DecodeEndReason.ENDED_EARLY
             elif kind == Message.MAPS:
                 filepath = body.decode()
-                print_maps(from_remote_path(pid, filepath))
-                os.unlink(filepath)
+                localpath = from_remote_path(pid, filepath)
+                print_maps(localpath)
+                os.unlink(localpath)
             else:
                 print('unknown message kind:', kind, file=sys.stderr)
     finally:
