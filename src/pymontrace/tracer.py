@@ -1,5 +1,6 @@
 import enum
 import inspect
+import io
 import os
 import pathlib
 import pickle
@@ -18,7 +19,7 @@ from tempfile import TemporaryDirectory
 from typing import NoReturn
 
 from pymontrace import _darwin, attacher
-from pymontrace.tracee import PROBES_BY_NAME
+from pymontrace.tracee import PROBES_BY_NAME, TBBufDesc, TBHeader
 
 
 # Replace with typing.assert_never after 3.11
@@ -412,14 +413,18 @@ def install_signal_handler():
         signal.signal(signo, signal_handler)
 
 
-class DecodeEndReason(enum.Enum):
-    DISCONNECTED = enum.auto()
-    EXITED = enum.auto()
-    ENDED_EARLY = enum.auto()
+class WaitResult(enum.Enum):
+    READY = enum.auto()
+    TIMEOUT = enum.auto()
 
 
-def wait_till_ready_or_got_signal(s: socket.socket, sel: selectors.BaseSelector):
-    for key, _ in sel.select():
+def wait_till_ready_or_got_signal(
+    s: socket.socket, sel: selectors.BaseSelector
+) -> WaitResult:
+    ready = sel.select(timeout=0.1)
+    if len(ready) == 0:
+        return WaitResult.TIMEOUT
+    for key, _ in ready:
         if key.fileobj == signal_read:
             received = signal_read.recv(1)
             if received == b'':
@@ -433,15 +438,146 @@ def wait_till_ready_or_got_signal(s: socket.socket, sel: selectors.BaseSelector)
 
         assert key.fileobj == s
     # If we make it out of that for loop it means s is ready
+    return WaitResult.READY
 
 
-def decode_and_print_forever(pid: int, s: socket.socket, only_print=False):
+FMTS = ('QQ', 'IIQ', 'IIQ')
+HEADER_SIZE = struct.calcsize('@' + ''.join(FMTS))
+PART_STRUCTS = tuple(struct.Struct(f'@{fmt}') for fmt in FMTS)
+PART_SIZES = tuple(s.size for s in PART_STRUCTS)
+
+
+def read_header(f: io.FileIO):
+    size = HEADER_SIZE
+    data = os.pread(f.fileno(), size, 0)
+    if len(data) != size:
+        raise Exception(
+            f'short read of tracebuffer header: read {len(data)}, wanted {size}')
+
+    start, end, epoch = PART_STRUCTS[2].unpack_from(data, size - PART_SIZES[2])
+    buf1 = TBBufDesc(start, end, epoch, f.tell())
+    start, end, epoch = PART_STRUCTS[1].unpack_from(data, PART_SIZES[0])
+    buf0 = TBBufDesc(start, end, epoch, buf1.start)
+
+    counter, epoch = PART_STRUCTS[0].unpack_from(data, 0)
+    return TBHeader(counter, epoch, bufs=(buf0, buf1))
+
+
+COUNTER_SIZE = struct.calcsize('@Q')
+
+
+def read_counter(f: io.FileIO):
+    length = COUNTER_SIZE
+    raw = os.pread(f.fileno(), length, 0)
+    if len(raw) != length:
+        raise Exception('failed to read counter')
+    return int.from_bytes(raw, sys.byteorder)
+
+
+class TraceBuffer:
+    def __init__(self, fileobj: io.FileIO) -> None:
+        from mmap import PAGESIZE
+
+        # We assign this before validing so that __del__ can close it
+        # if the check fails
+        self.f = fileobj
+
+        if fileobj.tell() < PAGESIZE:
+            assert fileobj.tell() == fileobj.seek(0, os.SEEK_END)
+            raise ValueError(f'tracebuffer is too short: {fileobj.tell()}')
+
+        self.epoch = 2
+        self.mark = 0  # offset from start of current buffer
+
+        self.header = read_header(self.f)
+
+    @classmethod
+    def for_path(cls, filepath: str):
+        return cls(open(filepath, 'a+b', buffering=0))
+
+    def __del__(self):
+        self.f.close()
+
+    def read(self) -> bytes:
+        # This is probably going to be too slow to succeed always
+        for _ in range(2560):
+            self.header = read_header(self.f)
+            # if counter is odd retry
+            if self.header.counter & 1:
+                continue
+            which_buffer = self.epoch & 1
+            buf = self.header.bufs[which_buffer]
+            assert self.epoch <= buf.epoch, f"{self.epoch=}, {buf.epoch=}"
+            if buf.epoch != self.epoch:
+                # dropped a buffer
+                print('WARN: dropped buffer', file=sys.stderr)
+                self.epoch += 1
+                self.mark = 0
+                continue
+            start = buf.start + self.mark
+            length = buf.end - start
+            if length == 0:
+                # Either we have nothing to read or the buffer switched
+                reread_counter = read_counter(self.f)
+                assert reread_counter >= self.header.counter
+                if self.header.counter != reread_counter:
+                    # dirty read
+                    continue
+                if self.epoch == self.header.epoch:
+                    return b''
+                # self.epoch < self.header.epoch:
+                self.epoch += 1
+                self.mark = 0
+                continue
+            data = os.pread(self.f.fileno(), length, start)
+            reread_counter = read_counter(self.f)
+            assert reread_counter >= self.header.counter
+            if self.header.counter != reread_counter:
+                # dirty read
+                continue
+            # CLEAN READ
+            self.mark += length
+            return data
+        raise Exception('failed to cleanly read tracebuffer')
+
+
+def decode_trace_buffers_once(buffers: list[TraceBuffer]):
+    from pymontrace.tracee import Message
+
+    header_fmt = struct.Struct('=HH')
+
+    for buf in buffers:
+        data = buf.read()
+        while data != b'':
+            (kind, size) = header_fmt.unpack_from(data)
+            offset = header_fmt.size
+            body = data[offset:offset + size]
+            data = data[offset + size:]
+            if kind in (Message.PRINT, Message.ERROR,):
+                line = body
+                out = (sys.stderr if kind == Message.ERROR else sys.stdout)
+                out.write(line.decode())
+            else:
+                print(f'unexpected data in trace buffer: {kind=}', file=sys.stderr)
+
+
+class DecodeEndReason(enum.Enum):
+    DISCONNECTED = enum.auto()
+    EXITED = enum.auto()
+    ENDED_EARLY = enum.auto()
+
+
+def decode_and_print_forever(
+    pid: int, s: socket.socket, tbs: list[TraceBuffer], *, only_print=False
+):
     from pymontrace.tracee import Message
     EVENT_READ = selectors.EVENT_READ
 
     sel = selectors.DefaultSelector()
     sel.register(signal_read, EVENT_READ)
     sel.register(s, EVENT_READ)
+
+    trace_buffers: list[TraceBuffer] = tbs
 
     t = None
     try:
@@ -450,18 +586,18 @@ def decode_and_print_forever(pid: int, s: socket.socket, only_print=False):
             # We check for signals between message receipt so that s remains
             # in a good state to read final shutdown messages (e.g. from
             # the pymontrace::END probe)
-            wait_till_ready_or_got_signal(s, sel)
+            if wait_till_ready_or_got_signal(s, sel) == WaitResult.TIMEOUT:
+                decode_trace_buffers_once(trace_buffers)
+                continue
 
             header = s.recv(header_fmt.size)
             if header == b'':
+                decode_trace_buffers_once(trace_buffers)
                 return DecodeEndReason.DISCONNECTED
             (kind, size) = header_fmt.unpack(header)
             body = s.recv(size)
-            if kind in (Message.PRINT, Message.ERROR,):
-                line = body
-                out = (sys.stderr if kind == Message.ERROR else sys.stdout)
-                out.write(line.decode())
-            elif kind == Message.THREADS and only_print:
+
+            if kind == Message.THREADS and only_print:
                 print(f'ignoring {kind=} during shutdown', file=sys.stderr)
             elif kind == Message.THREADS:
                 count_threads = size // struct.calcsize('=Q')
@@ -470,14 +606,23 @@ def decode_and_print_forever(pid: int, s: socket.socket, only_print=False):
                                      args=(pid, thread_ids), daemon=True)
                 t.start()
             elif kind == Message.EXIT:
+                decode_trace_buffers_once(trace_buffers)
                 return DecodeEndReason.EXITED
             elif kind == Message.END_EARLY:
+                decode_trace_buffers_once(trace_buffers)
                 return DecodeEndReason.ENDED_EARLY
             elif kind == Message.MAPS:
                 filepath = body.decode()
                 localpath = from_remote_path(pid, filepath)
                 print_maps(localpath)
                 os.unlink(localpath)
+            elif kind == Message.BUFFER:
+                filepath = body.decode()
+                localpath = from_remote_path(pid, filepath)
+                trace_buffers.append(TraceBuffer.for_path(localpath))
+                os.unlink(localpath)
+            elif kind == Message.HEARTBEAT:
+                pass
             else:
                 print('unknown message kind:', kind, file=sys.stderr)
     finally:
@@ -490,9 +635,9 @@ def decode_and_print_forever(pid: int, s: socket.socket, only_print=False):
             t.join()
 
 
-def decode_and_print_remaining(pid: int, s: socket.socket):
+def decode_and_print_remaining(pid: int, s: socket.socket, tbs: list[TraceBuffer]):
     # This should not block as the client should have disconnected
-    decode_and_print_forever(pid, s, only_print=True)
+    decode_and_print_forever(pid, s, tbs, only_print=True)
 
 
 def print_maps(mapsfile_path):

@@ -52,10 +52,12 @@ class EndReason(enum.Enum):
     INTERRUPTED = enum.auto()
 
 
-def receive_and_print_until_interrupted(pid: int, s: socket.socket) -> EndReason:
+def receive_and_print_until_interrupted(
+    pid: int, s: socket.socket, tracebuffers: list
+) -> EndReason:
     print('Probes installed. Hit CTRL-C to end...', file=sys.stderr)
     try:
-        outcome = decode_and_print_forever(pid, s)
+        outcome = decode_and_print_forever(pid, s, tracebuffers)
         if outcome == tracer.DecodeEndReason.DISCONNECTED:
             print('Target disconnected.', file=sys.stderr)
             return EndReason.DISCONNECTED
@@ -118,7 +120,9 @@ def tracepid(pid: int, encoded_script: bytes):
         # TODO: verify the connected party is pid
         os.unlink(comms.localpath)
 
-        outcome = receive_and_print_until_interrupted(pid, s)
+        tracebuffers = []
+
+        outcome = receive_and_print_until_interrupted(pid, s, tracebuffers)
         if (outcome == EndReason.INTERRUPTED
                 or wait_till_gone(pid) == PIDState.STILL_THERE):
             print('Removing probes...', file=sys.stderr)
@@ -127,7 +131,7 @@ def tracepid(pid: int, encoded_script: bytes):
                 pid,
                 format_untrace_snippet(),
             )
-        decode_and_print_remaining(pid, s)
+        decode_and_print_remaining(pid, s, tracebuffers)
 
 
 def subprocess_entry(progpath, encoded_script: bytes):
@@ -166,11 +170,12 @@ def tracesubprocess(progpath: str, prog_text):
         s, _ = ss.accept()
         os.unlink(comms.localpath)
 
-        receive_and_print_until_interrupted(p.pid, s)
+        tracebuffers = []
+        receive_and_print_until_interrupted(p.pid, s, tracebuffers)
         # The child will also have had a SIGINT at this point as it's
         # in the same terminal group. So should have ended unless it's
         # installed its own signal handlers.
-        decode_and_print_remaining(p.pid, s)
+        decode_and_print_remaining(p.pid, s, tracebuffers)
 
 
 def cli_main():
