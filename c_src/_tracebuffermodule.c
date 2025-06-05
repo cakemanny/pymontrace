@@ -35,9 +35,16 @@
 // The structure that lives at the head of our mapping
 struct mapping_header {
     _Atomic unsigned long counter;
+    unsigned long epoch;
+    char bufname[32];
 
-    long msg_offset;
-    long msg_size;
+    struct {
+        uint32_t start; /* offset from start of mapping */
+        uint32_t position;  /* */
+        uint32_t limit; /* end as offset from start of mapping */
+        uint64_t epoch; /* even for first buffer, odd for second, matching
+                           header for the active buffer */
+    } bufs[2];
 };
 
 
@@ -58,6 +65,9 @@ typedef struct {
     int fd;     // The fd backing the mapping. Not owned.
     void* data; // The mmapped mapping. Owned.
     size_t len; // The len of the mapping.
+    unsigned long epoch; // The epoch of the current buffer being read (reader)
+    uint32_t mark; // The read position in the current buffer (reader)
+                   // as an offset from its start.
 
     int max_loops;  // PERF: A counter for benchmarking read
                     // efficiency/starvation
@@ -81,7 +91,23 @@ newTraceBufferObject(PyObject *module, int fd, void* data, size_t len)
     self->fd = fd;
     self->data = data;
     self->len = len;
+    self->epoch = 2;
+    self->mark = 0;
     self->max_loops = 0;
+
+    struct mapping_header* hdr = self->data;
+    /* start at 2 so that the second buffer (starting at epoch 1) is invalid
+     * to start */
+    hdr->counter = 0;
+    hdr->epoch = 2;
+    hdr->bufs[0].start = sizeof(struct mapping_header);
+    hdr->bufs[0].position = hdr->bufs[0].start;
+    hdr->bufs[0].limit = len / 2;
+    hdr->bufs[0].epoch = 2;
+    hdr->bufs[1].start = hdr->bufs[0].limit;
+    hdr->bufs[1].position = hdr->bufs[1].start;
+    hdr->bufs[1].limit = len;
+    hdr->bufs[1].epoch = 1;
 
     return self;
 }
@@ -166,6 +192,8 @@ TraceBuffer_write(PyObject *op, PyObject *args)
         Py_RETURN_NONE;
     }
     if (data_len > MAX_WRITE) {
+        // If we change this max write, then it must be based on the smallest
+        // of the two buffer sizes.
         PyErr_SetString(PyExc_ValueError, "too large: max size 1024");
         return NULL;
     }
@@ -189,11 +217,23 @@ TraceBuffer_write(PyObject *op, PyObject *args)
         return NULL;
     }
 
-    hdr->msg_offset = sizeof *hdr;
-    static_assert(sizeof hdr->msg_size >= sizeof data_len, "msg_size is too small");
-    hdr->msg_size = data_len;
+    int which_buffer = hdr->epoch & 1;
+    __auto_type buf = &hdr->bufs[which_buffer];
+    uint32_t space = buf->limit - buf->position;
 
-    memcpy(self->data + hdr->msg_offset, data, data_len);
+    if (space < data_len) {
+        // switch
+        hdr->epoch += 1;
+        which_buffer ^= 1;
+        buf = &hdr->bufs[which_buffer];
+        assert(data_len < (buf->limit - buf->start));
+        buf->position = buf->start + data_len;
+        buf->epoch += 1;
+    } else {
+        buf->position += data_len;
+    }
+
+    memcpy(self->data + buf->position - data_len, data, data_len);
 
     // Unlock
     atomic_fetch_add_explicit(&hdr->counter, 1, memory_order_release);
@@ -205,7 +245,7 @@ TraceBuffer_write(PyObject *op, PyObject *args)
 static PyObject *
 TraceBuffer_read(PyObject *op, PyObject *args)
 {
-    char buf[MAX_WRITE] = {};
+    char out_buf[MAX_WRITE] = {};
     int out_len = 0;
     TraceBufferObject *self = TraceBufferObject_CAST(op);
 
@@ -226,12 +266,41 @@ TraceBuffer_read(PyObject *op, PyObject *args)
             continue;
         }
 
-        long size = hdr->msg_size;
-        long offset = hdr->msg_offset;
-        if (size > 0 && size <= MAX_WRITE) {
-            assert(offset == sizeof(*hdr));
-            memcpy(buf, self->data + offset, size);
-            out_len = size;
+        int which_buffer = self->epoch & 1;
+        __auto_type buf = &hdr->bufs[which_buffer];
+        assert(self->epoch <= buf->epoch);
+        if (self->epoch != buf->epoch) {
+            // TODO: Is there some python function to write to the current
+            // sys.stderr?
+            fprintf(stderr, "WARN: dropped buffer\n");
+            self->epoch += 1;
+            self->mark = 0;
+            continue;
+        }
+        uint32_t start = buf->start + self->mark;
+        uint32_t length = buf->position - start;
+        if (length == 0) {
+            unsigned long hdr_epoch = hdr->epoch;
+            // See below for full comments.
+            atomic_thread_fence(memory_order_acquire);
+            unsigned long ctr2 = atomic_load_explicit(&hdr->counter,
+                    memory_order_relaxed);
+            if (ctr != ctr2) {
+                continue; // dirty read
+            }
+            if (self->epoch < hdr_epoch) {
+                self->epoch += 1;
+                self->mark = 0;
+                continue;
+            }
+            // Nothing to read
+            return Py_BuildValue("y#", out_buf, 0);
+        }
+
+        long offset = start;
+        if (length > 0 && length <= MAX_WRITE) {
+            memcpy(out_buf, self->data + offset, length);
+            out_len = length;
         }
 
         // A fence so that the following counter read can't be moved before
@@ -246,8 +315,9 @@ TraceBuffer_read(PyObject *op, PyObject *args)
         if (ctr == ctr2) {
             if (i > self->max_loops) self->max_loops = i;
 
+            self->mark += length;
             // clean read
-            return Py_BuildValue("y#", buf, out_len);
+            return Py_BuildValue("y#", out_buf, out_len);
         }
     }
 
@@ -307,9 +377,13 @@ tracebuffer_create(PyObject *module, PyObject *args)
         return NULL;
     }
 
-    // TODO: check file size?
+    struct stat statbuf;
+    if (-1 == fstat(fd, &statbuf)) {
+        PyErr_SetFromErrno(PyExc_OSError);
+        return NULL;
+    }
 
-    size_t len = 16384;
+    size_t len = (size_t)statbuf.st_size;
     void* mapped = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (mapped == MAP_FAILED) {
         PyErr_SetFromErrno(PyExc_OSError);
