@@ -35,8 +35,8 @@ setup(
             py_limited_api=True,
         ),
         Extension(
-            name="pymontrace._mapbuffer",
-            sources=["c_src/mapbuffermodule.c"],
+            name="pymontrace._tracebuffer",
+            sources=["c_src/_tracebuffermodule.c"],
             undef_macros=undef_macros,
             py_limited_api=True,
         ),

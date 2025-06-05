@@ -43,14 +43,14 @@ struct mapping_header {
 
 // Module state
 typedef struct {
-    PyObject *MapBuffer_Type;    // MapBuffer class
+    PyObject *TraceBuffer_Type;    // TraceBuffer class
                            //
     /*
      * Could contains something like a linked list to all the instances?
      */
-} mapbuffer_state;
+} tracebuffer_state;
 
-/* MapBuffer objects */
+/* TraceBuffer objects */
 
 // Instance state
 typedef struct {
@@ -61,19 +61,19 @@ typedef struct {
 
     int max_loops;  // PERF: A counter for benchmarking read
                     // efficiency/starvation
-} MapBufferObject;
+} TraceBufferObject;
 
-#define MapBufferObject_CAST(op)  ((MapBufferObject *)(op))
+#define TraceBufferObject_CAST(op)  ((TraceBufferObject *)(op))
 
-static MapBufferObject *
-newMapBufferObject(PyObject *module, int fd, void* data, size_t len)
+static TraceBufferObject *
+newTraceBufferObject(PyObject *module, int fd, void* data, size_t len)
 {
-    mapbuffer_state *state = PyModule_GetState(module);
+    tracebuffer_state *state = PyModule_GetState(module);
     if (state == NULL) {
         return NULL;
     }
-    MapBufferObject *self;
-    self = PyObject_GC_New(MapBufferObject, (PyTypeObject*)state->MapBuffer_Type);
+    TraceBufferObject *self;
+    self = PyObject_GC_New(TraceBufferObject, (PyTypeObject*)state->TraceBuffer_Type);
     if (self == NULL) {
         return NULL;
     }
@@ -86,47 +86,47 @@ newMapBufferObject(PyObject *module, int fd, void* data, size_t len)
     return self;
 }
 
-/* MapBuffer finalization */
+/* TraceBuffer finalization */
 
 static int
-MapBuffer_traverse(PyObject *op, visitproc visit, void *arg)
+TraceBuffer_traverse(PyObject *op, visitproc visit, void *arg)
 {
     // Visit the type
     Py_VISIT(Py_TYPE(op));
 
     // Visit the attribute dict
-    MapBufferObject *self = MapBufferObject_CAST(op);
+    TraceBufferObject *self = TraceBufferObject_CAST(op);
     if(self) {}
     return 0;
 }
 
 static int
-MapBuffer_clear(PyObject *op)
+TraceBuffer_clear(PyObject *op)
 {
-    MapBufferObject *self = MapBufferObject_CAST(op);
+    TraceBufferObject *self = TraceBufferObject_CAST(op);
     if(self) {}
     return 0;
 }
 
 static void
-MapBuffer_finalize(PyObject *op)
+TraceBuffer_finalize(PyObject *op)
 {
-    MapBufferObject *self = MapBufferObject_CAST(op);
+    TraceBufferObject *self = TraceBufferObject_CAST(op);
     if(self) {}
 }
 
 static void
-MapBuffer_dealloc(PyObject *op)
+TraceBuffer_dealloc(PyObject *op)
 {
 
     PyObject_GC_UnTrack(op);
-    MapBuffer_finalize(op);
+    TraceBuffer_finalize(op);
     PyTypeObject *tp = Py_TYPE(op);
 
-    MapBufferObject *self = MapBufferObject_CAST(op);
+    TraceBufferObject *self = TraceBufferObject_CAST(op);
 
 #if !defined(NDEBUG)
-    fprintf(stderr, "mapbuffer: MAX_LOOPS = %d\n", self->max_loops);
+    fprintf(stderr, "tracebuffer: MAX_LOOPS = %d\n", self->max_loops);
 #endif
 
     int err;
@@ -137,7 +137,7 @@ MapBuffer_dealloc(PyObject *op)
         // The deallocator must not change exceptions... so.
         // Look into PyErr_WriteUnraisable
 #ifndef NDEBUG
-        perror("_mapbuffer.MapBuffer: munmap");
+        perror("_tracebuffer.TraceBuffer: munmap");
 #endif
     }
 
@@ -146,14 +146,14 @@ MapBuffer_dealloc(PyObject *op)
     Py_DECREF(tp);
 }
 
-/* MapBuffer methods */
+/* TraceBuffer methods */
 
 #define MAX_WRITE   1024
 
 static PyObject *
-MapBuffer_write(PyObject *op, PyObject *args)
+TraceBuffer_write(PyObject *op, PyObject *args)
 {
-    MapBufferObject *self = MapBufferObject_CAST(op);
+    TraceBufferObject *self = TraceBufferObject_CAST(op);
 
     const char* data;
     ssize_t data_len;
@@ -203,11 +203,11 @@ MapBuffer_write(PyObject *op, PyObject *args)
 
 
 static PyObject *
-MapBuffer_read(PyObject *op, PyObject *args)
+TraceBuffer_read(PyObject *op, PyObject *args)
 {
     char buf[MAX_WRITE] = {};
     int out_len = 0;
-    MapBufferObject *self = MapBufferObject_CAST(op);
+    TraceBufferObject *self = TraceBufferObject_CAST(op);
 
     struct mapping_header* hdr = self->data;
     unsigned long ctr;
@@ -261,47 +261,47 @@ MapBuffer_read(PyObject *op, PyObject *args)
     return NULL;
 }
 
-static PyMethodDef MapBuffer_methods[] = {
-    {"write", MapBuffer_write, METH_VARARGS,
+static PyMethodDef TraceBuffer_methods[] = {
+    {"write", TraceBuffer_write, METH_VARARGS,
      PyDoc_STR("write(message: str) -> None")},
-    {"read", MapBuffer_read, METH_VARARGS,
+    {"read", TraceBuffer_read, METH_VARARGS,
      PyDoc_STR("read() -> str")},
     {NULL, NULL, 0, NULL}           /* sentinel */
 };
 
-/* MapBuffer type definition */
+/* TraceBuffer type definition */
 
-PyDoc_STRVAR(MapBuffer_doc,
+PyDoc_STRVAR(TraceBuffer_doc,
         "A wrapper around a shareable mmap");
 
-static PyGetSetDef MapBuffer_getsetlist[] = {
+static PyGetSetDef TraceBuffer_getsetlist[] = {
     {NULL},
 };
 
-static PyType_Slot MapBuffer_Type_slots[] = {
-    {Py_tp_doc, (char *)MapBuffer_doc},
-    {Py_tp_traverse, MapBuffer_traverse},
-    {Py_tp_clear, MapBuffer_clear},
-    {Py_tp_finalize, MapBuffer_finalize},
-    {Py_tp_dealloc, MapBuffer_dealloc},
-    {Py_tp_methods, MapBuffer_methods},
-    {Py_tp_getset, MapBuffer_getsetlist},
+static PyType_Slot TraceBuffer_Type_slots[] = {
+    {Py_tp_doc, (char *)TraceBuffer_doc},
+    {Py_tp_traverse, TraceBuffer_traverse},
+    {Py_tp_clear, TraceBuffer_clear},
+    {Py_tp_finalize, TraceBuffer_finalize},
+    {Py_tp_dealloc, TraceBuffer_dealloc},
+    {Py_tp_methods, TraceBuffer_methods},
+    {Py_tp_getset, TraceBuffer_getsetlist},
     {0, 0},  /* sentinel */
 };
 
-static PyType_Spec MapBuffer_Type_spec = {
-    .name = "pymontrace._mapbuffer.MapBuffer",
-    .basicsize = sizeof(MapBufferObject),
+static PyType_Spec TraceBuffer_Type_spec = {
+    .name = "pymontrace._tracebuffer.TraceBuffer",
+    .basicsize = sizeof(TraceBufferObject),
     .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
-    .slots = MapBuffer_Type_slots,
+    .slots = TraceBuffer_Type_slots,
 };
 
 
 static PyObject *
-mapbuffer_create(PyObject *module, PyObject *args)
+tracebuffer_create(PyObject *module, PyObject *args)
 {
     int fd;
-    MapBufferObject* rv;
+    TraceBufferObject* rv;
 
     if (!PyArg_ParseTuple(args, "i:create", &fd)) {
         return NULL;
@@ -316,7 +316,7 @@ mapbuffer_create(PyObject *module, PyObject *args)
         return NULL;
     }
 
-    rv = newMapBufferObject(module, fd, mapped, len);
+    rv = newTraceBufferObject(module, fd, mapped, len);
     if (rv == NULL) {
         return NULL;
     }
@@ -328,8 +328,8 @@ mapbuffer_create(PyObject *module, PyObject *args)
 PyDoc_STRVAR(create__doc__, "\
 create(file_descriptor: int)");
 
-static PyMethodDef mapbuffer_methods[] = {
-    {"create",  mapbuffer_create, METH_VARARGS,
+static PyMethodDef tracebuffer_methods[] = {
+    {"create",  tracebuffer_create, METH_VARARGS,
      create__doc__},
     {NULL, NULL, 0, NULL}        /* Sentinel */
 };
@@ -343,59 +343,59 @@ An mmap wrapper with synchronisation.\n\
 ");
 
 static int
-mapbuffer_modexec(PyObject *m)
+tracebuffer_modexec(PyObject *m)
 {
-    mapbuffer_state *state = PyModule_GetState(m);
+    tracebuffer_state *state = PyModule_GetState(m);
 
-    state->MapBuffer_Type =
-        PyType_FromModuleAndSpec(m, &MapBuffer_Type_spec, NULL);
-    if (state->MapBuffer_Type == NULL) {
+    state->TraceBuffer_Type =
+        PyType_FromModuleAndSpec(m, &TraceBuffer_Type_spec, NULL);
+    if (state->TraceBuffer_Type == NULL) {
         return -1;
     }
-    if (PyModule_AddType(m, (PyTypeObject*)state->MapBuffer_Type) < 0) {
+    if (PyModule_AddType(m, (PyTypeObject*)state->TraceBuffer_Type) < 0) {
         return -1;
     }
 
     return 0;
 }
 
-static PyModuleDef_Slot mapbuffer_slots[] = {
-    {Py_mod_exec, mapbuffer_modexec},
+static PyModuleDef_Slot tracebuffer_slots[] = {
+    {Py_mod_exec, tracebuffer_modexec},
     {0, NULL}
 };
 
 static int
-mapbuffer_traverse(PyObject *module, visitproc visit, void *arg)
+tracebuffer_traverse(PyObject *module, visitproc visit, void *arg)
 {
-    mapbuffer_state *state = PyModule_GetState(module);
-    Py_VISIT(state->MapBuffer_Type);
+    tracebuffer_state *state = PyModule_GetState(module);
+    Py_VISIT(state->TraceBuffer_Type);
 
     return 0;
 }
 
 static int
-mapbuffer_clear(PyObject *module)
+tracebuffer_clear(PyObject *module)
 {
-    mapbuffer_state *state = PyModule_GetState(module);
-    Py_CLEAR(state->MapBuffer_Type);
+    tracebuffer_state *state = PyModule_GetState(module);
+    Py_CLEAR(state->TraceBuffer_Type);
     return 0;
 }
 
-static struct PyModuleDef mapbuffermodule = {
+static struct PyModuleDef tracebuffermodule = {
     PyModuleDef_HEAD_INIT,
-    .m_name = "pymontrace._mapbuffer",
+    .m_name = "pymontrace._tracebuffer",
     .m_doc = module_doc,
-    .m_size = sizeof(mapbuffer_state),
-    .m_methods = mapbuffer_methods,
-    .m_slots = mapbuffer_slots,
-    .m_traverse = mapbuffer_traverse,
-    .m_clear = mapbuffer_clear,
+    .m_size = sizeof(tracebuffer_state),
+    .m_methods = tracebuffer_methods,
+    .m_slots = tracebuffer_slots,
+    .m_traverse = tracebuffer_traverse,
+    .m_clear = tracebuffer_clear,
     .m_free = NULL,
 };
 
 
 PyMODINIT_FUNC
-PyInit__mapbuffer(void)
+PyInit__tracebuffer(void)
 {
-    return PyModuleDef_Init(&mapbuffermodule);
+    return PyModuleDef_Init(&tracebuffermodule);
 }

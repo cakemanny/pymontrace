@@ -16,7 +16,7 @@ lint:
 	isort src --check --diff
 
 
-TO_CHECK = c_src/attachermodule.c c_src/mapbuffermodule.c
+TO_CHECK = c_src/attachermodule.c c_src/_tracebuffermodule.c
 
 .PHONY: check
 ifeq "$(OS)" "Darwin"
