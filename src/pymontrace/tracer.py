@@ -203,6 +203,8 @@ def install_pymontrace(pid: int) -> TemporaryDirectory:
     we prepare a module containing the tracee parts and extends
     """
     import pymontrace
+    import pymontrace._tracebuffer
+    import pymontrace.tracebuffer
     import pymontrace.tracee
 
     # Maybe there will be cases where checking for some TMPDIR is better.
@@ -217,12 +219,20 @@ def install_pymontrace(pid: int) -> TemporaryDirectory:
     moddir = pathlib.Path(tmpdir.name) / 'pymontrace'
     moddir.mkdir()
 
-    for module in [pymontrace, pymontrace.tracee]:
+    for module in [pymontrace, pymontrace.tracee, pymontrace.tracebuffer]:
         source_file = inspect.getsourcefile(module)
         if source_file is None:
             raise FileNotFoundError('failed to get source for module', module)
 
         shutil.copyfile(source_file, moddir / os.path.basename(source_file))
+
+    for module in [pymontrace._tracebuffer]:
+        if module.__spec__ is None:
+            raise RuntimeError(f'{module.__name__} missing __spec__ attribute')
+        shared_object = module.__spec__.origin
+        if shared_object is None:
+            raise FileNotFoundError('failed to find shared object for module', module)
+        shutil.copyfile(shared_object, moddir / os.path.basename(shared_object))
 
     return tmpdir
 
