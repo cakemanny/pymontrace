@@ -10,18 +10,12 @@ jobs:
 
   check:
     runs-on: ubuntu-latest
+    container:
+      image: python:3.9
     steps:
-    - name: Disable man-db triggers
-      # https://github.com/actions/runner-images/issues/10977#issuecomment-2810713336
-      run: |
-        echo "set man-db/auto-update false" | sudo debconf-communicate
-        sudo dpkg-reconfigure man-db
     - uses: actions/checkout@v4
     # Acquire python header files
-    - uses: actions/setup-python@v5
-      with:
-        python-version: '3.9'
-    - run: sudo make check
+    - run: make check
 
   build:
     strategy:
