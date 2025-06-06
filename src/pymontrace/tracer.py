@@ -1,6 +1,5 @@
 import enum
 import inspect
-import io
 import os
 import pathlib
 import pickle
@@ -18,8 +17,9 @@ from contextlib import contextmanager
 from tempfile import TemporaryDirectory
 from typing import NoReturn
 
-from pymontrace import _darwin, attacher
-from pymontrace.tracee import PROBES_BY_NAME, TBBufDesc, TBHeader
+from pymontrace import _darwin, attacher, tracebuffer
+from pymontrace.tracebuffer import TraceBuffer
+from pymontrace.tracee import PROBES_BY_NAME
 
 
 # Replace with typing.assert_never after 3.11
@@ -441,106 +441,6 @@ def wait_till_ready_or_got_signal(
     return WaitResult.READY
 
 
-FMTS = ('QQ', 'IIQ', 'IIQ')
-HEADER_SIZE = struct.calcsize('@' + ''.join(FMTS))
-PART_STRUCTS = tuple(struct.Struct(f'@{fmt}') for fmt in FMTS)
-PART_SIZES = tuple(s.size for s in PART_STRUCTS)
-
-
-def read_header(f: io.FileIO):
-    size = HEADER_SIZE
-    data = os.pread(f.fileno(), size, 0)
-    if len(data) != size:
-        raise Exception(
-            f'short read of tracebuffer header: read {len(data)}, wanted {size}')
-
-    start, end, epoch = PART_STRUCTS[2].unpack_from(data, size - PART_SIZES[2])
-    buf1 = TBBufDesc(start, end, epoch, f.tell())
-    start, end, epoch = PART_STRUCTS[1].unpack_from(data, PART_SIZES[0])
-    buf0 = TBBufDesc(start, end, epoch, buf1.start)
-
-    counter, epoch = PART_STRUCTS[0].unpack_from(data, 0)
-    return TBHeader(counter, epoch, bufs=(buf0, buf1))
-
-
-COUNTER_SIZE = struct.calcsize('@Q')
-
-
-def read_counter(f: io.FileIO):
-    length = COUNTER_SIZE
-    raw = os.pread(f.fileno(), length, 0)
-    if len(raw) != length:
-        raise Exception('failed to read counter')
-    return int.from_bytes(raw, sys.byteorder)
-
-
-class TraceBuffer:
-    def __init__(self, fileobj: io.FileIO) -> None:
-        from mmap import PAGESIZE
-
-        # We assign this before validing so that __del__ can close it
-        # if the check fails
-        self.f = fileobj
-
-        if fileobj.tell() < PAGESIZE:
-            assert fileobj.tell() == fileobj.seek(0, os.SEEK_END)
-            raise ValueError(f'tracebuffer is too short: {fileobj.tell()}')
-
-        self.epoch = 2
-        self.mark = 0  # offset from start of current buffer
-
-        self.header = read_header(self.f)
-
-    @classmethod
-    def for_path(cls, filepath: str):
-        return cls(open(filepath, 'a+b', buffering=0))
-
-    def __del__(self):
-        self.f.close()
-
-    def read(self) -> bytes:
-        # This is probably going to be too slow to succeed always
-        for _ in range(2560):
-            self.header = read_header(self.f)
-            # if counter is odd retry
-            if self.header.counter & 1:
-                continue
-            which_buffer = self.epoch & 1
-            buf = self.header.bufs[which_buffer]
-            assert self.epoch <= buf.epoch, f"{self.epoch=}, {buf.epoch=}"
-            if buf.epoch != self.epoch:
-                # dropped a buffer
-                print('WARN: dropped buffer', file=sys.stderr)
-                self.epoch += 1
-                self.mark = 0
-                continue
-            start = buf.start + self.mark
-            length = buf.end - start
-            if length == 0:
-                # Either we have nothing to read or the buffer switched
-                reread_counter = read_counter(self.f)
-                assert reread_counter >= self.header.counter
-                if self.header.counter != reread_counter:
-                    # dirty read
-                    continue
-                if self.epoch == self.header.epoch:
-                    return b''
-                # self.epoch < self.header.epoch:
-                self.epoch += 1
-                self.mark = 0
-                continue
-            data = os.pread(self.f.fileno(), length, start)
-            reread_counter = read_counter(self.f)
-            assert reread_counter >= self.header.counter
-            if self.header.counter != reread_counter:
-                # dirty read
-                continue
-            # CLEAN READ
-            self.mark += length
-            return data
-        raise Exception('failed to cleanly read tracebuffer')
-
-
 def decode_trace_buffers_once(buffers: list[TraceBuffer]):
     from pymontrace.tracee import Message
 
@@ -619,7 +519,7 @@ def decode_and_print_forever(
             elif kind == Message.BUFFER:
                 filepath = body.decode()
                 localpath = from_remote_path(pid, filepath)
-                trace_buffers.append(TraceBuffer.for_path(localpath))
+                trace_buffers.append(tracebuffer.create(localpath))
                 os.unlink(localpath)
             elif kind == Message.HEARTBEAT:
                 pass

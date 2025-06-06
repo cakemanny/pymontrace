@@ -46,6 +46,6 @@ def create(filename: str, size: int = DEFAULT_BUFFER_SIZE) -> TraceBuffer:
         raise ValueError("Invalid size, must a multiple of PAGESIZE")
     fd = os.open(filename, os.O_CREAT | os.O_RDWR)
     os.ftruncate(fd, size)
-    with open(fd, 'a+b') as f:  # <- closes the fd
+    with open(fd, 'a+b', buffering=0) as f:  # <- closes the fd
         mb = _tracebuffer.create(f.fileno())
     return TraceBuffer(mb)

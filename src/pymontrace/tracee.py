@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from types import CodeType, FrameType, SimpleNamespace
 from typing import Any, Callable, Literal, NoReturn, Optional, Sequence, Union
 
+from pymontrace import tracebuffer
+
 TOOL_ID = sys.monitoring.DEBUGGER_ID if sys.version_info >= (3, 12) else 0
 
 
@@ -270,96 +272,6 @@ def decode_pymontrace_program(encoded: bytes):
     return probe_actions
 
 
-@dataclass
-class TBHeader:
-    counter: int    # u64
-    epoch: int      # u64
-    bufs: tuple['TBBufDesc', 'TBBufDesc']
-
-    def pack(self) -> bytes:
-        return struct.pack('@QQ', self.counter, self.epoch) + \
-            self.bufs[0].pack() + self.bufs[1].pack()
-
-
-@dataclass
-class TBBufDesc:
-    start: int  # u32
-    end: int    # u32
-    epoch: int  # u64
-    limit: int  # unserialised
-
-    def pack(self) -> bytes:
-        return struct.pack('@IIQ', self.start, self.end, self.epoch)
-
-
-class TraceBuffer:
-    def __init__(self, fp: io.FileIO, size: int) -> None:
-        self._lock = threading.Lock()
-        self.fp = fp
-        self.size = size
-        fmt = '@QQIIQIIQ'
-        header_size = struct.calcsize(fmt)
-        self.header = TBHeader(
-            counter=0,
-            epoch=2,
-            bufs=(
-                TBBufDesc(start=header_size, end=header_size, epoch=2, limit=size // 2),
-                TBBufDesc(start=size // 2, end=size // 2, epoch=1, limit=size),
-            ),
-        )
-        hdr = self.header.pack()
-        if (bytes_written := os.pwrite(fp.fileno(), hdr, 0)) != header_size:
-            raise RuntimeError(
-                f'short write of header {bytes_written} of {header_size} bytes')
-
-        assert os.pread(fp.fileno(), 48, 0) == hdr
-
-    def close(self):
-        self.fp.close()
-
-    def _increment_counter(self):
-        self.header.counter += 1
-        ctr = self.header.counter.to_bytes(8, sys.byteorder, signed=False)
-        if (written := os.pwrite(self.fp.fileno(), ctr, 0)) != 8:
-            raise RuntimeError(f'short write of {written} of 8 bytes')
-
-    def write(self, data):
-        if len(data) > (1 << 15):
-            raise ValueError(f'too much data: {len(data)=} > {1 << 15}')
-
-        # Why timeout? It's possible for the tracer to crash and reattach
-        # while the lock is held. A re-entrant lock would also not block
-        # but may mess up buffer state.
-        if not self._lock.acquire(timeout=1.0):
-            raise TimeoutError('failed to acquire lock on TraceBuffer after 1s')
-        try:
-            which_buffer = self.header.epoch & 1
-            buf = self.header.bufs[which_buffer]
-            space = buf.limit - buf.end
-            # Start writing
-            self._increment_counter()
-
-            if space < len(data):
-                # switch
-                self.header.epoch += 1
-                which_buffer ^= 1
-                buf = self.header.bufs[which_buffer]
-                buf.end = buf.start + len(data)
-                buf.epoch += 2
-                os.pwrite(self.fp.fileno(), self.header.pack(), 0)
-            else:
-                buf.end += len(data)
-                # TODO: optimise / combine write end of writing, maybe
-                os.pwrite(self.fp.fileno(), self.header.pack(), 0)
-
-            os.pwrite(self.fp.fileno(), data, buf.end - len(data))
-
-            # End writing
-            self._increment_counter()
-        finally:
-            self._lock.release()
-
-
 class Message:
     PRINT = 1
     ERROR = 2
@@ -374,7 +286,7 @@ class Message:
 class TracerRemote:
 
     comm_fh: Union[socket.socket, None] = None
-    primary_buffer: Union[TraceBuffer, None] = None
+    primary_buffer: Union[tracebuffer.TraceBuffer, None] = None
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -422,7 +334,7 @@ class TracerRemote:
                     self._force_close()
 
     def _force_close(self):
-        unsettrace()
+        unsettrace()  # TODO: skip end actions... maybe
         self.close()
 
     def _heartbeat(self):
@@ -434,12 +346,7 @@ class TracerRemote:
     def _create_primary_buffer(comm_fh: socket.socket):
         fn: str = comm_fh.getpeername() + '.buffer'
         assert fn.startswith('/'), f"{fn=}"
-        # Must not open with O_APPEND on Linux, see
-        # https://man7.org/linux/man-pages/man2/pread.2.html#BUGS
-        # fd = os.open(fn, os.O_CREAT | os.O_RDWR)
-        f = open(fn, 'x+b', buffering=0, closefd=True)
-        f.truncate(size := 1 * 1024 * 1024)
-        return fn, TraceBuffer(f, size)
+        return fn, tracebuffer.create(fn)
 
     def writeall(self, data):
         self._heartbeat()
@@ -751,7 +658,11 @@ class pmt:
 
         if (comm_fh := remote.comm_fh) is None:
             return
-        dest: str = comm_fh.getpeername() + '.maps'
+        try:
+            dest: str = comm_fh.getpeername() + '.maps'
+        except OSError:
+            # tracer probably died suddenly
+            return
         assert os.path.isabs(dest), f"not absolute: {dest!r}"
 
         if len(vars(pmt.maps)) == 0:
@@ -1170,6 +1081,7 @@ def unsettrace(preclose=None):
             assert probe.is_end
             safe_eval_no_frame(action, snippet)
 
+        # FIXME: this crashes if the tracer died hard
         pmt.printmaps()
 
         pmt._reset()

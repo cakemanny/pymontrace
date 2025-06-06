@@ -228,7 +228,7 @@ TraceBuffer_write(PyObject *op, PyObject *args)
         buf = &hdr->bufs[which_buffer];
         assert(data_len < (buf->limit - buf->start));
         buf->position = buf->start + data_len;
-        buf->epoch += 1;
+        buf->epoch += 2;
     } else {
         buf->position += data_len;
     }
@@ -245,7 +245,7 @@ TraceBuffer_write(PyObject *op, PyObject *args)
 static PyObject *
 TraceBuffer_read(PyObject *op, PyObject *args)
 {
-    char out_buf[MAX_WRITE] = {};
+    char* out_buf = NULL;
     int out_len = 0;
     TraceBufferObject *self = TraceBufferObject_CAST(op);
 
@@ -268,11 +268,17 @@ TraceBuffer_read(PyObject *op, PyObject *args)
 
         int which_buffer = self->epoch & 1;
         __auto_type buf = &hdr->bufs[which_buffer];
+        if (self->epoch > buf->epoch) {
+            fprintf(stderr, "self->epoch: %lu\n", self->epoch);
+            fprintf(stderr, "buf->epoch: %llu\n", buf->epoch);
+        }
         assert(self->epoch <= buf->epoch);
         if (self->epoch != buf->epoch) {
             // TODO: Is there some python function to write to the current
             // sys.stderr?
-            fprintf(stderr, "WARN: dropped buffer\n");
+            fprintf(stderr, "WARN: dropped buffer (epoch %llu)\n", buf->epoch);
+            // FIXME: probably we should check it was a clean read before
+            // bumping our epoch?
             self->epoch += 1;
             self->mark = 0;
             continue;
@@ -294,11 +300,21 @@ TraceBuffer_read(PyObject *op, PyObject *args)
                 continue;
             }
             // Nothing to read
-            return Py_BuildValue("y#", out_buf, 0);
+            PyMem_Free(out_buf); // in case we saw a length in a previous loop
+            char empty_buf[1] = {};
+            return Py_BuildValue("y#", empty_buf, 0);
         }
 
         long offset = start;
-        if (length > 0 && length <= MAX_WRITE) {
+        if (length > 0 && length <= self->len / 2) {
+            void* resized = PyMem_Realloc(out_buf, length);
+            if (resized == NULL) {
+                PyMem_Free(out_buf);
+                PyErr_SetNone(PyExc_MemoryError);
+                return NULL;
+            }
+            out_buf = resized;
+
             memcpy(out_buf, self->data + offset, length);
             out_len = length;
         }
@@ -317,7 +333,9 @@ TraceBuffer_read(PyObject *op, PyObject *args)
 
             self->mark += length;
             // clean read
-            return Py_BuildValue("y#", out_buf, out_len);
+            PyObject* rv = Py_BuildValue("y#", out_buf, out_len);
+            PyMem_Free(out_buf);
+            return rv;
         }
     }
 
@@ -328,6 +346,7 @@ TraceBuffer_read(PyObject *op, PyObject *args)
 
     // failed
     PyErr_SetString(PyExc_RuntimeError, "failed to get a clean read");
+    PyMem_Free(out_buf);
     return NULL;
 }
 
