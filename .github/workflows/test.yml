@@ -17,6 +17,10 @@ jobs:
         echo "set man-db/auto-update false" | sudo debconf-communicate
         sudo dpkg-reconfigure man-db
     - uses: actions/checkout@v4
+    # Acquire python header files
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
     - run: sudo make check
 
   build:
