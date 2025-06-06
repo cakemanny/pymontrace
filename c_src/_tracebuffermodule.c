@@ -275,14 +275,12 @@ TraceBuffer_read(PyObject *op, PyObject *args)
         int which_buffer = self->epoch & 1;
         __auto_type buf = &hdr->bufs[which_buffer];
         if (self->epoch > buf->epoch) {
-            fprintf(stderr, "self->epoch: %lu\n", self->epoch);
-            fprintf(stderr, "buf->epoch: %llu\n", buf->epoch);
+            PySys_FormatStderr("self->epoch: %lu\n", self->epoch);
+            PySys_FormatStderr("buf->epoch: %"PRIu64"\n", buf->epoch);
         }
         assert(self->epoch <= buf->epoch);
         if (self->epoch != buf->epoch) {
-            // TODO: Is there some python function to write to the current
-            // sys.stderr?
-            fprintf(stderr, "WARN: dropped buffer (epoch %llu)\n", buf->epoch);
+            PySys_FormatStderr("WARN: dropped buffer (epoch %"PRIu64")\n", buf->epoch);
             // FIXME: probably we should check it was a clean read before
             // bumping our epoch?
             self->epoch += 1;
@@ -324,7 +322,7 @@ TraceBuffer_read(PyObject *op, PyObject *args)
             memcpy(out_buf, self->data + offset, length);
             out_len = length;
         } else {
-            fprintf(stderr, "WARN: bad read length");
+            PySys_FormatStderr("WARN: bad read length\n");
         }
 
         // A fence so that the following counter read can't be moved before
