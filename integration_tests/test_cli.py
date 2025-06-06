@@ -49,6 +49,24 @@ def test_func_probe():
     assert b'Traceback' not in p.stderr
 
 
+def test_aggregation():
+
+    p = subprocess.run(
+        [
+            'pymontrace',
+            '-c',
+            'modulo_loop.py',
+            '-e',
+            'func:*.inner:start {{ maps.a_values[ctx.a] = agg.count() }}'
+        ],
+        cwd=(pathlib.Path('.') / 'integration_tests' / 'targets'),
+        capture_output=True
+    )
+    p.check_returncode()
+    assert b'a_values \n\n  4: 12\n  5: 12\n  ' in p.stdout
+    assert b'Traceback' not in p.stderr
+
+
 def wait_for_started(p: subprocess.Popen):
     # Most of the programs in this test suite write b'started\n' to stdout
     # as a syncronisation point.
