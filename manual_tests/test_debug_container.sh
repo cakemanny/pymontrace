@@ -32,7 +32,6 @@ sleep 1  # give the trace container time to complete otherwise its SIGKILLed
 "
 )
 
-# The BEGIN probe doesn't seem to be firing. TODO: investigate
 docker run --rm -i -w /src --pid="container:$cid" "$image_id" bash <<'EOF'
 export PYTHONUNBUFFERED=1
 pymontrace -p "$(pgrep python)" -e 'pymontrace::BEGIN {{ print("hi") }} func:*.fff:return {{ print(ctx.a) }} pymontrace::END {{ print("bye") }}'

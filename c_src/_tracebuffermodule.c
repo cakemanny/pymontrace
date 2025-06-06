@@ -96,9 +96,16 @@ newTraceBufferObject(PyObject *module, int fd, void* data, size_t len)
     self->max_loops = 0;
 
     struct mapping_header* hdr = self->data;
+
+    unsigned long ctr = 0;
+    if (!atomic_compare_exchange_strong_explicit(&hdr->counter, &ctr, 1 + ctr,
+                memory_order_acq_rel, memory_order_acquire)) {
+        // Buffer has already been initialised.
+        return self;
+    }
+
     /* start at 2 so that the second buffer (starting at epoch 1) is invalid
      * to start */
-    hdr->counter = 0;
     hdr->epoch = 2;
     hdr->bufs[0].start = sizeof(struct mapping_header);
     hdr->bufs[0].position = hdr->bufs[0].start;
@@ -108,6 +115,9 @@ newTraceBufferObject(PyObject *module, int fd, void* data, size_t len)
     hdr->bufs[1].position = hdr->bufs[1].start;
     hdr->bufs[1].limit = len;
     hdr->bufs[1].epoch = 1;
+
+    // Make writes visible
+    atomic_fetch_add_explicit(&hdr->counter, 1, memory_order_release);
 
     return self;
 }
@@ -208,11 +218,7 @@ TraceBuffer_write(PyObject *op, PyObject *args)
 
     // Lock
     if (!atomic_compare_exchange_strong_explicit(&hdr->counter, &ctr, 1 + ctr,
-                memory_order_acq_rel,
-                // This could be relaxed because the msg_offset doesn't change
-                // but in the future we may want to be able to read sth
-                // that was written....
-                memory_order_acquire)) {
+                memory_order_acq_rel, memory_order_acquire)) {
         PyErr_SetString(PyExc_RuntimeError, "other writer accessing buffer");
         return NULL;
     }
@@ -317,6 +323,8 @@ TraceBuffer_read(PyObject *op, PyObject *args)
 
             memcpy(out_buf, self->data + offset, length);
             out_len = length;
+        } else {
+            fprintf(stderr, "WARN: bad read length");
         }
 
         // A fence so that the following counter read can't be moved before

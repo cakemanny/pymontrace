@@ -307,6 +307,8 @@ def format_untrace_snippet():
         pymontrace.tracee.unsettrace()
         if getattr(pymontrace.tracee, 'do_unload', False):
             del __import__('sys').modules['pymontrace.tracee']
+            del __import__('sys').modules['pymontrace.tracebuffer']
+            del __import__('sys').modules['pymontrace._tracebuffer']
             del __import__('sys').modules['pymontrace']
         del pymontrace
         """
