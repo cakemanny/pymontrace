@@ -1,6 +1,7 @@
-import sys
-import struct
 import inspect
+import struct
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -163,10 +164,11 @@ def test_vars():
 
 @pytest.fixture
 def connected_remote():
-    from pymontrace.tracee import remote
-    from tempfile import TemporaryDirectory
     import os
     import socket
+    from tempfile import TemporaryDirectory
+
+    from pymontrace.tracee import remote
 
     old_comm_fh = remote.comm_fh
     # Must be 104 characters of less, so cannot use tmp_path fixture.
@@ -246,8 +248,9 @@ def test_agg_max(connected_remote):
 
 @pytest.mark.skip(reason="enable to test perf")
 def test_agg_perf(connected_remote):
-    from pymontrace.tracee import agg, pmt
     import time
+
+    from pymontrace.tracee import agg, pmt
 
     start = time.monotonic_ns()
     for _ in range(1_000_000):
@@ -302,6 +305,7 @@ class TestQuantization:
 
 def test_agg_quantize(connected_remote):
     from array import array
+
     from pymontrace.tracee import agg, pmt
 
     pmt.maps.quanty['a'] = agg.quantize(0)
@@ -317,3 +321,30 @@ def test_agg_quantize(connected_remote):
     pmt.maps.quanty['a'] = agg.quantize(-1)
     assert pmt.maps.quanty['a'].buckets == \
         array('Q', (63 * [0]) + [1, 2, 1, 2] + (61 * [0]))
+
+
+def test_agg_buffer(tmp_path: Path):
+    from pymontrace.tracee import AggBuffer
+
+    filename = (tmp_path / 'agg.buffer').as_posix()
+    created_one = AggBuffer.create('ab', filename)
+
+    assert created_one.name == 'ab'
+
+    positions = []
+    for i in range(3):
+        some_data = f'xxx{i}'.encode()
+        position, length = created_one.write((4).to_bytes(4, sys.byteorder) + some_data)
+        assert length == 8
+        positions.append(position)
+
+    assert positions == [48, 56, 64]
+
+    opened_one = AggBuffer.open(filename)
+    assert opened_one.name == 'ab'
+
+    assert list(opened_one.read_records()) == [
+        b'\x04\x00\x00\x00xxx0',
+        b'\x04\x00\x00\x00xxx1',
+        b'\x04\x00\x00\x00xxx2',
+    ]

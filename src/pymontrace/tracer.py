@@ -2,7 +2,6 @@ import enum
 import inspect
 import os
 import pathlib
-import pickle
 import re
 import selectors
 import shutil
@@ -19,7 +18,7 @@ from typing import NoReturn
 
 from pymontrace import _darwin, attacher, tracebuffer
 from pymontrace.tracebuffer import TraceBuffer
-from pymontrace.tracee import PROBES_BY_NAME
+from pymontrace.tracee import PROBES_BY_NAME, AggBuffer
 
 
 # Replace with typing.assert_never after 3.11
@@ -453,6 +452,12 @@ def wait_till_ready_or_got_signal(
     return WaitResult.READY
 
 
+class TraceState:
+    def __init__(self):
+        self.trace_buffers: list[TraceBuffer] = []
+        self.agg_buffers: list[AggBuffer] = []
+
+
 def decode_trace_buffers_once(buffers: list[TraceBuffer]):
     from pymontrace.tracee import Message
 
@@ -480,7 +485,7 @@ class DecodeEndReason(enum.Enum):
 
 
 def decode_and_print_forever(
-    pid: int, s: socket.socket, tbs: list[TraceBuffer], *, only_print=False
+    pid: int, s: socket.socket, ts: TraceState, *, only_print=False
 ):
     from pymontrace.tracee import Message
     EVENT_READ = selectors.EVENT_READ
@@ -488,8 +493,6 @@ def decode_and_print_forever(
     sel = selectors.DefaultSelector()
     sel.register(signal_read, EVENT_READ)
     sel.register(s, EVENT_READ)
-
-    trace_buffers: list[TraceBuffer] = tbs
 
     t = None
     try:
@@ -499,12 +502,11 @@ def decode_and_print_forever(
             # in a good state to read final shutdown messages (e.g. from
             # the pymontrace::END probe)
             if wait_till_ready_or_got_signal(s, sel) == WaitResult.TIMEOUT:
-                decode_trace_buffers_once(trace_buffers)
+                decode_trace_buffers_once(ts.trace_buffers)
                 continue
 
             header = s.recv(header_fmt.size)
             if header == b'':
-                decode_trace_buffers_once(trace_buffers)
                 return DecodeEndReason.DISCONNECTED
             (kind, size) = header_fmt.unpack(header)
             body = s.recv(size)
@@ -518,23 +520,21 @@ def decode_and_print_forever(
                                      args=(pid, thread_ids), daemon=True)
                 t.start()
             elif kind == Message.EXIT:
-                decode_trace_buffers_once(trace_buffers)
                 return DecodeEndReason.EXITED
             elif kind == Message.END_EARLY:
-                decode_trace_buffers_once(trace_buffers)
                 return DecodeEndReason.ENDED_EARLY
-            elif kind == Message.MAPS:
-                filepath = body.decode()
-                localpath = from_remote_path(pid, filepath)
-                print_maps(localpath)
-                os.unlink(localpath)
             elif kind == Message.BUFFER:
                 filepath = body.decode()
                 localpath = from_remote_path(pid, filepath)
-                trace_buffers.append(tracebuffer.create(localpath))
+                ts.trace_buffers.append(tracebuffer.create(localpath))
                 os.unlink(localpath)
             elif kind == Message.HEARTBEAT:
                 pass
+            elif kind == Message.AGG_BUFFER:
+                filepath = body.decode()
+                localpath = from_remote_path(pid, filepath)
+                ts.agg_buffers.append(AggBuffer.open(localpath))
+                os.unlink(localpath)
             else:
                 print('unknown message kind:', kind, file=sys.stderr)
     finally:
@@ -547,17 +547,26 @@ def decode_and_print_forever(
             t.join()
 
 
-def decode_and_print_remaining(pid: int, s: socket.socket, tbs: list[TraceBuffer]):
+def decode_and_print_remaining(pid: int, s: socket.socket, ts: TraceState):
     # This should not block as the client should have disconnected
-    decode_and_print_forever(pid, s, tbs, only_print=True)
+    decode_and_print_forever(pid, s, ts, only_print=True)
+    decode_trace_buffers_once(ts.trace_buffers)
+    print_maps(ts.agg_buffers)
 
 
-def print_maps(mapsfile_path):
-    with open(mapsfile_path, 'rb') as f:
-        maps = pickle.load(f)
-    for name, mapp in maps.items():
+def print_maps(agg_buffers: list[AggBuffer]):
+    from pymontrace.tracee import PMTMap
+
+    for agg_buffer in agg_buffers:
+        as_dict = {}
+        with agg_buffer:
+            for record_bytes in agg_buffer.read_records():
+                key, value = PMTMap._decode(record_bytes)
+                as_dict[key] = value
+
+        name = agg_buffer.name
         try:
-            print_map(name, mapp)
+            print_map(name, as_dict)
         except Exception:
             print(f"Failed to print map: {name}:", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)

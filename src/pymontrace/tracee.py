@@ -280,9 +280,10 @@ class Message:
     THREADS = 3     # Additional threads the tracer must attach to
     EXIT = 4        # The tracee is exiting (atexit)
     END_EARLY = 5   # The tracing code called the pmt.exit function
-    MAPS = 6        # A new map file is available
+    # MAPS = 6        # A new map file is available (TODO: clean up)
     BUFFER = 7      # A new trace buffer has been created
     HEARTBEAT = 8   # Sent to detect tracer death
+    AGG_BUFFER = 9  # A new aggregation buffer has been created
 
 
 class TracerRemote:
@@ -368,7 +369,7 @@ class TracerRemote:
             for msg in to_send:
                 self.sendall(msg)
 
-    def create_agg_buffer(self):
+    def create_agg_buffer(self, name: str):
         if (comm_fh := self.comm_fh) is None:
             # can happen if disconnect happens during trace action execution
             raise RuntimeError('no remote')
@@ -377,7 +378,7 @@ class TracerRemote:
             self._agg_buffer_count += 1
         fn: str = comm_fh.getpeername() + f'.map{i:03}'
         assert fn.startswith('/'), f"{fn=}"
-        return fn, open(fn, 'x+b', buffering=0)
+        return AggBuffer.create(name, fn)
 
     @staticmethod
     def _encode_print(*args, **kwargs):
@@ -417,11 +418,6 @@ class TracerRemote:
     def notify_end_early(self):
         self._send_msg_no_body(Message.END_EARLY)
 
-    def notify_maps(self, filepath: str):
-        to_write = filepath.encode()
-        body_size = len(to_write)
-        self.sendall(struct.pack('=HH', Message.MAPS, body_size) + to_write)
-
     @staticmethod
     def _encode_buffer(filepath: str):
         to_write = filepath.encode()
@@ -430,6 +426,11 @@ class TracerRemote:
 
     def send_heartbeat(self):
         self._send_msg_no_body(Message.HEARTBEAT)
+
+    def notify_agg_buffer(self, filepath: str):
+        to_write = filepath.encode()
+        body_size = len(to_write)
+        self.sendall(struct.pack('=HH', Message.AGG_BUFFER, body_size) + to_write)
 
 
 remote = TracerRemote()
@@ -564,33 +565,34 @@ class AggBuffer:
     HDR_FMT = '@QQ32s'
     """struct { counter:u64; epoch:u64; name:char[32]; }"""
 
-    def __init__(self, name: str) -> None:
-        self.fn, self.fp = remote.create_agg_buffer()
-        name_bytes = name.encode()
-        hdr_bytes = struct.pack(AggBuffer.HDR_FMT, 0, 2, name_bytes)
-        os.pwrite(self.fp.fileno(), hdr_bytes, 0)
+    def __init__(self, name: str, filename: str, fp: io.FileIO) -> None:
+        self.fn = filename
+        self.fp = fp
+        self.name = name
         self.start = struct.calcsize(AggBuffer.HDR_FMT)
         self.position = self.start
 
-    # TEMPORARY while this is still pickled at end of trace
-    def __getstate__(self) -> dict:
-        state = self.__dict__.copy()
-        del state['fp']
-        state['pid'] = os.getpid()
-        return state
+    @classmethod
+    def create(cls, name: str, filename: str) -> 'AggBuffer':
+        fp = open(filename, 'x+b', buffering=0)
+        name_bytes = name.encode()
+        hdr_bytes = struct.pack(AggBuffer.HDR_FMT, 0, 2, name_bytes)
+        if (written := os.pwrite(fp.fileno(), hdr_bytes, 0)) != len(hdr_bytes):
+            raise RuntimeError(f'short write of {written} bytes')
+        return AggBuffer(name, filename, fp)
 
-    # TEMPORARY while this is still pickled at end of trace
-    def __setstate__(self, state: dict):
-        # likely called in tracer
-        source_pid: int = state.pop('pid')
-        self.__dict__.update(state)
-        pid = os.getpid()
-        if source_pid != pid and \
-                os.path.exists(rerooted := f'/proc/{source_pid}/root{self.fn}'):
-            self.fn = rerooted
-            self.fp = open(rerooted, 'r+b', buffering=0)
-        else:
-            self.fp = open(self.fn, 'r+b', buffering=0)
+    @classmethod
+    def open(cls, filename: str) -> 'AggBuffer':
+        fp = open(filename, 'r+b', buffering=0)
+        hdr_length = struct.calcsize(cls.HDR_FMT)
+        hdr_bytes = os.pread(fp.fileno(), hdr_length, 0)
+        if len(hdr_bytes) != hdr_length:
+            raise RuntimeError(
+                f'short read: {len(hdr_bytes)} of {hdr_length} bytes')
+        counter, epoch, name = struct.unpack(cls.HDR_FMT, hdr_bytes)
+        # strip trailing null bytes
+        name = name[:name.index(b'\x00')]
+        return AggBuffer(name.decode(), filename, fp)
 
     def __enter__(self):
         fcntl.flock(self.fp, fcntl.LOCK_EX)
@@ -628,13 +630,31 @@ class AggBuffer:
             remaining -= written
         return (offset, length)
 
+    # # For the tracer
+
+    def read_records(self):
+        reader = io.BufferedReader(self.fp)
+        try:
+            reader.seek(self.start, io.SEEK_SET)
+            while True:
+                length_bytes = reader.read(4)
+                if len(length_bytes) < 4:
+                    break
+                length = int.from_bytes(length_bytes, sys.byteorder)
+                data_bytes = reader.read(length)
+                if len(data_bytes) < length:
+                    break
+                yield length_bytes + data_bytes
+        finally:
+            # Avoid closing the file
+            reader.detach()
+
 
 class PMTMap(abc.MutableMapping):
-    def __init__(self, name: str) -> None:
+    def __init__(self, buffer: AggBuffer) -> None:
         super().__init__()
-        self.name = name
         self.index: dict[Any, tuple[int, int]] = {}
-        self.buffer = AggBuffer(name)
+        self.buffer = buffer
 
     def __len__(self) -> int:
         return len(self.index)
@@ -727,17 +747,16 @@ class PMTMap(abc.MutableMapping):
         # Maybe we could reset the value to 0
         raise NotImplementedError
 
-    # TODO: maybe we have to implement __getstate__ and __setstate__
-
 
 class MapNS(SimpleNamespace):
 
     # Only happens on AttributeError
-    def __getattr__(self, name):
-        # At this point we'd create the buffer space
-        # new_map = PMTMap()
-        new_map = PMTMap(name)
+    def __getattr__(self, name: str):
+        # At this point we create the buffer space
+        buffer = remote.create_agg_buffer(name)
+        new_map = PMTMap(buffer)
         self.__setattr__(name, new_map)
+        remote.notify_agg_buffer(buffer.fn)
         return new_map
 
     def __setattr__(self, name: str, value, /) -> None:
@@ -820,33 +839,6 @@ class pmt:
                 'set your attribute on pmt.vars or pmt.maps instead'
             )
         return super().__setattr__(name, value)
-
-    @staticmethod
-    def printmaps():
-        # This is not the final implementation! Just a stopgap one to reduce
-        # the chance that untrace jams up the tracee.
-
-        if (comm_fh := remote.comm_fh) is None:
-            return
-        try:
-            dest: str = comm_fh.getpeername() + '.maps'
-        except OSError:
-            # tracer probably died suddenly
-            return
-        assert os.path.isabs(dest), f"not absolute: {dest!r}"
-
-        if len(vars(pmt.maps)) == 0:
-            return
-
-        try:
-            with open(dest, 'wb') as f:
-                pickle.dump(dict(vars(pmt.maps).items()), f)
-            remote.notify_maps(dest)
-        except Exception:
-            buf = io.StringIO()
-            print(f'{__name__}.pmt.printmaps failed', file=buf)
-            traceback.print_exc(file=buf)
-            pmt.print(buf.getvalue(), end='', file=sys.stderr)
 
     def _asdict(self):
         o = {}
@@ -1250,9 +1242,6 @@ def unsettrace(preclose=None):
         for (probe, action, snippet) in pmt._end_actions:
             assert probe.is_end
             safe_eval_no_frame(action, snippet)
-
-        # FIXME: this crashes if the tracer died hard
-        pmt.printmaps()
 
         pmt._reset()
         if preclose is not None:

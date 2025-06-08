@@ -9,7 +9,7 @@ import sys
 import pymontrace.attacher
 from pymontrace import tracer
 from pymontrace.tracer import (
-    CommsFile, create_and_bind_socket, decode_and_print_forever,
+    CommsFile, TraceState, create_and_bind_socket, decode_and_print_forever,
     decode_and_print_remaining, encode_script, format_bootstrap_snippet,
     format_untrace_snippet, to_remote_path, validate_script
 )
@@ -53,11 +53,11 @@ class EndReason(enum.Enum):
 
 
 def receive_and_print_until_interrupted(
-    pid: int, s: socket.socket, tracebuffers: list
+    pid: int, s: socket.socket, tracestate: TraceState
 ) -> EndReason:
     print('Probes installed. Hit CTRL-C to end...', file=sys.stderr)
     try:
-        outcome = decode_and_print_forever(pid, s, tracebuffers)
+        outcome = decode_and_print_forever(pid, s, tracestate)
         if outcome == tracer.DecodeEndReason.DISCONNECTED:
             print('Target disconnected.', file=sys.stderr)
             return EndReason.DISCONNECTED
@@ -120,9 +120,9 @@ def tracepid(pid: int, encoded_script: bytes):
         # TODO: verify the connected party is pid
         os.unlink(comms.localpath)
 
-        tracebuffers = []
+        tracestate = TraceState()
 
-        outcome = receive_and_print_until_interrupted(pid, s, tracebuffers)
+        outcome = receive_and_print_until_interrupted(pid, s, tracestate)
         if (outcome == EndReason.INTERRUPTED
                 or wait_till_gone(pid) == PIDState.STILL_THERE):
             print('Removing probes...', file=sys.stderr)
@@ -131,7 +131,7 @@ def tracepid(pid: int, encoded_script: bytes):
                 pid,
                 format_untrace_snippet(),
             )
-        decode_and_print_remaining(pid, s, tracebuffers)
+        decode_and_print_remaining(pid, s, tracestate)
 
 
 def subprocess_entry(progpath, encoded_script: bytes):
@@ -170,12 +170,12 @@ def tracesubprocess(progpath: str, prog_text):
         s, _ = ss.accept()
         os.unlink(comms.localpath)
 
-        tracebuffers = []
-        receive_and_print_until_interrupted(p.pid, s, tracebuffers)
+        tracestate = TraceState()
+        receive_and_print_until_interrupted(p.pid, s, tracestate)
         # The child will also have had a SIGINT at this point as it's
         # in the same terminal group. So should have ended unless it's
         # installed its own signal handlers.
-        decode_and_print_remaining(p.pid, s, tracebuffers)
+        decode_and_print_remaining(p.pid, s, tracestate)
 
 
 def cli_main():
