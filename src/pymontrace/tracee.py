@@ -4,7 +4,9 @@ The module that is imported in the tracee.
 This is a single large file to simplify injecting into the target (tracee).
 All imports are from the standard library.
 """
+import array
 import atexit
+import fcntl
 import inspect
 import io
 import os
@@ -17,7 +19,7 @@ import textwrap
 import threading
 import time
 import traceback
-from collections import namedtuple
+from collections import abc, namedtuple
 from dataclasses import dataclass
 from types import CodeType, FrameType, SimpleNamespace
 from typing import Any, Callable, Literal, NoReturn, Optional, Sequence, Union
@@ -291,6 +293,7 @@ class TracerRemote:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self.last_heartbeat = time.monotonic()
+        self._agg_buffer_count = 0
 
     @property
     def is_connected(self):
@@ -364,6 +367,17 @@ class TracerRemote:
             tb.write(data)
             for msg in to_send:
                 self.sendall(msg)
+
+    def create_agg_buffer(self):
+        if (comm_fh := self.comm_fh) is None:
+            # can happen if disconnect happens during trace action execution
+            raise RuntimeError('no remote')
+        with self._lock:
+            i = self._agg_buffer_count
+            self._agg_buffer_count += 1
+        fn: str = comm_fh.getpeername() + f'.map{i:03}'
+        assert fn.startswith('/'), f"{fn=}"
+        return fn, open(fn, 'x+b', buffering=0)
 
     @staticmethod
     def _encode_print(*args, **kwargs):
@@ -494,14 +508,15 @@ class agg:
 
 class Quantization:
 
+    zero_idx = 64
+
     @dataclass
     class Bucket:
         value: int
         count: int
 
     def __init__(self) -> None:
-        self.buckets = []  # 0, 1, 2, 4, ...
-        self.neg_buckets = []  # -1, -2, -4, -8, ...
+        self.buckets = array.array('Q', [0] * 128)
 
     def add(self, value):
         if not isinstance(value, (int, float)):
@@ -510,15 +525,10 @@ class Quantization:
 
         value = int(value)
         bucket_idx = self.bucket_idx(value)
-        if bucket_idx >= 64:
+        if bucket_idx >= len(self.buckets):
             # perhaps introduce some kind of "scale" property ?
             raise ValueError('large number not yet quantizable: {value!r}')
-        if value < 0:
-            self.neg_buckets[bucket_idx] += 1
-        else:
-            if len(self.buckets) <= bucket_idx:
-                self.buckets.extend((1 + bucket_idx - len(self.buckets)) * [0])
-            self.buckets[bucket_idx] += 1
+        self.buckets[bucket_idx] += 1
 
     @staticmethod
     def quantize(value: int) -> int:
@@ -529,12 +539,12 @@ class Quantization:
         assert value < 0
         return -(2 ** ((-value).bit_length() - 1))
 
-    @staticmethod
-    def bucket_idx(value: int) -> int:
+    @classmethod
+    def bucket_idx(cls, value: int) -> int:
         if value >= 0:
-            return value.bit_length()
+            return cls.zero_idx + value.bit_length()
         else:
-            return value.bit_length() - 1
+            return cls.zero_idx - value.bit_length()
 
 
 class VarNS(SimpleNamespace):
@@ -549,15 +559,175 @@ class VarNS(SimpleNamespace):
             object.__setattr__(self, name, value)
 
 
-class PMTMap(dict):  # Should be collections.MutableMapping
+class AggBuffer:
+
+    HDR_FMT = '@QQ32s'
+    """struct { counter:u64; epoch:u64; name:char[32]; }"""
+
+    def __init__(self, name: str) -> None:
+        self.fn, self.fp = remote.create_agg_buffer()
+        name_bytes = name.encode()
+        hdr_bytes = struct.pack(AggBuffer.HDR_FMT, 0, 2, name_bytes)
+        os.pwrite(self.fp.fileno(), hdr_bytes, 0)
+        self.start = struct.calcsize(AggBuffer.HDR_FMT)
+        self.position = self.start
+
+    # TEMPORARY while this is still pickled at end of trace
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        del state['fp']
+        state['pid'] = os.getpid()
+        return state
+
+    # TEMPORARY while this is still pickled at end of trace
+    def __setstate__(self, state: dict):
+        # likely called in tracer
+        source_pid: int = state.pop('pid')
+        self.__dict__.update(state)
+        pid = os.getpid()
+        if source_pid != pid and \
+                os.path.exists(rerooted := f'/proc/{source_pid}/root{self.fn}'):
+            self.fn = rerooted
+            self.fp = open(rerooted, 'r+b', buffering=0)
+        else:
+            self.fp = open(self.fn, 'r+b', buffering=0)
+
+    def __enter__(self):
+        fcntl.flock(self.fp, fcntl.LOCK_EX)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        fcntl.flock(self.fp, fcntl.LOCK_UN)
+
+    def read(self, offset: int, size: int) -> bytes:
+        data = os.pread(self.fp.fileno(), size, offset)
+        if len(data) != size:
+            raise RuntimeError(f'short read, {len(data)} or {size}')
+        return data
+
+    def write(self, kvp: bytes) -> tuple[int, int]:
+        """Returns: (offset, size)"""
+        length = len(kvp)
+
+        remaining = length
+        while remaining != 0:
+            offset = self.position + (length - remaining)
+            written = os.pwrite(self.fp.fileno(), kvp, offset)
+            remaining -= written
+        self.position += length
+        return (self.position - length, length)
+
+    def update(self, kvp: bytes, offset: int, oldsize: int):
+        length = len(kvp)
+        if len(kvp) != oldsize:
+            raise ValueError('size changed, cannot update')
+
+        remaining = length
+        while remaining != 0:
+            off = offset + (length - remaining)
+            written = os.pwrite(self.fp.fileno(), kvp, off)
+            remaining -= written
+        return (offset, length)
+
+
+class PMTMap(abc.MutableMapping):
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self.name = name
+        self.index: dict[Any, tuple[int, int]] = {}
+        self.buffer = AggBuffer(name)
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def __iter__(self):
+        return iter(self.index)
+
+    def __getitem__(self, key, /):
+        with self.buffer:
+            return self._getitem(key)
+
+    _NO_DEFAULT = object()
+
+    def _getitem(self, key, default=_NO_DEFAULT):
+        try:
+            offset, size = self.index[key]
+        except KeyError:
+            if default != self._NO_DEFAULT:
+                return default
+            raise
+        stored_key, value = self._decode(self.buffer.read(offset, size))
+        assert key == stored_key
+        return value
+
+    @staticmethod
+    def _encode(key, value) -> bytes:
+        # pickle does not encode with a consistent size for same type
+        # so we cannot use it for the value, which changes
+        key_data = pickle.dumps(key)
+        value_data: bytes
+        if isinstance(value, int):
+            if value < 0:
+                # we use `=` (standard) instead of '@' (native)
+                # because we are anyway out of alignment
+                value_data = b'q' + struct.pack('=q', value)
+            else:
+                value_data = b'Q' + struct.pack('=Q', value)
+        elif isinstance(value, float):
+            value_data = b'd' + struct.pack('=d', value)
+        elif isinstance(value, Quantization):
+            value_data = b'Y' + value.buckets.tobytes()
+        else:
+            raise TypeError(
+                f'unsupported aggregation value type: {value.__class__.__name__}')
+        length = len(key_data) + len(value_data)
+        return (length.to_bytes(length=4, byteorder=sys.byteorder)
+                + key_data + value_data)
+
+    @staticmethod
+    def _decode(data: bytes) -> tuple:
+        length = int.from_bytes(data[:4], byteorder=sys.byteorder)
+        assert length == len(data[4:]), f"{length} != {len(data[4:])}"
+        buf = io.BytesIO(data[4:])
+        key = pickle.load(buf)
+        value_data = buf.read()
+        if (prefix := value_data[:1]) in (b'qQd'):
+            (value,) = struct.unpack('=' + prefix.decode(), value_data[1:])
+        elif prefix == b'Y':
+            value = object.__new__(Quantization)
+            value.buckets = array.array('Q')
+            value.buckets.frombytes(value_data[1:])
+        else:
+            raise ValueError(f'bad aggregation value with prefix {prefix}')
+        return key, value
+
+    def _setitem(self, key, value):
+        data = self._encode(key, value)
+        if key in self.index:
+            offset, size = self.index[key]
+            self.buffer.update(data, offset, size)
+        else:
+            offset, size = self.buffer.write(data)
+            self.index[key] = (offset, size)
 
     def __setitem__(self, key, value, /) -> None:
-        current = self.get(key, None)
-        if isinstance(value, aggregation.Base):
-            new = value.aggregate(current)
-            super().__setitem__(key, new)
-        else:
-            super().__setitem__(key, value)
+        with self.buffer:
+            current = self._getitem(key, None)
+            if isinstance(value, aggregation.Base):
+                new = value.aggregate(current)
+                self._setitem(key, new)
+            elif isinstance(value, (int, float, Quantization)):
+                self._setitem(key, value)
+            else:
+                raise EvaluationError(
+                    f'unsupported value type: {value.__class__.__name__}, '
+                    'use an aggregation function such as agg.count() instead'
+                )
+
+    def __delitem__(self, key):
+        # Maybe we could reset the value to 0
+        raise NotImplementedError
+
+    # TODO: maybe we have to implement __getstate__ and __setstate__
 
 
 class MapNS(SimpleNamespace):
@@ -566,7 +736,7 @@ class MapNS(SimpleNamespace):
     def __getattr__(self, name):
         # At this point we'd create the buffer space
         # new_map = PMTMap()
-        new_map = PMTMap()
+        new_map = PMTMap(name)
         self.__setattr__(name, new_map)
         return new_map
 

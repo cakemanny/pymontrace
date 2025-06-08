@@ -161,7 +161,34 @@ def test_vars():
     assert pmt.vars.yyy.aggregate == 7
 
 
-def test_agg_count():
+@pytest.fixture
+def connected_remote():
+    from pymontrace.tracee import remote
+    from tempfile import TemporaryDirectory
+    import os
+    import socket
+
+    old_comm_fh = remote.comm_fh
+    # Must be 104 characters of less, so cannot use tmp_path fixture.
+    tmpdir = TemporaryDirectory(dir="/tmp")
+    filepath = f'{tmpdir.name}/pymontrace-{os.getpid()}'
+    s1 = socket.socket(socket.AF_UNIX)
+    s1.bind(filepath)
+    s1.listen(0)
+    s2 = socket.socket(socket.AF_UNIX)
+    s2.connect(filepath)
+    os.unlink(filepath)
+    remote.comm_fh = s2
+    try:
+        yield
+    finally:
+        s1.close()
+        s2.close()
+        remote.comm_fh = old_comm_fh
+        tmpdir.cleanup()
+
+
+def test_agg_count(connected_remote):
     from pymontrace.tracee import agg, pmt
 
     pmt.maps.county['a'] = agg.count()
@@ -175,7 +202,7 @@ def test_agg_count():
     assert pmt.maps[(1, 2)] == 3
 
 
-def test_agg_sum():
+def test_agg_sum(connected_remote):
     from pymontrace.tracee import agg, pmt
 
     pmt.maps.summy['a'] = agg.sum(1)
@@ -185,7 +212,7 @@ def test_agg_sum():
     assert pmt.maps.summy['a'] == 6
 
 
-def test_agg_min():
+def test_agg_min(connected_remote):
     from pymontrace.tracee import agg, pmt
 
     pmt.maps.minny['a'] = agg.min(1)
@@ -201,7 +228,7 @@ def test_agg_min():
     assert pmt.maps.minny['b'] == 1
 
 
-def test_agg_max():
+def test_agg_max(connected_remote):
     from pymontrace.tracee import agg, pmt
 
     pmt.maps.maxxy['a'] = agg.max(1)
@@ -215,6 +242,21 @@ def test_agg_max():
     pmt.maps.maxxy['b'] = agg.max(1)
 
     assert pmt.maps.maxxy['b'] == 3
+
+
+@pytest.mark.skip(reason="enable to test perf")
+def test_agg_perf(connected_remote):
+    from pymontrace.tracee import agg, pmt
+    import time
+
+    start = time.monotonic_ns()
+    for _ in range(1_000_000):
+        pmt.maps.perfy['a'] = agg.max(10)
+    end = time.monotonic_ns()
+    avg_op_micros = (end - start) / 1_000_000_000
+    # 5.5358µs in commit that adds this test
+    print(f"avg max: {avg_op_micros:.5}µs")
+    assert False
 
 
 class TestQuantization:
@@ -240,32 +282,38 @@ class TestQuantization:
     @staticmethod
     def test_bucket_idx():
         from pymontrace.tracee import Quantization
+        zero_idx = Quantization.zero_idx
 
-        assert Quantization.bucket_idx(0) == 0
-        assert Quantization.bucket_idx(1) == 1
-        assert Quantization.bucket_idx(2) == 2
-        assert Quantization.bucket_idx(3) == 2
-        assert Quantization.bucket_idx(4) == 3
+        assert Quantization.bucket_idx(0) == zero_idx + 0
+        assert Quantization.bucket_idx(1) == zero_idx + 1
+        assert Quantization.bucket_idx(2) == zero_idx + 2
+        assert Quantization.bucket_idx(3) == zero_idx + 2
+        assert Quantization.bucket_idx(4) == zero_idx + 3
 
-        assert [Quantization.bucket_idx(x) for x in range(10)] == [
+        assert [Quantization.bucket_idx(x) - zero_idx for x in range(10)] == [
             0, 1, 2, 2, 3, 3, 3, 3, 4, 4
         ]
 
-        #            -   -----   -------------   -----
+        #           --  ------  --------------  ------
         negative = [-1, -2, -3, -4, -5, -6, -7, -8, -9]
-        expected = [ 0,  1,  1,  2,  2,  2,  2,  3,  3]  # noqa
+        expected = [63, 62, 62, 61, 61, 61, 61, 60, 60]
         assert [Quantization.bucket_idx(x) for x in negative] == expected
 
 
-def test_agg_quantize():
+def test_agg_quantize(connected_remote):
+    from array import array
     from pymontrace.tracee import agg, pmt
 
     pmt.maps.quanty['a'] = agg.quantize(0)
-    assert pmt.maps.quanty['a'].buckets == [1]
+    assert pmt.maps.quanty['a'].buckets == array('Q', (64 * [0]) + [1] + (63 * [0]))
     pmt.maps.quanty['a'] = agg.quantize(0)
-    assert pmt.maps.quanty['a'].buckets == [2]
+    assert pmt.maps.quanty['a'].buckets == array('Q', (64 * [0]) + [2] + (63 * [0]))
     pmt.maps.quanty['a'] = agg.quantize(1)
-    assert pmt.maps.quanty['a'].buckets == [2, 1]
+    assert pmt.maps.quanty['a'].buckets == array('Q', (64 * [0]) + [2, 1] + (62 * [0]))
     pmt.maps.quanty['a'] = agg.quantize(2)
     pmt.maps.quanty['a'] = agg.quantize(3)
-    assert pmt.maps.quanty['a'].buckets == [2, 1, 2]
+    assert pmt.maps.quanty['a'].buckets == array('Q', (64 * [0]) + [2, 1, 2] + (61 * [0]))
+
+    pmt.maps.quanty['a'] = agg.quantize(-1)
+    assert pmt.maps.quanty['a'].buckets == \
+        array('Q', (63 * [0]) + [1, 2, 1, 2] + (61 * [0]))
