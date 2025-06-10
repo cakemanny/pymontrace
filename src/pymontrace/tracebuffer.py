@@ -1,5 +1,6 @@
 import os
 import threading
+from typing import Union
 
 from pymontrace import _tracebuffer
 
@@ -49,3 +50,51 @@ def create(filename: str, size: int = DEFAULT_BUFFER_SIZE) -> TraceBuffer:
     with open(fd, 'a+b', buffering=0) as f:  # <- closes the fd
         tb = _tracebuffer.create(f.fileno())
     return TraceBuffer(tb)
+
+
+class AggBuffer:
+    def __init__(self, _agg_buffer, fn: str) -> None:
+        self._agg_buffer = _agg_buffer
+        self.fn = fn
+        self._lock = threading.Lock()
+        self.epoch = 2
+
+    @property
+    def name(self):
+        return self._agg_buffer.name
+
+    def __enter__(self):
+        if not self._lock.acquire(timeout=1.0):
+            raise TimeoutError('failed to acquire lock on AggBuffer after 1s')
+        self.epoch = self._agg_buffer.epoch
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._lock.release()
+
+    def read(self, offset: int, size: int) -> bytes:
+        return self._agg_buffer.read(self.epoch, offset, size)
+
+    def write(self, kvp: bytes) -> tuple[int, int]:
+        return self._agg_buffer.write(self.epoch, kvp)
+
+    def update(self, kvp: bytes, offset: int, size: int) -> bytes:
+        return self._agg_buffer.update(self.epoch, kvp, offset, size)
+
+    def readall(self, epoch: Union[int, None] = None):
+        if epoch is None:
+            epoch = self.epoch
+        return self._agg_buffer.readall(epoch)
+
+
+def create_agg_buffer(name: str, filename: str, size=DEFAULT_BUFFER_SIZE) -> AggBuffer:
+    with open(filename, 'x+b', buffering=0) as f:
+        f.truncate(size)
+        ab = _tracebuffer.create_agg_buffer(f.fileno(), name)
+    return AggBuffer(ab, filename)
+
+
+def open_agg_buffer(filename: str, size=DEFAULT_BUFFER_SIZE) -> AggBuffer:
+    with open(filename, 'r+b', buffering=0) as f:
+        f.truncate(size)
+        ab = _tracebuffer.open_agg_buffer(f.fileno())
+    return AggBuffer(ab, filename)

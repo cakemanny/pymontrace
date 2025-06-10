@@ -17,8 +17,8 @@ from tempfile import TemporaryDirectory
 from typing import NoReturn
 
 from pymontrace import _darwin, attacher, tracebuffer
-from pymontrace.tracebuffer import TraceBuffer
-from pymontrace.tracee import PROBES_BY_NAME, AggBuffer
+from pymontrace.tracebuffer import AggBuffer, TraceBuffer
+from pymontrace.tracee import PROBES_BY_NAME
 
 
 # Replace with typing.assert_never after 3.11
@@ -457,6 +457,12 @@ class TraceState:
         self.trace_buffers: list[TraceBuffer] = []
         self.agg_buffers: list[AggBuffer] = []
 
+        # To not exhaust the tracee's memory,
+        # periodically aggregation data is accumulated here in the tracer.
+        self.checkpointed_aggregations = {}
+        self.chkptd_aggs = {}
+        self.checkpointed_aggs = {}
+
 
 def decode_trace_buffers_once(buffers: list[TraceBuffer]):
     from pymontrace.tracee import Message
@@ -533,7 +539,7 @@ def decode_and_print_forever(
             elif kind == Message.AGG_BUFFER:
                 filepath = body.decode()
                 localpath = from_remote_path(pid, filepath)
-                ts.agg_buffers.append(AggBuffer.open(localpath))
+                ts.agg_buffers.append(tracebuffer.open_agg_buffer(localpath))
                 os.unlink(localpath)
             else:
                 print('unknown message kind:', kind, file=sys.stderr)
@@ -554,15 +560,33 @@ def decode_and_print_remaining(pid: int, s: socket.socket, ts: TraceState):
     print_maps(ts.agg_buffers)
 
 
+def read_records(agg_buffer: AggBuffer):
+    import io
+
+    f = io.BytesIO(agg_buffer.readall())
+
+    while True:
+        length_bytes = f.read(4)
+        if len(length_bytes) < 4:
+            break
+        length = int.from_bytes(length_bytes, sys.byteorder)
+        if length == 0:
+            break
+        data_bytes = f.read(length)
+        if len(data_bytes) < length:
+            break
+        yield length_bytes + data_bytes
+
+
 def print_maps(agg_buffers: list[AggBuffer]):
     from pymontrace.tracee import PMTMap
 
     for agg_buffer in agg_buffers:
         as_dict = {}
-        with agg_buffer:
-            for record_bytes in agg_buffer.read_records():
-                key, value = PMTMap._decode(record_bytes)
-                as_dict[key] = value
+
+        for record_bytes in read_records(agg_buffer):
+            key, value = PMTMap._decode(record_bytes)
+            as_dict[key] = value
 
         name = agg_buffer.name
         try:

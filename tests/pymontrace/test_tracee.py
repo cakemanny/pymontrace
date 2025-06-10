@@ -1,7 +1,6 @@
 import inspect
 import struct
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -257,7 +256,10 @@ def test_agg_perf(connected_remote):
         pmt.maps.perfy['a'] = agg.max(10)
     end = time.monotonic_ns()
     avg_op_micros = (end - start) / 1_000_000_000
+
     # 5.5358µs in commit that adds this test
+    # 3.5259µs after switching to python's mmap
+    # 2.7347µs after rewriting in C
     print(f"avg max: {avg_op_micros:.5}µs")
     assert False
 
@@ -321,30 +323,3 @@ def test_agg_quantize(connected_remote):
     pmt.maps.quanty['a'] = agg.quantize(-1)
     assert pmt.maps.quanty['a'].buckets == \
         array('Q', (63 * [0]) + [1, 2, 1, 2] + (61 * [0]))
-
-
-def test_agg_buffer(tmp_path: Path):
-    from pymontrace.tracee import AggBuffer
-
-    filename = (tmp_path / 'agg.buffer').as_posix()
-    created_one = AggBuffer.create('ab', filename)
-
-    assert created_one.name == 'ab'
-
-    positions = []
-    for i in range(3):
-        some_data = f'xxx{i}'.encode()
-        position, length = created_one.write((4).to_bytes(4, sys.byteorder) + some_data)
-        assert length == 8
-        positions.append(position)
-
-    assert positions == [48, 56, 64]
-
-    opened_one = AggBuffer.open(filename)
-    assert opened_one.name == 'ab'
-
-    assert list(opened_one.read_records()) == [
-        b'\x04\x00\x00\x00xxx0',
-        b'\x04\x00\x00\x00xxx1',
-        b'\x04\x00\x00\x00xxx2',
-    ]

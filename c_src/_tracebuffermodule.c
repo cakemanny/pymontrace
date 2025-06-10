@@ -35,7 +35,7 @@
 // The structure that lives at the head of our mapping
 struct mapping_header {
     _Atomic unsigned long counter;
-    unsigned long epoch;
+    _Atomic unsigned long epoch;
     char bufname[32];
 
     struct {
@@ -51,7 +51,8 @@ struct mapping_header {
 // Module state
 typedef struct {
     PyObject *TraceBuffer_Type;    // TraceBuffer class
-                           //
+    PyObject *AggBuffer_Type;    // AggBuffer class
+
     /*
      * Could contains something like a linked list to all the instances?
      */
@@ -106,7 +107,7 @@ newTraceBufferObject(PyObject *module, int fd, void* data, size_t len)
 
     /* start at 2 so that the second buffer (starting at epoch 1) is invalid
      * to start */
-    hdr->epoch = 2;
+    atomic_store_explicit(&hdr->epoch, 2, memory_order_relaxed);
     hdr->bufs[0].start = sizeof(struct mapping_header);
     hdr->bufs[0].position = hdr->bufs[0].start;
     hdr->bufs[0].limit = len / 2;
@@ -223,13 +224,15 @@ TraceBuffer_write(PyObject *op, PyObject *args)
         return NULL;
     }
 
-    int which_buffer = hdr->epoch & 1;
+    // relaxed is fine here because the read is guarded by the lock of the
+    // counter
+    int which_buffer = 1 & atomic_load_explicit(&hdr->epoch, memory_order_relaxed);
     __auto_type buf = &hdr->bufs[which_buffer];
     uint32_t space = buf->limit - buf->position;
 
     if (space < data_len) {
         // switch
-        hdr->epoch += 1;
+        atomic_fetch_add_explicit(&hdr->epoch, 1, memory_order_relaxed);
         which_buffer ^= 1;
         buf = &hdr->bufs[which_buffer];
         assert(data_len < (buf->limit - buf->start));
@@ -280,17 +283,20 @@ TraceBuffer_read(PyObject *op, PyObject *args)
         }
         assert(self->epoch <= buf->epoch);
         if (self->epoch != buf->epoch) {
-            PySys_FormatStderr("WARN: dropped buffer (epoch %"PRIu64")\n", buf->epoch);
+            PySys_FormatStderr("WARN: dropped buffer(s)\n");
             // FIXME: probably we should check it was a clean read before
             // bumping our epoch?
-            self->epoch += 1;
+            self->epoch = buf->epoch - 1;
             self->mark = 0;
             continue;
         }
         uint32_t start = buf->start + self->mark;
         uint32_t length = buf->position - start;
         if (length == 0) {
-            unsigned long hdr_epoch = hdr->epoch;
+            // relaxed is fine here as we have the fence. (in fact epoch is
+            // only atomic for AggBuffer)
+            unsigned long hdr_epoch =
+                atomic_load_explicit(&hdr->epoch, memory_order_relaxed);
             // See below for full comments.
             atomic_thread_fence(memory_order_acquire);
             unsigned long ctr2 = atomic_load_explicit(&hdr->counter,
@@ -358,9 +364,9 @@ TraceBuffer_read(PyObject *op, PyObject *args)
 
 static PyMethodDef TraceBuffer_methods[] = {
     {"write", TraceBuffer_write, METH_VARARGS,
-     PyDoc_STR("write(message: str) -> None")},
+     PyDoc_STR("write(data: bytes) -> None")},
     {"read", TraceBuffer_read, METH_VARARGS,
-     PyDoc_STR("read() -> str")},
+     PyDoc_STR("read() -> bytes")},
     {NULL, NULL, 0, NULL}           /* sentinel */
 };
 
@@ -391,6 +397,391 @@ static PyType_Spec TraceBuffer_Type_spec = {
     .slots = TraceBuffer_Type_slots,
 };
 
+/* AggBuffer objects */
+
+// Instance state
+typedef struct {
+    PyObject_HEAD
+    int fd;
+    void* data; // The mmapped mappings.
+    size_t len; // The length of the mapping.
+
+} AggBufferObject;
+
+#define AggBufferObject_CAST(op)  ((AggBufferObject *)(op))
+
+static AggBufferObject *
+newAggBufferObject(PyObject *module, int fd, const char* name)
+{
+    tracebuffer_state *state = PyModule_GetState(module);
+    if (state == NULL) {
+        return NULL;
+    }
+
+    struct stat statbuf;
+    if (-1 == fstat(fd, &statbuf)) {
+        PyErr_SetFromErrno(PyExc_OSError);
+        return NULL;
+    }
+
+    size_t len = (size_t)statbuf.st_size;
+    void* mapped = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mapped == MAP_FAILED) {
+        PyErr_SetFromErrno(PyExc_OSError);
+        return NULL;
+    }
+
+    AggBufferObject *self;
+    self = PyObject_GC_New(AggBufferObject, (PyTypeObject*)state->AggBuffer_Type);
+    if (self == NULL) {
+        return NULL;
+    }
+
+    self->fd = fd;
+    self->data = mapped;
+    self->len = len;
+
+    struct mapping_header* hdr = self->data;
+
+    unsigned long ctr = 0;
+    if (!atomic_compare_exchange_strong_explicit(&hdr->counter, &ctr, 1 + ctr,
+                memory_order_acq_rel, memory_order_acquire)) {
+        // Buffer has already been initialised.
+        return self;
+    }
+
+    /* start at 2 so that the second buffer (starting at epoch 1) is invalid
+     * to start */
+    // relaxed is fine here as the mapping hasn't been shared yet
+    atomic_store_explicit(&hdr->epoch, 2, memory_order_relaxed);
+    if (name != NULL) {
+        strncpy(hdr->bufname, name, sizeof(hdr->bufname) - 1);
+        hdr->bufname[sizeof(hdr->bufname) - 1] = '\0';
+    }
+    hdr->bufs[0].start = sizeof(struct mapping_header);
+    hdr->bufs[0].position = hdr->bufs[0].start;
+    hdr->bufs[0].limit = len / 2;
+    hdr->bufs[0].epoch = 2;
+    hdr->bufs[1].start = hdr->bufs[0].limit;
+    hdr->bufs[1].position = hdr->bufs[1].start;
+    hdr->bufs[1].limit = len;
+    hdr->bufs[1].epoch = 1;
+
+    // Make writes visible
+    atomic_fetch_add_explicit(&hdr->counter, 1, memory_order_release);
+
+    return self;
+}
+
+/* AggBuffer finalization */
+
+static int
+AggBuffer_traverse(PyObject *op, visitproc visit, void *arg)
+{
+    // Visit the type
+    Py_VISIT(Py_TYPE(op));
+
+    // Visit the attribute dict
+    AggBufferObject *self = AggBufferObject_CAST(op);
+    if(self) {}
+    return 0;
+}
+
+static int
+AggBuffer_clear(PyObject *op)
+{
+    AggBufferObject *self = AggBufferObject_CAST(op);
+    if(self) {}
+    return 0;
+}
+
+static void
+AggBuffer_finalize(PyObject *op)
+{
+    AggBufferObject *self = AggBufferObject_CAST(op);
+    if(self) {}
+}
+
+static void
+AggBuffer_dealloc(PyObject *op)
+{
+
+    PyObject_GC_UnTrack(op);
+    AggBuffer_finalize(op);
+    PyTypeObject *tp = Py_TYPE(op);
+
+    AggBufferObject *self = AggBufferObject_CAST(op);
+
+    int err;
+    Py_BEGIN_ALLOW_THREADS
+    err = munmap(self->data, self->len);
+    Py_END_ALLOW_THREADS
+    if (err == -1) {
+        // The deallocator must not change exceptions... so.
+        // Look into PyErr_WriteUnraisable
+#ifndef NDEBUG
+        perror("_tracebuffer.AggBuffer: munmap");
+#endif
+    }
+
+    freefunc free = PyType_GetSlot(tp, Py_tp_free);
+    free(self);
+    Py_DECREF(tp);
+}
+
+/* AggBuffer methods */
+
+static PyObject *
+AggBuffer_read(PyObject *op, PyObject *args)
+{
+    AggBufferObject *self = AggBufferObject_CAST(op);
+
+    unsigned long epoch;
+    Py_ssize_t offset;
+    Py_ssize_t size;
+
+    if (!PyArg_ParseTuple(args, "knn:read", &epoch, &offset, &size)) {
+        return NULL;
+    }
+
+    int which_buffer = epoch & 1;
+    struct mapping_header* hdr = self->data;
+
+    __auto_type buf = &hdr->bufs[which_buffer];
+    if (buf->epoch != epoch) {
+        PyErr_Format(PyExc_RuntimeError,
+                "buffer has epoch %"PRIu64", expected %lu", buf->epoch, epoch);
+        return NULL;
+    }
+
+    if (offset < buf->start || offset + size > buf->limit) {
+        PyErr_SetString(PyExc_ValueError, "offset/+size out of bounds");
+        return NULL;
+    }
+
+    return Py_BuildValue("y#", self->data + offset, size);
+}
+
+static PyObject *
+AggBuffer_write(PyObject *op, PyObject *args)
+{
+    AggBufferObject *self = AggBufferObject_CAST(op);
+
+    unsigned long epoch;
+    const char* data;
+    ssize_t data_len;
+
+    if (!PyArg_ParseTuple(args, "ky#:write", &epoch, &data, &data_len)) {
+        return NULL;
+    }
+    assert(data_len >= 0);
+
+    int which_buffer = epoch & 1;
+
+    struct mapping_header* hdr = self->data;
+
+    unsigned long ctr = atomic_load_explicit(&hdr->counter, memory_order_acquire);
+
+    if (ctr & 1) {
+        // Shouldn't happen, as there is external locking
+        PyErr_SetString(PyExc_RuntimeError, "buffer is busy.");
+        return NULL;
+    }
+
+    // Lock
+    if (!atomic_compare_exchange_strong_explicit(&hdr->counter, &ctr, 1 + ctr,
+                memory_order_acq_rel, memory_order_acquire)) {
+        PyErr_SetString(PyExc_RuntimeError, "other writer accessing buffer");
+        return NULL;
+    }
+
+    __auto_type buf = &hdr->bufs[which_buffer];
+    if (buf->epoch != epoch) {
+        atomic_fetch_add_explicit(&hdr->counter, 1, memory_order_release);
+        PyErr_Format(PyExc_RuntimeError,
+                "buffer has epoch %"PRIu64", expected %lu", buf->epoch, epoch);
+        return NULL;
+    }
+
+    uint32_t space = buf->limit - buf->position;
+    if (space < data_len) {
+        // TODO: increment some drop count
+        // Unlock
+        atomic_fetch_add_explicit(&hdr->counter, 1, memory_order_release);
+        PyErr_SetString(PyExc_MemoryError, "current buffer is full");
+        return NULL;
+    }
+
+    memcpy(self->data + buf->position, data, data_len);
+    buf->position += data_len;
+
+    // Unlock
+    atomic_fetch_add_explicit(&hdr->counter, 1, memory_order_release);
+    return Py_BuildValue("nn", (Py_ssize_t)(buf->position - data_len), data_len);
+}
+
+static PyObject *
+AggBuffer_update(PyObject *op, PyObject *args)
+{
+    AggBufferObject *self = AggBufferObject_CAST(op);
+
+    unsigned long epoch;
+    const char* data;
+    ssize_t data_len;
+    Py_ssize_t offset;
+    Py_ssize_t size;
+
+    if (!PyArg_ParseTuple(args, "ky#nn:update", &epoch, &data, &data_len,
+                &offset, &size)) {
+        return NULL;
+    }
+    assert(data_len >= 0);
+    if (size != data_len) {
+        PyErr_SetString(PyExc_ValueError, "size changed, cannot update");
+        return NULL;
+    }
+
+    int which_buffer = epoch & 1;
+
+    struct mapping_header* hdr = self->data;
+
+    unsigned long ctr = atomic_load_explicit(&hdr->counter, memory_order_acquire);
+    if (ctr & 1) {
+        PyErr_SetString(PyExc_RuntimeError, "buffer is busy.");
+        return NULL;
+    }
+
+    // Lock
+    if (!atomic_compare_exchange_strong_explicit(&hdr->counter, &ctr, 1 + ctr,
+                memory_order_acq_rel, memory_order_acquire)) {
+        PyErr_SetString(PyExc_RuntimeError, "other writer accessing buffer");
+        return NULL;
+    }
+
+    __auto_type buf = &hdr->bufs[which_buffer];
+    if (buf->epoch != epoch) {
+        // Unlock
+        atomic_fetch_add_explicit(&hdr->counter, 1, memory_order_release);
+        PyErr_Format(PyExc_RuntimeError,
+                "buffer has epoch %"PRIu64", expected %lu", buf->epoch, epoch);
+        return NULL;
+    }
+    if (offset < buf->start || offset + size > buf->limit) {
+        // Unlock
+        atomic_fetch_add_explicit(&hdr->counter, 1, memory_order_release);
+        PyErr_SetString(PyExc_ValueError, "offset/+size out of bounds");
+        return NULL;
+    }
+
+    memcpy(self->data + offset, data, data_len);
+
+    // Unlock
+    atomic_fetch_add_explicit(&hdr->counter, 1, memory_order_release);
+    return Py_BuildValue("nn", offset, data_len);
+}
+
+static PyObject *
+AggBuffer_readall(PyObject *op, PyObject *args)
+{
+    AggBufferObject *self = AggBufferObject_CAST(op);
+
+    unsigned long epoch;
+
+    if (!PyArg_ParseTuple(args, "k:readall", &epoch)) {
+        return NULL;
+    }
+
+    int which_buffer = epoch & 1;
+    struct mapping_header* hdr = self->data;
+
+    // We want to see the latest writes to the buffer header.
+    // This is only sufficient for as long as we
+    // 1. only read after detaching OR
+    // 2. only if already having picked the inactive buffer.
+    atomic_load_explicit(&hdr->counter, memory_order_acquire);
+
+    __auto_type buf = &hdr->bufs[which_buffer];
+    if (buf->epoch != epoch) {
+        PyErr_Format(PyExc_RuntimeError,
+                "buffer has epoch %"PRIu64", expected %lu", buf->epoch, epoch);
+        return NULL;
+    }
+
+    return Py_BuildValue("y#", self->data + buf->start,
+            (Py_ssize_t)(buf->position - buf->start));
+}
+
+static PyMethodDef AggBuffer_methods[] = {
+    {"read", AggBuffer_read, METH_VARARGS,
+     PyDoc_STR("read(epoch: int, offset: int, size: int) -> bytes")},
+    {"write", AggBuffer_write, METH_VARARGS,
+     PyDoc_STR("write(epoch: int, kvp_data: bytes) -> (offset: int, size: int)")},
+    {"update", AggBuffer_update, METH_VARARGS,
+     PyDoc_STR("write(epoch: int, kvp_data: bytes, offset: int, oldsize: int) "
+               "-> (offset: int, size: int)")},
+    {"readall", AggBuffer_readall, METH_VARARGS,
+     PyDoc_STR("readall(epoch: int) -> str")},
+    {NULL, NULL, 0, NULL}           /* sentinel */
+};
+
+
+static PyObject *
+AggBuffer_get_epoch(PyObject *op, void *Py_UNUSED(closure))
+{
+    AggBufferObject *self = AggBufferObject_CAST(op);
+
+    struct mapping_header* hdr = self->data;
+
+    unsigned long epoch;
+    /*
+     * Acquire semantics here because this precedes reading the buffer header
+     * which may have been updated by the tracer.
+     */
+    epoch = atomic_load_explicit(&hdr->epoch, memory_order_acquire);
+
+    return PyLong_FromUnsignedLong(epoch);
+}
+
+static PyObject *
+AggBuffer_get_name(PyObject *op, void *Py_UNUSED(closure))
+{
+    AggBufferObject *self = AggBufferObject_CAST(op);
+
+    struct mapping_header* hdr = self->data;
+
+    return Py_BuildValue("s", hdr->bufname);
+}
+
+/* AggBuffer type definition */
+
+PyDoc_STRVAR(AggBuffer_doc,
+        "A buffer for writing aggregation data, backed by a shared mmap file.");
+
+static PyGetSetDef AggBuffer_getsetlist[] = {
+    {"epoch", AggBuffer_get_epoch, NULL, NULL},
+    {"name", AggBuffer_get_name, NULL, NULL},
+    {NULL},
+};
+
+static PyType_Slot AggBuffer_Type_slots[] = {
+    {Py_tp_doc, (char *)AggBuffer_doc},
+    {Py_tp_traverse, AggBuffer_traverse},
+    {Py_tp_clear, AggBuffer_clear},
+    {Py_tp_finalize, AggBuffer_finalize},
+    {Py_tp_dealloc, AggBuffer_dealloc},
+    {Py_tp_methods, AggBuffer_methods},
+    {Py_tp_getset, AggBuffer_getsetlist},
+    {0, 0},  /* sentinel */
+};
+
+static PyType_Spec AggBuffer_Type_spec = {
+    .name = "pymontrace._tracebuffer.AggBuffer",
+    .basicsize = sizeof(AggBufferObject),
+    .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
+    .slots = AggBuffer_Type_slots,
+};
+
+/* Module Methods */
 
 static PyObject *
 tracebuffer_create(PyObject *module, PyObject *args)
@@ -423,13 +814,59 @@ tracebuffer_create(PyObject *module, PyObject *args)
     return (PyObject *)rv;
 }
 
+static PyObject *
+tracebuffer_create_aggbuffer(PyObject *module, PyObject *args)
+{
+    int fd;
+    const char* name;
+    ssize_t name_len;
+    AggBufferObject* rv;
+
+    if (!PyArg_ParseTuple(args, "is#:create_agg_buffer", &fd, &name,
+                &name_len)) {
+        return NULL;
+    }
+    struct mapping_header *hdr;
+    if ((size_t)name_len > sizeof(hdr->bufname) - 1) {
+        PyErr_SetString(PyExc_ValueError, "buffer name too long: max 31");
+        return NULL;
+    }
+
+    rv = newAggBufferObject(module, fd, name);
+    if (rv == NULL) {
+        return NULL;
+    }
+    return (PyObject *)rv;
+}
+
+static PyObject *
+tracebuffer_open_aggbuffer(PyObject *module, PyObject *args)
+{
+    int fd;
+    AggBufferObject* rv;
+
+    if (!PyArg_ParseTuple(args, "i:create_agg_buffer", &fd)) {
+        return NULL;
+    }
+
+    rv = newAggBufferObject(module, fd, NULL);
+    if (rv == NULL) {
+        return NULL;
+    }
+    return (PyObject *)rv;
+}
+
 
 PyDoc_STRVAR(create__doc__, "\
 create(file_descriptor: int)");
 
 static PyMethodDef tracebuffer_methods[] = {
-    {"create",  tracebuffer_create, METH_VARARGS,
+    {"create", tracebuffer_create, METH_VARARGS,
      create__doc__},
+    {"create_agg_buffer", tracebuffer_create_aggbuffer, METH_VARARGS,
+     PyDoc_STR("create_agg_buffer(fd: int, name: bytes) -> AggBuffer")},
+    {"open_agg_buffer", tracebuffer_open_aggbuffer, METH_VARARGS,
+     PyDoc_STR("open_agg_buffer(fd: int) -> AggBuffer")},
     {NULL, NULL, 0, NULL}        /* Sentinel */
 };
 
@@ -455,6 +892,15 @@ tracebuffer_modexec(PyObject *m)
         return -1;
     }
 
+    state->AggBuffer_Type =
+        PyType_FromModuleAndSpec(m, &AggBuffer_Type_spec, NULL);
+    if (state->AggBuffer_Type == NULL) {
+        return -1;
+    }
+    if (PyModule_AddType(m, (PyTypeObject*)state->AggBuffer_Type) < 0) {
+        return -1;
+    }
+
     return 0;
 }
 
@@ -468,6 +914,7 @@ tracebuffer_traverse(PyObject *module, visitproc visit, void *arg)
 {
     tracebuffer_state *state = PyModule_GetState(module);
     Py_VISIT(state->TraceBuffer_Type);
+    Py_VISIT(state->AggBuffer_Type);
 
     return 0;
 }
@@ -477,6 +924,7 @@ tracebuffer_clear(PyObject *module)
 {
     tracebuffer_state *state = PyModule_GetState(module);
     Py_CLEAR(state->TraceBuffer_Type);
+    Py_CLEAR(state->AggBuffer_Type);
     return 0;
 }
 

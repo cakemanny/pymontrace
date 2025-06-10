@@ -6,7 +6,6 @@ All imports are from the standard library.
 """
 import array
 import atexit
-import fcntl
 import inspect
 import io
 import os
@@ -348,6 +347,7 @@ class TracerRemote:
 
     @staticmethod
     def _create_primary_buffer(comm_fh: socket.socket):
+        # Should there be a separate one of these for each thread/cpu ?
         fn: str = comm_fh.getpeername() + '.buffer'
         assert fn.startswith('/'), f"{fn=}"
         return fn, tracebuffer.create(fn)
@@ -378,7 +378,7 @@ class TracerRemote:
             self._agg_buffer_count += 1
         fn: str = comm_fh.getpeername() + f'.map{i:03}'
         assert fn.startswith('/'), f"{fn=}"
-        return AggBuffer.create(name, fn)
+        return tracebuffer.create_agg_buffer(name, fn)
 
     @staticmethod
     def _encode_print(*args, **kwargs):
@@ -560,98 +560,8 @@ class VarNS(SimpleNamespace):
             object.__setattr__(self, name, value)
 
 
-class AggBuffer:
-
-    HDR_FMT = '@QQ32s'
-    """struct { counter:u64; epoch:u64; name:char[32]; }"""
-
-    def __init__(self, name: str, filename: str, fp: io.FileIO) -> None:
-        self.fn = filename
-        self.fp = fp
-        self.name = name
-        self.start = struct.calcsize(AggBuffer.HDR_FMT)
-        self.position = self.start
-
-    @classmethod
-    def create(cls, name: str, filename: str) -> 'AggBuffer':
-        fp = open(filename, 'x+b', buffering=0)
-        name_bytes = name.encode()
-        hdr_bytes = struct.pack(AggBuffer.HDR_FMT, 0, 2, name_bytes)
-        if (written := os.pwrite(fp.fileno(), hdr_bytes, 0)) != len(hdr_bytes):
-            raise RuntimeError(f'short write of {written} bytes')
-        return AggBuffer(name, filename, fp)
-
-    @classmethod
-    def open(cls, filename: str) -> 'AggBuffer':
-        fp = open(filename, 'r+b', buffering=0)
-        hdr_length = struct.calcsize(cls.HDR_FMT)
-        hdr_bytes = os.pread(fp.fileno(), hdr_length, 0)
-        if len(hdr_bytes) != hdr_length:
-            raise RuntimeError(
-                f'short read: {len(hdr_bytes)} of {hdr_length} bytes')
-        counter, epoch, name = struct.unpack(cls.HDR_FMT, hdr_bytes)
-        # strip trailing null bytes
-        name = name[:name.index(b'\x00')]
-        return AggBuffer(name.decode(), filename, fp)
-
-    def __enter__(self):
-        fcntl.flock(self.fp, fcntl.LOCK_EX)
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        fcntl.flock(self.fp, fcntl.LOCK_UN)
-
-    def read(self, offset: int, size: int) -> bytes:
-        data = os.pread(self.fp.fileno(), size, offset)
-        if len(data) != size:
-            raise RuntimeError(f'short read, {len(data)} or {size}')
-        return data
-
-    def write(self, kvp: bytes) -> tuple[int, int]:
-        """Returns: (offset, size)"""
-        length = len(kvp)
-
-        remaining = length
-        while remaining != 0:
-            offset = self.position + (length - remaining)
-            written = os.pwrite(self.fp.fileno(), kvp, offset)
-            remaining -= written
-        self.position += length
-        return (self.position - length, length)
-
-    def update(self, kvp: bytes, offset: int, oldsize: int):
-        length = len(kvp)
-        if len(kvp) != oldsize:
-            raise ValueError('size changed, cannot update')
-
-        remaining = length
-        while remaining != 0:
-            off = offset + (length - remaining)
-            written = os.pwrite(self.fp.fileno(), kvp, off)
-            remaining -= written
-        return (offset, length)
-
-    # # For the tracer
-
-    def read_records(self):
-        reader = io.BufferedReader(self.fp)
-        try:
-            reader.seek(self.start, io.SEEK_SET)
-            while True:
-                length_bytes = reader.read(4)
-                if len(length_bytes) < 4:
-                    break
-                length = int.from_bytes(length_bytes, sys.byteorder)
-                data_bytes = reader.read(length)
-                if len(data_bytes) < length:
-                    break
-                yield length_bytes + data_bytes
-        finally:
-            # Avoid closing the file
-            reader.detach()
-
-
 class PMTMap(abc.MutableMapping):
-    def __init__(self, buffer: AggBuffer) -> None:
+    def __init__(self, buffer: tracebuffer.AggBuffer) -> None:
         super().__init__()
         self.index: dict[Any, tuple[int, int]] = {}
         self.buffer = buffer
