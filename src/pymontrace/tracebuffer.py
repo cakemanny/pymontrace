@@ -60,8 +60,16 @@ class AggBuffer:
         self.epoch = 2
 
     @property
-    def name(self):
+    def name(self) -> str:  # tracer
         return self._agg_buffer.name
+
+    @property
+    def agg_op(self):  # tracer
+        return self._agg_buffer.agg_op
+
+    @agg_op.setter
+    def agg_op(self, value: int):  # tracee
+        self._agg_buffer.agg_op = value
 
     def __enter__(self):
         if not self._lock.acquire(timeout=1.0):
@@ -71,19 +79,29 @@ class AggBuffer:
     def __exit__(self, exc_type, exc_value, traceback):
         self._lock.release()
 
-    def read(self, offset: int, size: int) -> bytes:
+    def read(self, offset: int, size: int) -> bytes:  # tracee
         return self._agg_buffer.read(self.epoch, offset, size)
 
-    def write(self, kvp: bytes) -> tuple[int, int]:
+    def write(self, kvp: bytes) -> tuple[int, int]:  # tracee
         return self._agg_buffer.write(self.epoch, kvp)
 
-    def update(self, kvp: bytes, offset: int, size: int) -> bytes:
+    def update(self, kvp: bytes, offset: int, size: int) -> bytes:  # tracee
         return self._agg_buffer.update(self.epoch, kvp, offset, size)
 
-    def readall(self, epoch: Union[int, None] = None):
+    def readall(self, epoch: Union[int, None] = None) -> bytes:  # tracer
         if epoch is None:
             epoch = self.epoch
         return self._agg_buffer.readall(epoch)
+
+    def written(self, epoch: int) -> int:  # tracer
+        """The number of bytes already written to epoch buffer"""
+        return self._agg_buffer.written(epoch)
+
+    def switch(self):  # tracer
+        """Switch the active buffer and increment the epoch"""
+        # Maybe this should just be combined into a single C function?
+        self._agg_buffer.reset(self.epoch - 1)
+        self.epoch = self._agg_buffer.incr_epoch()
 
 
 def create_agg_buffer(name: str, filename: str, size=DEFAULT_BUFFER_SIZE) -> AggBuffer:

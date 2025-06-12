@@ -32,11 +32,22 @@
 #   define cpu_relax()  ;;
 #endif
 
+enum agg_op {
+    AGG_OP_NONE = 0,
+    AGG_OP_COUNT = 1,
+    AGG_OP_SUM = 2,
+    AGG_OP_MAX = 3,
+    AGG_OP_MIN = 4,
+    AGG_OP_QUANTIZE = 5,
+    AGG_OP_END, // sentinel
+};
+
 // The structure that lives at the head of our mapping
 struct mapping_header {
     _Atomic unsigned long counter;
     _Atomic unsigned long epoch;
     char bufname[32];
+    _Atomic enum agg_op agg_op;
 
     struct {
         uint32_t start; /* offset from start of mapping */
@@ -458,6 +469,7 @@ newAggBufferObject(PyObject *module, int fd, const char* name)
         strncpy(hdr->bufname, name, sizeof(hdr->bufname) - 1);
         hdr->bufname[sizeof(hdr->bufname) - 1] = '\0';
     }
+    hdr->agg_op = AGG_OP_NONE;
     hdr->bufs[0].start = sizeof(struct mapping_header);
     hdr->bufs[0].position = hdr->bufs[0].start;
     hdr->bufs[0].limit = len / 2;
@@ -696,7 +708,7 @@ AggBuffer_readall(PyObject *op, PyObject *args)
 
     // We want to see the latest writes to the buffer header.
     // This is only sufficient for as long as we
-    // 1. only read after detaching OR
+    // 1. only read after detaching from the tracee OR
     // 2. only if already having picked the inactive buffer.
     atomic_load_explicit(&hdr->counter, memory_order_acquire);
 
@@ -711,6 +723,102 @@ AggBuffer_readall(PyObject *op, PyObject *args)
             (Py_ssize_t)(buf->position - buf->start));
 }
 
+static PyObject *
+AggBuffer_written(PyObject *op, PyObject *args)
+{
+    AggBufferObject *self = AggBufferObject_CAST(op);
+
+    unsigned long epoch;
+
+    if (!PyArg_ParseTuple(args, "k:written", &epoch)) {
+        return NULL;
+    }
+
+    int which_buffer = epoch & 1;
+    struct mapping_header* hdr = self->data;
+    unsigned long ctr;
+
+    #define clean_read(init_ctr) ({ \
+        atomic_thread_fence(memory_order_acquire); \
+        init_ctr == atomic_load_explicit(&hdr->counter, memory_order_relaxed); \
+    })
+
+    for (int i = 0; i < 256; i++) {
+        ctr = atomic_load_explicit(&hdr->counter, memory_order_acquire);
+        if ((ctr & 1) != 0) {
+            cpu_relax();
+            if (((i + 1) & 63) == 0) {
+                sched_yield();
+            }
+            continue;
+        }
+
+        __auto_type buf = &hdr->bufs[which_buffer];
+        if (buf->epoch != epoch) {
+            if (!clean_read(ctr)) {
+                continue;
+            }
+            PyErr_Format(PyExc_RuntimeError,
+                    "buffer has epoch %"PRIu64", expected %lu", buf->epoch, epoch);
+            return NULL;
+        }
+
+        if (clean_read(ctr)) {
+            return PyLong_FromSsize_t((Py_ssize_t)(buf->position - buf->start));
+        }
+    }
+    #undef clean_read
+
+    PyErr_SetString(PyExc_RuntimeError, "failed to get a clean read");
+    return NULL;
+}
+
+static PyObject *
+AggBuffer_reset(PyObject *op, PyObject *args)
+{
+    AggBufferObject *self = AggBufferObject_CAST(op);
+
+    unsigned long epoch;
+
+    if (!PyArg_ParseTuple(args, "k:reset", &epoch)) {
+        return NULL;
+    }
+
+    struct mapping_header* hdr = self->data;
+
+    unsigned long current_epoch;
+    current_epoch = atomic_load_explicit(&hdr->epoch, memory_order_relaxed);
+    if (epoch == current_epoch) {
+        PyErr_SetString(PyExc_ValueError, "cannot reset active buffer");
+        return NULL;
+    }
+
+    int which_buffer = epoch & 1;
+    __auto_type buf = &hdr->bufs[which_buffer];
+
+    buf->position = buf->start;
+    memset(self->data + buf->start, 0, buf->limit - buf->start);
+    Py_RETURN_NONE;
+}
+
+static PyObject *
+AggBuffer_incr_epoch(PyObject *op, PyObject *args)
+{
+    AggBufferObject *self = AggBufferObject_CAST(op);
+
+    struct mapping_header* hdr = self->data;
+    unsigned long epoch;
+    epoch = atomic_load_explicit(&hdr->epoch, memory_order_relaxed);
+
+    assert(hdr->bufs[(epoch - 1) & 1].epoch == (epoch - 1));
+    // increment the epoch of the inactive buffer that will be switched to.
+    hdr->bufs[(epoch - 1) & 1].epoch = epoch + 1;
+
+    unsigned long old_epoch;
+    old_epoch = atomic_fetch_add_explicit(&hdr->epoch, 1, memory_order_release);
+    return PyLong_FromUnsignedLong(1 + old_epoch);
+}
+
 static PyMethodDef AggBuffer_methods[] = {
     {"read", AggBuffer_read, METH_VARARGS,
      PyDoc_STR("read(epoch: int, offset: int, size: int) -> bytes")},
@@ -721,6 +829,13 @@ static PyMethodDef AggBuffer_methods[] = {
                "-> (offset: int, size: int)")},
     {"readall", AggBuffer_readall, METH_VARARGS,
      PyDoc_STR("readall(epoch: int) -> str")},
+    {"written", AggBuffer_written, METH_VARARGS,
+     PyDoc_STR("written(epoch: int) -> int")},
+    {"reset", AggBuffer_reset, METH_VARARGS,
+     PyDoc_STR("reset(epoch: int) -> int")},
+    {"incr_epoch", AggBuffer_incr_epoch, METH_VARARGS,
+     PyDoc_STR("incr_epoch() -> int\n\n"
+             "Bumps the epoch and returns its new value.")},
     {NULL, NULL, 0, NULL}           /* sentinel */
 };
 
@@ -752,6 +867,37 @@ AggBuffer_get_name(PyObject *op, void *Py_UNUSED(closure))
     return Py_BuildValue("s", hdr->bufname);
 }
 
+static PyObject *
+AggBuffer_get_agg_op(PyObject *op, void *Py_UNUSED(closure))
+{
+    AggBufferObject *self = AggBufferObject_CAST(op);
+    struct mapping_header* hdr = self->data;
+
+    int agg_op = atomic_load_explicit(&hdr->agg_op, memory_order_relaxed);
+    return Py_BuildValue("i", agg_op);
+}
+
+static int
+AggBuffer_set_agg_op(PyObject *op, PyObject *value, void *Py_UNUSED(closure))
+{
+    AggBufferObject *self = AggBufferObject_CAST(op);
+    struct mapping_header* hdr = self->data;
+
+    long agg_op = AGG_OP_NONE;
+    if (value != NULL) {
+        agg_op = PyLong_AsLong(value);
+        if (-1 == agg_op && PyErr_Occurred()) {
+            return -1;
+        }
+    }
+    if (agg_op < AGG_OP_NONE || agg_op >= AGG_OP_END) {
+        PyErr_SetString(PyExc_ValueError, "invalid aggregation op id");
+        return -1;
+    }
+    atomic_store_explicit(&hdr->agg_op, agg_op, memory_order_relaxed);
+    return 0;
+}
+
 /* AggBuffer type definition */
 
 PyDoc_STRVAR(AggBuffer_doc,
@@ -760,6 +906,8 @@ PyDoc_STRVAR(AggBuffer_doc,
 static PyGetSetDef AggBuffer_getsetlist[] = {
     {"epoch", AggBuffer_get_epoch, NULL, NULL},
     {"name", AggBuffer_get_name, NULL, NULL},
+    {"agg_op", AggBuffer_get_agg_op, AggBuffer_set_agg_op,
+     PyDoc_STR("The aggregation operation id")},
     {NULL},
 };
 

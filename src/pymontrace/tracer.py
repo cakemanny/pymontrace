@@ -1,5 +1,6 @@
 import enum
 import inspect
+import operator
 import os
 import pathlib
 import re
@@ -14,7 +15,7 @@ import threading
 import traceback
 from contextlib import contextmanager
 from tempfile import TemporaryDirectory
-from typing import NoReturn
+from typing import NoReturn, Union
 
 from pymontrace import _darwin, attacher, tracebuffer
 from pymontrace.tracebuffer import AggBuffer, TraceBuffer
@@ -459,9 +460,7 @@ class TraceState:
 
         # To not exhaust the tracee's memory,
         # periodically aggregation data is accumulated here in the tracer.
-        self.checkpointed_aggregations = {}
         self.chkptd_aggs = {}
-        self.checkpointed_aggs = {}
 
 
 def decode_trace_buffers_once(buffers: list[TraceBuffer]):
@@ -482,6 +481,53 @@ def decode_trace_buffers_once(buffers: list[TraceBuffer]):
                 out.write(line.decode())
             else:
                 print(f'unexpected data in trace buffer: {kind=}', file=sys.stderr)
+
+
+def accumulate_func(agg_op: int):
+    from pymontrace.tracee import AggOp
+
+    if agg_op == AggOp.NONE:
+        return lambda _, v2: v2
+    elif agg_op == AggOp.COUNT:
+        return operator.add
+    elif agg_op == AggOp.SUM:
+        return operator.add
+    elif agg_op == AggOp.MAX:
+        return max
+    elif agg_op == AggOp.MIN:
+        return min
+    elif agg_op == AggOp.QUANTIZE:
+        def accumulate_quantize(v1, v2):
+            pass
+        return accumulate_quantize
+    raise ValueError(f'invalid agg_op: {agg_op}')
+
+
+def switch_aggregation_buffers(ts: TraceState):
+    from pymontrace.tracee import PMTMap
+
+    for buffer in ts.agg_buffers:
+
+        # First check if the active buffer has been written to
+        # (otherwise it's not really active).
+        active = buffer.epoch
+        if buffer.written(active) == 0:
+            continue
+
+        which = buffer.epoch - 1
+        accumulated = ts.chkptd_aggs.setdefault(buffer.name, {})
+
+        agg_op = buffer.agg_op
+        accumulate = accumulate_func(agg_op)
+
+        for record_bytes in read_records(buffer, epoch=which):
+            key, value = PMTMap._decode(record_bytes)
+            if key in accumulated:
+                existing = accumulated[key]
+                accumulated[key] = accumulate(existing, value)
+            else:
+                accumulated[key] = value
+        buffer.switch()
 
 
 class DecodeEndReason(enum.Enum):
@@ -535,7 +581,7 @@ def decode_and_print_forever(
                 ts.trace_buffers.append(tracebuffer.create(localpath))
                 os.unlink(localpath)
             elif kind == Message.HEARTBEAT:
-                pass
+                decode_trace_buffers_once(ts.trace_buffers)
             elif kind == Message.AGG_BUFFER:
                 filepath = body.decode()
                 localpath = from_remote_path(pid, filepath)
@@ -557,13 +603,14 @@ def decode_and_print_remaining(pid: int, s: socket.socket, ts: TraceState):
     # This should not block as the client should have disconnected
     decode_and_print_forever(pid, s, ts, only_print=True)
     decode_trace_buffers_once(ts.trace_buffers)
+    # TODO: accumulate active agg buffer
     print_maps(ts.agg_buffers)
 
 
-def read_records(agg_buffer: AggBuffer):
+def read_records(agg_buffer: AggBuffer, epoch: Union[int, None] = None):
     import io
 
-    f = io.BytesIO(agg_buffer.readall())
+    f = io.BytesIO(agg_buffer.readall(epoch))
 
     while True:
         length_bytes = f.read(4)
@@ -581,6 +628,7 @@ def read_records(agg_buffer: AggBuffer):
 def print_maps(agg_buffers: list[AggBuffer]):
     from pymontrace.tracee import PMTMap
 
+    # TODO: change to print accumulated aggregations
     for agg_buffer in agg_buffers:
         as_dict = {}
 

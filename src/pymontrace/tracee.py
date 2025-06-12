@@ -445,16 +445,33 @@ class EvaluationError(PMTError):
     pass
 
 
+class AggOp:
+    """Aggregation Operation"""
+    NONE = 0
+    COUNT = 1
+    SUM = 2
+    MAX = 3
+    MIN = 4
+    QUANTIZE = 5
+    # How will this work if we add lquantize ??
+
+
 class aggregation:
     class Base:
+        op = AggOp.NONE
+
         def aggregate(self, current):
             raise NotImplementedError
 
     class Count(Base):
+        op = AggOp.COUNT
+
         def aggregate(self, current: Optional[int]):
             return (current or 0) + 1
 
     class Sum(Base):
+        op = AggOp.SUM
+
         def __init__(self, value):
             self.value = value
 
@@ -462,6 +479,8 @@ class aggregation:
             return (current or 0) + self.value
 
     class Max(Base):
+        op = AggOp.MAX
+
         def __init__(self, value):
             self.value = value
 
@@ -469,6 +488,8 @@ class aggregation:
             return self.value if current is None else max(current, self.value)
 
     class Min(Base):
+        op = AggOp.MIN
+
         def __init__(self, value):
             self.value = value
 
@@ -476,6 +497,8 @@ class aggregation:
             return self.value if current is None else min(current, self.value)
 
     class Quantize(Base):
+        op = AggOp.QUANTIZE
+
         def __init__(self, value):
             self.value = value
 
@@ -486,6 +509,11 @@ class aggregation:
 
 
 class agg:
+    """
+    A namespace of functions to be used in the actions.
+
+    e.g. 'line:xxx.py:123 {{ maps[ctx.route] = agg.quantize(ctx.duration) }}'
+    """
     @staticmethod
     def count():
         return aggregation.Count()
@@ -518,6 +546,15 @@ class Quantization:
 
     def __init__(self) -> None:
         self.buckets = array.array('Q', [0] * 128)
+
+    # used in accumulation in tracer
+    def __add__(self, other):
+        if not isinstance(other, Quantization):
+            raise TypeError
+        result = Quantization()
+        for i, (v0, v1) in enumerate(zip(self.buckets, other.buckets, strict=True)):
+            result.buckets[i] = v0 + v1
+        return result
 
     def add(self, value):
         if not isinstance(value, (int, float)):
@@ -565,6 +602,8 @@ class PMTMap(abc.MutableMapping):
         super().__init__()
         self.index: dict[Any, tuple[int, int]] = {}
         self.buffer = buffer
+        self.agg_op = 0
+        self.epoch = 2
 
     def __len__(self) -> int:
         return len(self.index)
@@ -572,8 +611,14 @@ class PMTMap(abc.MutableMapping):
     def __iter__(self):
         return iter(self.index)
 
+    def _reset_index(self):
+        self.epoch = self.buffer.epoch
+        self.index = {}
+
     def __getitem__(self, key, /):
         with self.buffer:
+            if self.epoch != self.buffer.epoch:
+                self._reset_index()
             return self._getitem(key)
 
     _NO_DEFAULT = object()
@@ -641,10 +686,15 @@ class PMTMap(abc.MutableMapping):
 
     def __setitem__(self, key, value, /) -> None:
         with self.buffer:
+            if self.epoch != self.buffer.epoch:
+                self._reset_index()
             current = self._getitem(key, None)
             if isinstance(value, aggregation.Base):
                 new = value.aggregate(current)
                 self._setitem(key, new)
+                if self.agg_op == 0:
+                    self.buffer.agg_op = value.op
+                    self.agg_op = value.op
             elif isinstance(value, (int, float, Quantization)):
                 self._setitem(key, value)
             else:

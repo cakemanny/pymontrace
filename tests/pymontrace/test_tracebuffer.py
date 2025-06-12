@@ -1,5 +1,6 @@
-
 from pathlib import Path
+
+import pytest
 
 
 def test_tracebuffer(tmp_path: Path):
@@ -35,3 +36,14 @@ def test_agg_buffer(tmp_path: Path):
     buffer.write(b"moar")
     assert buffer.read(offset, size) == b"hallo"
     assert buffer._agg_buffer.readall(buffer.epoch) == b"hallomoar"
+
+    assert buffer.written(2) == 9
+
+    assert buffer.agg_op == 0
+    buffer.agg_op = 2
+    assert buffer.agg_op == 2
+
+    with pytest.raises(ValueError):
+        buffer.agg_op = -1
+    with pytest.raises(ValueError):
+        buffer.agg_op = 6

@@ -46,6 +46,7 @@ In priority order:
       (We have added an atexit handler - that's half of it)
       (though to get maps after signal its better to just have persisted that
        assuming the file continue to exist)
+- [ ] Interval probes (probably using setitimer)
 - [ ] Support FreeBSD + jails , Illumos + zones, ...
 - [ ] musl support on Linux ...
 - [ ] Rewrite the C code in Rust?
