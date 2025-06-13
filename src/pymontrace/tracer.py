@@ -1,5 +1,6 @@
 import enum
 import inspect
+import io
 import operator
 import os
 import pathlib
@@ -503,8 +504,41 @@ def accumulate_func(agg_op: int):
     raise ValueError(f'invalid agg_op: {agg_op}')
 
 
-def switch_aggregation_buffers(ts: TraceState):
+def read_records(agg_buffer: AggBuffer, epoch: Union[int, None] = None):
+
+    f = io.BytesIO(agg_buffer.readall(epoch))
+
+    while True:
+        length_bytes = f.read(4)
+        if len(length_bytes) < 4:
+            break
+        length = int.from_bytes(length_bytes, sys.byteorder)
+        if length == 0:
+            break
+        data_bytes = f.read(length)
+        if len(data_bytes) < length:
+            break
+        yield length_bytes + data_bytes
+
+
+def accumulate_buffer(buffer: AggBuffer, epoch: int, ts: TraceState):
     from pymontrace.tracee import PMTMap
+
+    accumulated = ts.chkptd_aggs.setdefault(buffer.name, {})
+
+    agg_op = buffer.agg_op
+    accumulate = accumulate_func(agg_op)
+
+    for record_bytes in read_records(buffer, epoch=epoch):
+        key, value = PMTMap._decode(record_bytes)
+        if key in accumulated:
+            existing = accumulated[key]
+            accumulated[key] = accumulate(existing, value)
+        else:
+            accumulated[key] = value
+
+
+def switch_aggregation_buffers(ts: TraceState):
 
     for buffer in ts.agg_buffers:
 
@@ -515,18 +549,7 @@ def switch_aggregation_buffers(ts: TraceState):
             continue
 
         which = buffer.epoch - 1
-        accumulated = ts.chkptd_aggs.setdefault(buffer.name, {})
-
-        agg_op = buffer.agg_op
-        accumulate = accumulate_func(agg_op)
-
-        for record_bytes in read_records(buffer, epoch=which):
-            key, value = PMTMap._decode(record_bytes)
-            if key in accumulated:
-                existing = accumulated[key]
-                accumulated[key] = accumulate(existing, value)
-            else:
-                accumulated[key] = value
+        accumulate_buffer(buffer, which, ts)
         buffer.switch()
 
 
@@ -555,6 +578,7 @@ def decode_and_print_forever(
             # the pymontrace::END probe)
             if wait_till_ready_or_got_signal(s, sel) == WaitResult.TIMEOUT:
                 decode_trace_buffers_once(ts.trace_buffers)
+                switch_aggregation_buffers(ts)
                 continue
 
             header = s.recv(header_fmt.size)
@@ -603,42 +627,17 @@ def decode_and_print_remaining(pid: int, s: socket.socket, ts: TraceState):
     # This should not block as the client should have disconnected
     decode_and_print_forever(pid, s, ts, only_print=True)
     decode_trace_buffers_once(ts.trace_buffers)
-    # TODO: accumulate active agg buffer
-    print_maps(ts.agg_buffers)
+
+    for agg_buffer in ts.agg_buffers:
+        accumulate_buffer(agg_buffer, agg_buffer.epoch - 1, ts)
+        accumulate_buffer(agg_buffer, agg_buffer.epoch, ts)
+    print_maps(ts)
 
 
-def read_records(agg_buffer: AggBuffer, epoch: Union[int, None] = None):
-    import io
-
-    f = io.BytesIO(agg_buffer.readall(epoch))
-
-    while True:
-        length_bytes = f.read(4)
-        if len(length_bytes) < 4:
-            break
-        length = int.from_bytes(length_bytes, sys.byteorder)
-        if length == 0:
-            break
-        data_bytes = f.read(length)
-        if len(data_bytes) < length:
-            break
-        yield length_bytes + data_bytes
-
-
-def print_maps(agg_buffers: list[AggBuffer]):
-    from pymontrace.tracee import PMTMap
-
-    # TODO: change to print accumulated aggregations
-    for agg_buffer in agg_buffers:
-        as_dict = {}
-
-        for record_bytes in read_records(agg_buffer):
-            key, value = PMTMap._decode(record_bytes)
-            as_dict[key] = value
-
-        name = agg_buffer.name
+def print_maps(ts: TraceState):
+    for name, mapp in ts.chkptd_aggs.items():
         try:
-            print_map(name, as_dict)
+            print_map(name, mapp)
         except Exception:
             print(f"Failed to print map: {name}:", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
