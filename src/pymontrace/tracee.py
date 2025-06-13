@@ -552,7 +552,7 @@ class Quantization:
         if not isinstance(other, Quantization):
             raise TypeError
         result = Quantization()
-        for i, (v0, v1) in enumerate(zip(self.buckets, other.buckets, strict=True)):
+        for i, (v0, v1) in enumerate(zip(self.buckets, other.buckets)):
             result.buckets[i] = v0 + v1
         return result
 
