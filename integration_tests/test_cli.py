@@ -62,6 +62,10 @@ def test_aggregation():
         cwd=(pathlib.Path('.') / 'integration_tests' / 'targets'),
         capture_output=True
     )
+    print(">>>STDERR")
+    print(p.stderr.decode())
+    print(">>>STDOUT")
+    print(p.stdout.decode())
     p.check_returncode()
     assert b'a_values \n\n  4: 12\n  5: 12\n  ' in p.stdout
     assert b'Traceback' not in p.stderr

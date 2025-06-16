@@ -259,7 +259,8 @@ def test_agg_perf(connected_remote):
 
     # 5.5358µs in commit that adds this test
     # 3.5259µs after switching to python's mmap
-    # 2.7347µs after rewriting in C
+    # 2.7347µs after rewriting AggBuffer in C
+    # 2.2626µs : encoding key and value separately and only updating the value
     print(f"avg max: {avg_op_micros:.5}µs")
     assert False
 

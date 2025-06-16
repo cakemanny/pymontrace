@@ -619,7 +619,8 @@ class PMTMap(abc.MutableMapping):
         with self.buffer:
             if self.epoch != self.buffer.epoch:
                 self._reset_index()
-            return self._getitem(key)
+            value, _ = self._getitem(key)
+            return value
 
     _NO_DEFAULT = object()
 
@@ -628,17 +629,24 @@ class PMTMap(abc.MutableMapping):
             offset, size = self.index[key]
         except KeyError:
             if default != self._NO_DEFAULT:
-                return default
+                return default, None
             raise
-        stored_key, value = self._decode(self.buffer.read(offset, size))
-        assert key == stored_key
-        return value
+        data = self.buffer.read(offset, size)
+        value = self._decode_value(data)
+        return value, data
 
     @staticmethod
     def _encode(key, value) -> bytes:
         # pickle does not encode with a consistent size for same type
         # so we cannot use it for the value, which changes
         key_data = pickle.dumps(key)
+
+        return (len(key_data).to_bytes(length=4, byteorder=sys.byteorder)
+                + key_data
+                + PMTMap._encode_value(value))
+
+    @staticmethod
+    def _encode_value(value) -> bytes:
         value_data: bytes
         if isinstance(value, int):
             if value < 0:
@@ -653,18 +661,28 @@ class PMTMap(abc.MutableMapping):
             value_data = b'Y' + value.buckets.tobytes()
         else:
             raise TypeError(
-                f'unsupported aggregation value type: {value.__class__.__name__}')
-        length = len(key_data) + len(value_data)
-        return (length.to_bytes(length=4, byteorder=sys.byteorder)
-                + key_data + value_data)
+                f'unsupported aggregation value type: {value.__class__.__name__}'
+            )
+        return (len(value_data).to_bytes(length=4, byteorder=sys.byteorder)
+                + value_data)
 
     @staticmethod
     def _decode(data: bytes) -> tuple:
-        length = int.from_bytes(data[:4], byteorder=sys.byteorder)
-        assert length == len(data[4:]), f"{length} != {len(data[4:])}"
-        buf = io.BytesIO(data[4:])
-        key = pickle.load(buf)
-        value_data = buf.read()
+        key_length = int.from_bytes(data[:4], byteorder=sys.byteorder)
+        assert key_length <= len(data) - 4, f"{key_length} > {len(data[4:])}"
+
+        key = pickle.loads(data[4:])  # ignores trailing
+        value_length = int.from_bytes(data[4 + key_length:][:4], byteorder=sys.byteorder)
+        assert 4 + key_length + 4 + value_length == len(data), \
+            f"4 + {key_length} + 4 + {value_length} != {len(data)}"
+
+        value = PMTMap._decode_value(data)
+        return key, value
+
+    @staticmethod
+    def _decode_value(data: bytes) -> Union[int, float, Quantization]:
+        key_length = int.from_bytes(data[:4], byteorder=sys.byteorder)
+        value_data = data[8 + key_length:]
         if (prefix := value_data[:1]) in (b'qQd'):
             (value,) = struct.unpack('=' + prefix.decode(), value_data[1:])
         elif prefix == b'Y':
@@ -673,14 +691,16 @@ class PMTMap(abc.MutableMapping):
             value.buckets.frombytes(value_data[1:])
         else:
             raise ValueError(f'bad aggregation value with prefix {prefix}')
-        return key, value
+        return value
 
-    def _setitem(self, key, value):
-        data = self._encode(key, value)
+    def _setitem(self, key, value, old_data):
         if key in self.index:
             offset, size = self.index[key]
+            new_value_data = self._encode_value(value)
+            data = old_data[:-len(new_value_data)] + new_value_data
             self.buffer.update(data, offset, size)
         else:
+            data = self._encode(key, value)
             offset, size = self.buffer.write(data)
             self.index[key] = (offset, size)
 
@@ -688,15 +708,15 @@ class PMTMap(abc.MutableMapping):
         with self.buffer:
             if self.epoch != self.buffer.epoch:
                 self._reset_index()
-            current = self._getitem(key, None)
+            current, old_data = self._getitem(key, None)
             if isinstance(value, aggregation.Base):
                 new = value.aggregate(current)
-                self._setitem(key, new)
+                self._setitem(key, new, old_data)
                 if self.agg_op == 0:
                     self.buffer.agg_op = value.op
                     self.agg_op = value.op
             elif isinstance(value, (int, float, Quantization)):
-                self._setitem(key, value)
+                self._setitem(key, value, old_data)
             else:
                 raise EvaluationError(
                     f'unsupported value type: {value.__class__.__name__}, '

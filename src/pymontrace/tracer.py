@@ -509,16 +509,28 @@ def read_records(agg_buffer: AggBuffer, epoch: Union[int, None] = None):
     f = io.BytesIO(agg_buffer.readall(epoch))
 
     while True:
-        length_bytes = f.read(4)
-        if len(length_bytes) < 4:
+        key_len_bytes = f.read(4)
+        if len(key_len_bytes) < 4:
             break
-        length = int.from_bytes(length_bytes, sys.byteorder)
+        length = int.from_bytes(key_len_bytes, sys.byteorder)
         if length == 0:
             break
-        data_bytes = f.read(length)
-        if len(data_bytes) < length:
+        key_bytes = f.read(length)
+        if len(key_bytes) < length:
             break
-        yield length_bytes + data_bytes
+
+        value_len_bytes = f.read(4)
+
+        if len(value_len_bytes) < 4:
+            break
+        value_len = int.from_bytes(value_len_bytes, sys.byteorder)
+        if value_len == 0:
+            break
+        value_bytes = f.read(value_len)
+        if len(value_bytes) < value_len:
+            break
+
+        yield key_len_bytes + key_bytes + value_len_bytes + value_bytes
 
 
 def accumulate_buffer(buffer: AggBuffer, epoch: int, ts: TraceState):

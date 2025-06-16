@@ -47,6 +47,7 @@ In priority order:
       (though to get maps after signal its better to just have persisted that
        assuming the file continue to exist)
 - [ ] Interval probes (probably using setitimer)
+- [ ] https://docs.python.org/3.14/howto/remote_debugging.html#remote-debugging
 - [ ] Support FreeBSD + jails , Illumos + zones, ...
 - [ ] musl support on Linux ...
 - [ ] Rewrite the C code in Rust?

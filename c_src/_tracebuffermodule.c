@@ -331,8 +331,7 @@ TraceBuffer_read(PyObject *op, PyObject *args)
             void* resized = PyMem_Realloc(out_buf, length);
             if (resized == NULL) {
                 PyMem_Free(out_buf);
-                PyErr_SetNone(PyExc_MemoryError);
-                return NULL;
+                return PyErr_NoMemory();
             }
             out_buf = resized;
 
