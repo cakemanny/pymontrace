@@ -1,10 +1,14 @@
 import os
+import pickle
 import threading
 from typing import Union
 
 from pymontrace import _tracebuffer
 
-__all__ = ['create']
+__all__ = [
+    'create', 'create_agg_buffer', 'open_agg_buffer', 'encode_entry',
+    'encode_value',
+]
 
 
 PAGESIZE = os.sysconf("SC_PAGE_SIZE")
@@ -116,3 +120,13 @@ def open_agg_buffer(filename: str, size=DEFAULT_BUFFER_SIZE) -> AggBuffer:
         f.truncate(size)
         ab = _tracebuffer.open_agg_buffer(f.fileno())
     return AggBuffer(ab, filename)
+
+
+def encode_entry(key, value, Quantization) -> bytes:
+    key_data = pickle.dumps(key)
+    return _tracebuffer.encode_entry(key_data, value, Quantization)
+
+
+# We skip the wrapper function as it adds about 40ns overhead and this is used
+# in the hot path.
+encode_value = _tracebuffer.encode_value

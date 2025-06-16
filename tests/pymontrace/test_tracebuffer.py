@@ -47,3 +47,70 @@ def test_agg_buffer(tmp_path: Path):
         buffer.agg_op = -1
     with pytest.raises(ValueError):
         buffer.agg_op = 6
+
+
+def test_encode_entry():
+    from pymontrace.tracee import PMTMap, Quantization
+    from pymontrace import tracebuffer
+
+    expected = (b'\x14\x00\x00\x00'
+                b'\x80\x04\x95\t\x00\x00\x00\x00\x00\x00\x00\x8c\x05hello\x94.'
+                b'\t\x00\x00\x00Q\x01\x00\x00\x00\x00\x00\x00\x00')
+
+    assert PMTMap._encode('hello', 1) == expected
+    assert tracebuffer.encode_entry('hello', 1, Quantization) == expected
+
+
+def test_encode_value():
+    from pymontrace.tracee import PMTMap, Quantization
+    from pymontrace import tracebuffer
+
+    expected = (b'\t\x00\x00\x00Q\x01\x00\x00\x00\x00\x00\x00\x00')
+
+    assert PMTMap._encode_value(1) == expected
+    assert tracebuffer.encode_value(1, Quantization) == expected
+
+
+@pytest.mark.skip(reason="enable to test perf")
+def test_encode_perf():
+    import time
+
+    from pymontrace.tracee import PMTMap, Quantization
+    from pymontrace import tracebuffer
+
+    start = time.monotonic_ns()
+    for _ in range(1_000_000):
+        tracebuffer.encode_entry('a', 10, Quantization)
+    end = time.monotonic_ns()
+    avg_op_micros = (end - start) / 1_000_000_000
+    # 0.29047µs
+    print(f"avg max: {avg_op_micros:.5}µs")
+
+    start = time.monotonic_ns()
+    for _ in range(1_000_000):
+        PMTMap._encode('a', 10)
+    end = time.monotonic_ns()
+    avg_op_micros = (end - start) / 1_000_000_000
+
+    # 0.40991µs as committed before
+    print(f"avg max: {avg_op_micros:.5}µs")
+
+    # encode_value
+
+    start = time.monotonic_ns()
+    for _ in range(1_000_000):
+        tracebuffer.encode_value(10, Quantization)
+    end = time.monotonic_ns()
+    avg_op_micros = (end - start) / 1_000_000_000
+    # 0.29047µs
+    print(f"avg max: {avg_op_micros:.5}µs")
+
+    start = time.monotonic_ns()
+    for _ in range(1_000_000):
+        PMTMap._encode_value(10)
+    end = time.monotonic_ns()
+    avg_op_micros = (end - start) / 1_000_000_000
+
+    # 0.40991µs as committed before
+    print(f"avg max: {avg_op_micros:.5}µs")
+    assert False

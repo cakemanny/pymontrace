@@ -641,7 +641,7 @@ class PMTMap(abc.MutableMapping):
         # so we cannot use it for the value, which changes
         key_data = pickle.dumps(key)
 
-        return (len(key_data).to_bytes(length=4, byteorder=sys.byteorder)
+        return (len(key_data).to_bytes(4, sys.byteorder)
                 + key_data
                 + PMTMap._encode_value(value))
 
@@ -663,7 +663,7 @@ class PMTMap(abc.MutableMapping):
             raise TypeError(
                 f'unsupported aggregation value type: {value.__class__.__name__}'
             )
-        return (len(value_data).to_bytes(length=4, byteorder=sys.byteorder)
+        return (len(value_data).to_bytes(4, sys.byteorder)
                 + value_data)
 
     @staticmethod
@@ -672,7 +672,7 @@ class PMTMap(abc.MutableMapping):
         assert key_length <= len(data) - 4, f"{key_length} > {len(data[4:])}"
 
         key = pickle.loads(data[4:])  # ignores trailing
-        value_length = int.from_bytes(data[4 + key_length:][:4], byteorder=sys.byteorder)
+        value_length = int.from_bytes(data[4 + key_length:][:4], sys.byteorder)
         assert 4 + key_length + 4 + value_length == len(data), \
             f"4 + {key_length} + 4 + {value_length} != {len(data)}"
 
@@ -681,7 +681,7 @@ class PMTMap(abc.MutableMapping):
 
     @staticmethod
     def _decode_value(data: bytes) -> Union[int, float, Quantization]:
-        key_length = int.from_bytes(data[:4], byteorder=sys.byteorder)
+        key_length = int.from_bytes(data[:4], sys.byteorder)
         value_data = data[8 + key_length:]
         if (prefix := value_data[:1]) in (b'qQd'):
             (value,) = struct.unpack('=' + prefix.decode(), value_data[1:])
@@ -696,11 +696,11 @@ class PMTMap(abc.MutableMapping):
     def _setitem(self, key, value, old_data):
         if key in self.index:
             offset, size = self.index[key]
-            new_value_data = self._encode_value(value)
+            new_value_data = tracebuffer.encode_value(value, Quantization)
             data = old_data[:-len(new_value_data)] + new_value_data
             self.buffer.update(data, offset, size)
         else:
-            data = self._encode(key, value)
+            data = tracebuffer.encode_entry(key, value, Quantization)
             offset, size = self.buffer.write(data)
             self.index[key] = (offset, size)
 

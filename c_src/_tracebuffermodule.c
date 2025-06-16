@@ -1003,6 +1003,147 @@ tracebuffer_open_aggbuffer(PyObject *module, PyObject *args)
     return (PyObject *)rv;
 }
 
+static void*
+encode_value(Py_ssize_t *total_size, PyObject* value,
+        PyObject* Quantization_Type)
+{
+    char *result = NULL;
+
+    const size_t value_len_offset = *total_size;
+#define SET_VALUE_LEN(_len) \
+        *((uint32_t*)((char*)result + value_len_offset)) = (_len)
+    const size_t value_offset = value_len_offset + sizeof(uint32_t);
+#define SET_VALUE_PREFIX(code) \
+        *((char*)result + value_offset) = (code)
+#define SET_VALUE(_type, _value) \
+        *((_type*)((char*)result + value_offset + 1)) = (_value)
+
+    if (PyLong_Check(value)) {
+        static_assert(sizeof(long) == sizeof(int64_t), "long not 64bit");
+        long long_value = PyLong_AsLong(value);
+        size_t value_len = 1 + sizeof(int64_t);
+        *total_size += sizeof(uint32_t) + value_len;
+        if ((result = PyMem_Malloc(*total_size)) == NULL) {
+            return PyErr_NoMemory();
+        }
+        SET_VALUE_LEN(value_len);
+        if (long_value < 0) {
+            SET_VALUE_PREFIX('q');
+        } else {
+            SET_VALUE_PREFIX('Q');
+        }
+        SET_VALUE(int64_t, long_value);
+    } else if (PyFloat_Check(value)) {
+        double double_value = PyFloat_AsDouble(value);
+        size_t value_len = 1 + sizeof(double);
+        *total_size += sizeof(uint32_t) + value_len;
+        if ((result = PyMem_Malloc(*total_size)) == NULL) {
+            return PyErr_NoMemory();
+        }
+        SET_VALUE_LEN(value_len);
+        SET_VALUE_PREFIX('d');
+        SET_VALUE(double, double_value);
+    } else if (PyObject_IsInstance(value, Quantization_Type)) {
+        size_t value_len = 1 + (128 * sizeof(uint64_t));
+        *total_size += sizeof(uint32_t) + value_len;
+        if ((result = PyMem_Malloc(*total_size)) == NULL) {
+            return PyErr_NoMemory();
+        }
+        SET_VALUE_LEN(value_len);
+        SET_VALUE_PREFIX('Y');
+
+        PyObject* buckets = PyObject_GetAttrString(value, "buckets");
+        if (buckets == NULL) {
+            return NULL;
+        }
+        PyObject* buffer_info = PyObject_CallMethod(buckets, "buffer_info", NULL);
+        if (buffer_info == NULL) {
+            return NULL;
+        }
+        unsigned long long address;
+        int nitems;
+        if (!PyArg_ParseTuple(buffer_info, "Ki", &address, &nitems)) {
+            return NULL;
+        }
+        if (nitems != 128) {
+            PyErr_SetString(PyExc_ValueError, "buckets doesn't have 128 elems");
+            return NULL;
+        }
+        assert(address != 0);
+        memcpy(result + value_offset + 1, (void*)address, 128 * sizeof(uint64_t));
+    } else {
+        PyErr_SetString(PyExc_TypeError,
+                "unsupported aggregation value type");
+        return NULL;
+    }
+#undef SET_VALUE_PREFIX
+
+    return result;
+}
+
+static PyObject *
+tracebuffer_encode_entry(PyObject *module, PyObject *args)
+{
+    const char* key_data;
+    Py_ssize_t key_len;
+    PyObject *value;
+    PyObject *Quantization_Type;
+
+    if (!PyArg_ParseTuple(args, "y#OO:encode_entry", &key_data, &key_len,
+                &value, &Quantization_Type)) {
+        return NULL;
+    }
+    if (!PyType_Check(Quantization_Type)) {
+        PyErr_SetString(PyExc_ValueError,
+                "third param must be the Quantization type");
+        return NULL;
+    }
+
+    Py_ssize_t total_size = sizeof(uint32_t) + key_len;
+
+    char* result = encode_value(&total_size, value, Quantization_Type);
+    if (result == NULL) {
+        return NULL;
+    }
+
+    // Set the size field and key data at the end once the result buffer
+    // has been allocated.
+    ((uint32_t*)result)[0] = key_len;
+    memcpy(result + sizeof(uint32_t), key_data, key_len);
+
+    PyObject* rv = Py_BuildValue("y#", result, total_size);
+    PyMem_Free(result);
+    return rv;
+}
+
+
+static PyObject *
+tracebuffer_encode_value(PyObject *module, PyObject *args)
+{
+    PyObject *value;
+    PyObject *Quantization_Type;
+
+    if (!PyArg_ParseTuple(args, "OO:encode_value", &value,
+                &Quantization_Type)) {
+        return NULL;
+    }
+    if (!PyType_Check(Quantization_Type)) {
+        PyErr_SetString(PyExc_ValueError,
+                "second param must be the Quantization type");
+        return NULL;
+    }
+
+    Py_ssize_t total_size = 0;
+    char* result = encode_value(&total_size, value, Quantization_Type);
+    if (result == NULL) {
+        return NULL;
+    }
+
+    PyObject* rv = Py_BuildValue("y#", result, total_size);
+    PyMem_Free(result);
+    return rv;
+}
+
 
 PyDoc_STRVAR(create__doc__, "\
 create(file_descriptor: int)");
@@ -1014,6 +1155,10 @@ static PyMethodDef tracebuffer_methods[] = {
      PyDoc_STR("create_agg_buffer(fd: int, name: bytes) -> AggBuffer")},
     {"open_agg_buffer", tracebuffer_open_aggbuffer, METH_VARARGS,
      PyDoc_STR("open_agg_buffer(fd: int) -> AggBuffer")},
+    {"encode_entry", tracebuffer_encode_entry, METH_VARARGS,
+     PyDoc_STR("encode_entry(key_data: bytes, value, Quantization) -> bytes")},
+    {"encode_value", tracebuffer_encode_value, METH_VARARGS,
+     PyDoc_STR("encode_value(value, Quantization) -> bytes")},
     {NULL, NULL, 0, NULL}        /* Sentinel */
 };
 
