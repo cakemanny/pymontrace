@@ -60,15 +60,117 @@ def test_encode_entry():
     assert PMTMap._encode('hello', 1) == expected
     assert tracebuffer.encode_entry('hello', 1, Quantization) == expected
 
+    expected = PMTMap._encode('some key', 3.4)
+    assert tracebuffer.encode_entry('some key', 3.4, Quantization) == expected
+
 
 def test_encode_value():
     from pymontrace.tracee import PMTMap, Quantization
     from pymontrace import tracebuffer
 
-    expected = (b'\t\x00\x00\x00Q\x01\x00\x00\x00\x00\x00\x00\x00')
+    expected = b'\t\x00\x00\x00Q\x01\x00\x00\x00\x00\x00\x00\x00'
 
     assert PMTMap._encode_value(1) == expected
     assert tracebuffer.encode_value(1, Quantization) == expected
+
+    expected = PMTMap._encode_value(-7)
+    assert tracebuffer.encode_value(-7, Quantization) == expected
+
+    expected = PMTMap._encode_value(3.4)
+    assert tracebuffer.encode_value(3.4, Quantization) == expected
+
+    q = Quantization()
+    q.add(1)
+    q.add(7)
+    q.add(12398)
+    expected = PMTMap._encode_value(q)
+    assert tracebuffer.encode_value(q, Quantization) == expected
+
+
+def test_encode_value__refleaks():
+    import sys
+
+    from pymontrace.tracee import Quantization
+    from pymontrace import tracebuffer
+
+    if not hasattr(sys, 'gettotalrefcount'):
+        pytest.skip("needs debug python build")
+
+    q = Quantization()
+    q.add(1)
+    q.add(7)
+    q.add(12398)
+
+    for _ in range(10):
+        # warm up
+        tracebuffer.encode_value(q, Quantization)
+
+    before = sys.gettotalrefcount()
+    for _ in range(n := 1000):
+        tracebuffer.encode_value(q, Quantization)
+    after = sys.gettotalrefcount()
+    print((after - before) / n)
+    assert after - before < 200
+
+
+def test_decode_value():
+    from pymontrace.tracee import PMTMap, Quantization
+    from pymontrace import tracebuffer
+
+    data = (b'\x14\x00\x00\x00'
+            b'\x80\x04\x95\t\x00\x00\x00\x00\x00\x00\x00\x8c\x05hello\x94.'
+            b'\t\x00\x00\x00Q\x01\x00\x00\x00\x00\x00\x00\x00')
+
+    assert PMTMap._decode_value(data) == 1
+    assert tracebuffer.decode_value(data, Quantization) == 1
+
+    data = PMTMap._encode('some key', -7)
+    assert tracebuffer.decode_value(data, Quantization) == -7
+
+    q = Quantization()
+    q.add(1)
+    q.add(7)
+    q.add(12398)
+    data = PMTMap._encode('some key', q)
+    # action
+    decoded = tracebuffer.decode_value(data, Quantization)
+    assert isinstance(decoded, Quantization)
+    assert decoded.buckets == q.buckets
+
+
+def test_decode_value__refleaks():
+    import sys
+
+    from pymontrace.tracee import Quantization
+    from pymontrace import tracebuffer
+
+    if not hasattr(sys, 'gettotalrefcount'):
+        pytest.skip("needs debug python build")
+
+    q = Quantization()
+    q.add(1)
+    q.add(7)
+    q.add(12398)
+    data = tracebuffer.encode_entry('some key', q, Quantization)
+
+    # warm up
+    for _ in range(10):
+        tracebuffer.decode_value(data, Quantization)
+
+    before = sys.gettotalrefcount()
+    for _ in range(n := 1000):
+        tracebuffer.decode_value(data, Quantization)
+    after = sys.gettotalrefcount()
+    print((after - before) / n)
+    assert after - before < 200
+
+
+def test_decode_value__double():
+    from pymontrace.tracee import Quantization
+    from pymontrace import tracebuffer
+
+    data = tracebuffer.encode_entry('some key', 3.4, Quantization)
+    assert tracebuffer.decode_value(data, Quantization) == 3.4
 
 
 @pytest.mark.skip(reason="enable to test perf")

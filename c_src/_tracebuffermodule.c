@@ -1052,25 +1052,36 @@ encode_value(Py_ssize_t *total_size, PyObject* value,
         SET_VALUE_LEN(value_len);
         SET_VALUE_PREFIX('Y');
 
-        PyObject* buckets = PyObject_GetAttrString(value, "buckets");
+        PyObject *buckets = NULL, *buffer_info = NULL;
+
+        buckets = PyObject_GetAttrString(value, "buckets");
         if (buckets == NULL) {
-            return NULL;
+            goto error;
         }
-        PyObject* buffer_info = PyObject_CallMethod(buckets, "buffer_info", NULL);
+        buffer_info = PyObject_CallMethod(buckets, "buffer_info", NULL);
         if (buffer_info == NULL) {
-            return NULL;
+            goto error;
         }
         unsigned long long address;
         int nitems;
         if (!PyArg_ParseTuple(buffer_info, "Ki", &address, &nitems)) {
-            return NULL;
+            goto error;
         }
         if (nitems != 128) {
             PyErr_SetString(PyExc_ValueError, "buckets doesn't have 128 elems");
-            return NULL;
+            goto error;
         }
         assert(address != 0);
         memcpy(result + value_offset + 1, (void*)address, 128 * sizeof(uint64_t));
+        goto out;
+error:
+        PyMem_Free(result);
+        result = NULL;
+out:
+        if (buckets != NULL)
+            Py_DECREF(buckets);
+        if (buffer_info != NULL)
+            Py_DECREF(buffer_info);
     } else {
         PyErr_SetString(PyExc_TypeError,
                 "unsupported aggregation value type");
@@ -1145,6 +1156,109 @@ tracebuffer_encode_value(PyObject *module, PyObject *args)
 }
 
 
+static PyObject *
+tracebuffer_decode_value(PyObject *module, PyObject *args)
+{
+    char *data;
+    Py_ssize_t data_len;
+    PyObject *Quantization_Type;
+
+    if (!PyArg_ParseTuple(args, "y#O:decode_value", &data, &data_len,
+                &Quantization_Type)) {
+        return NULL;
+    }
+    if (!PyType_Check(Quantization_Type)) {
+        PyErr_SetString(PyExc_ValueError,
+                "second param must be the Quantization type");
+        return NULL;
+    }
+
+    // decode_value takes a whole entry encoding, so first we skip
+    // over the key
+
+    if ((size_t)data_len < 2 * sizeof(uint32_t)) {
+        PyErr_SetString(PyExc_ValueError, "data too short");
+        return NULL;
+    }
+    uint32_t key_len = ((uint32_t*)data)[0];
+    if (key_len == 0 || key_len > (data_len - (2 * sizeof(uint32_t)))) {
+        PyErr_SetString(PyExc_ValueError, "bad key length");
+        return NULL;
+    }
+    uint32_t value_len = ((uint32_t*)(data + sizeof(uint32_t) + key_len))[0];
+    if (value_len != data_len - (key_len + (2 * sizeof(uint32_t)))) {
+        PyErr_SetString(PyExc_ValueError, "bad value length");
+        return NULL;
+    }
+    void* value_data = data + key_len + (2 * sizeof(uint32_t));
+
+    switch (((char *)value_data)[0]) {
+    case 'q': {
+            long long value = *((long long *)(value_data + 1));
+            return PyLong_FromLongLong(value);
+        }
+    case 'Q': {
+            unsigned long long value = *((unsigned long long *)(value_data + 1));
+            return PyLong_FromUnsignedLongLong(value);
+        }
+    case 'd': {
+            double value = *((double*)(value_data + 1));
+            return PyFloat_FromDouble(value);
+        }
+    case 'Y': {
+            PyObject *arraymodule = NULL, *arrayctor = NULL, *buckets = NULL,
+                     *frombytes_rv = NULL, *value = NULL;
+
+            arraymodule = PyImport_ImportModule("array");
+            if (arraymodule == NULL) {
+                goto error;
+            }
+            arrayctor = PyObject_GetAttrString(arraymodule, "array");
+            if (arrayctor == NULL) {
+                goto error;
+            }
+            buckets = PyObject_CallFunction(arrayctor, "s", "Q");
+            if (buckets == NULL) {
+                goto error;
+            }
+            frombytes_rv = PyObject_CallMethod(buckets, "frombytes", "y#",
+                    value_data + 1, value_len - 1);
+            if (frombytes_rv == NULL) {
+                goto error;
+            }
+
+            value = PyType_GenericNew((PyTypeObject*)Quantization_Type, NULL, NULL);
+            if (value == NULL) {
+                goto error;
+            }
+            if (PyObject_SetAttrString(value, "buckets", buckets) == -1) {
+                goto error;
+            }
+            goto out;
+error:
+            if (value != NULL)
+                Py_DECREF(value);
+            value = NULL;
+out:
+            if (arraymodule != NULL)
+                Py_DECREF(arraymodule);
+            if (arrayctor != NULL)
+                Py_DECREF(arrayctor);
+            if (buckets != NULL)
+                Py_DECREF(buckets);
+            if (frombytes_rv != NULL)
+                Py_DECREF(frombytes_rv);
+            return value;
+        }
+    default:
+        PyErr_Format(PyExc_ValueError,
+                "bad aggregation value with prefix 0x%x",
+                (unsigned)((char *)value_data)[0]);
+        return NULL;
+    }
+}
+
+
 PyDoc_STRVAR(create__doc__, "\
 create(file_descriptor: int)");
 
@@ -1159,6 +1273,8 @@ static PyMethodDef tracebuffer_methods[] = {
      PyDoc_STR("encode_entry(key_data: bytes, value, Quantization) -> bytes")},
     {"encode_value", tracebuffer_encode_value, METH_VARARGS,
      PyDoc_STR("encode_value(value, Quantization) -> bytes")},
+    {"decode_value", tracebuffer_decode_value, METH_VARARGS,
+     PyDoc_STR("decode_value(data, Quantization) -> int | float | Quantization")},
     {NULL, NULL, 0, NULL}        /* Sentinel */
 };
 

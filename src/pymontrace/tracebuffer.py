@@ -7,7 +7,7 @@ from pymontrace import _tracebuffer
 
 __all__ = [
     'create', 'create_agg_buffer', 'open_agg_buffer', 'encode_entry',
-    'encode_value',
+    'encode_value', 'decode_value'
 ]
 
 
@@ -130,3 +130,5 @@ def encode_entry(key, value, Quantization) -> bytes:
 # We skip the wrapper function as it adds about 40ns overhead and this is used
 # in the hot path.
 encode_value = _tracebuffer.encode_value
+
+decode_value = _tracebuffer.decode_value

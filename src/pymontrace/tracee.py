@@ -632,7 +632,7 @@ class PMTMap(abc.MutableMapping):
                 return default, None
             raise
         data = self.buffer.read(offset, size)
-        value = self._decode_value(data)
+        value = tracebuffer.decode_value(data, Quantization)
         return value, data
 
     @staticmethod
@@ -676,7 +676,7 @@ class PMTMap(abc.MutableMapping):
         assert 4 + key_length + 4 + value_length == len(data), \
             f"4 + {key_length} + 4 + {value_length} != {len(data)}"
 
-        value = PMTMap._decode_value(data)
+        value = tracebuffer.decode_value(data, Quantization)
         return key, value
 
     @staticmethod

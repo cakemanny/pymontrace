@@ -262,6 +262,7 @@ def test_agg_perf(connected_remote):
     # 2.7347µs after rewriting AggBuffer in C
     # 2.2626µs : encoding key and value separately and only updating the value
     # 2.0518µs : and then rewriting _encode_value in C
+    # 1.6945µs -> 1.1879µs (rewriting decode_value in C)
     print(f"avg max: {avg_op_micros:.5}µs")
     assert False
 

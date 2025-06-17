@@ -6,7 +6,8 @@ PIP ?= uv pip
 dev-setup:
 	test -n "$$VIRTUAL_ENV"
 	type uv || "$$VIRTUAL_ENV"/bin/pip install uv
-	$(PIP) install -e '.[dev,test]' setuptools
+	$(PIP) install -e '.[dev,test]'
+	$(PIP) install -U setuptools
 
 
 .PHONY: lint
