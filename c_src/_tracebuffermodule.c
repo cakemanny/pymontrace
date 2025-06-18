@@ -213,14 +213,19 @@ TraceBuffer_write(PyObject *op, PyObject *args)
     if (data_len == 0) {
         Py_RETURN_NONE;
     }
-    if (data_len > MAX_WRITE) {
-        // If we change this max write, then it must be based on the smallest
-        // of the two buffer sizes.
-        PyErr_SetString(PyExc_ValueError, "too large: max size 1024");
-        return NULL;
-    }
 
     struct mapping_header* hdr = self->data;
+    {
+        __auto_type buf0 = &hdr->bufs[0];
+        __auto_type buf0_size = buf0->limit - buf0->start;
+        if (data_len > buf0_size) {
+            PyErr_Format(PyExc_ValueError,
+                "too large: max size %"PRIu64"", buf0_size);
+
+            return NULL;
+        }
+    }
+
     unsigned long ctr = atomic_load_explicit(&hdr->counter, memory_order_acquire);
 
     if (ctr & 1) {

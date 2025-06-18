@@ -35,17 +35,21 @@ In priority order:
 - [ ] Trace many targets at once. Main need: trace forking servers.
 
 - [ ] Firm up the language / interface.
-      - [o] Create buffer spaces to support aggregations?
-        (we have in-target buffers but not out of process buffers)
+      - [x] Create buffer spaces to support aggregations?
       - [x] multiple probes
       - [ ] per-thread/per-context storage to store some amount of data.
 - [x] func probes (entry, exit, exception, yield, unwind, resume, ...)
 
-- [o] our own signal handlers, to be able to sneak out maps as the program
+- [x] our own signal handlers, to be able to sneak out maps as the program
       is about to end...?
-      (We have added an atexit handler - that's half of it)
-      (though to get maps after signal its better to just have persisted that
-       assuming the file continue to exist)
+      (we preshare the maps and store them out of process)
+- [ ] change the trace buffers so the tracer controls the buffer switch
+      (and reuse the aggregation buffer implementation)
+- [ ] change the communication socket to use dgram and simply send/receive
+      code
+      - no more need for locking
+      - change send to be non-blocking?
+
 - [ ] Interval probes (probably using setitimer)
 - [ ] https://docs.python.org/3.14/howto/remote_debugging.html#remote-debugging
 - [ ] Support FreeBSD + jails , Illumos + zones, ...
