@@ -15,12 +15,13 @@ import textwrap
 import threading
 import traceback
 from contextlib import contextmanager
+from dataclasses import dataclass
 from tempfile import TemporaryDirectory
 from typing import NoReturn, Union
 
 from pymontrace import _darwin, attacher, tracebuffer
 from pymontrace.tracebuffer import AggBuffer, TraceBuffer
-from pymontrace.tracee import PROBES_BY_NAME
+from pymontrace.tracee import PROBES_BY_NAME, Quantization
 
 
 # Replace with typing.assert_never after 3.11
@@ -498,9 +499,7 @@ def accumulate_func(agg_op: int):
     elif agg_op == AggOp.MIN:
         return min
     elif agg_op == AggOp.QUANTIZE:
-        def accumulate_quantize(v1, v2):
-            pass
-        return accumulate_quantize
+        return operator.add
     raise ValueError(f'invalid agg_op: {agg_op}')
 
 
@@ -664,6 +663,66 @@ def print_map(name, mapp, out=sys.stdout):
         vwidth = max(vwidth, len(str(v)))
     for k, v in sorted(mapp.items(), key=lambda kv: kv[1]):
         if isinstance(k, (int, str)):
-            print(f"  {k:{kwidth}}: {v:{vwidth}}", file=out)
+            key_part = f"  {k:{kwidth}}:"
         else:
-            print(f"  {k!s:{kwidth}}: {v:{vwidth}}", file=out)
+            key_part = f"  {k!s:{kwidth}}:"
+        if isinstance(v, Quantization):
+            value_part = f"\n{v}"
+        else:
+            value_part = f" {v:{vwidth}}"
+        print(f"{key_part}{value_part}", file=out)
+
+
+@dataclass
+class QuantizationRow:
+    value: int
+    distribution: float
+    count: int
+
+
+def format_quantization(self: Quantization):
+    q = self
+    # We shamelessly attempt to mimic dtrace here
+    total_count = sum([count for count in q.buckets])
+    if total_count == 0:
+        raise ValueError('empty quantization')
+
+    first_to_print = min(
+        (bucket - 1) for bucket, count in enumerate(q.buckets)
+        if count > 0
+    )
+    first_to_print = max(first_to_print, 0)
+
+    last_to_print = max(
+        (bucket + 1) for bucket, count in enumerate(q.buckets)
+        if count > 0
+    )
+    last_to_print = min(last_to_print, len(q.buckets) - 1)
+
+    rows: list[QuantizationRow] = []
+    for bucket, count in enumerate(q.buckets):
+        if first_to_print <= bucket <= last_to_print:
+            rows.append(
+                QuantizationRow(
+                    value=q.idx_value(bucket),  # todo,
+                    distribution=(count / total_count),
+                    count=count,
+                )
+            )
+
+    lines = [
+        "               value  ------------- Distribution ------------- count"
+    ]
+    for row in rows:
+        parts = []
+        parts.append(f"{row.value:20} |")
+        parts.append('@' * round(row.distribution * 40))
+        parts.append(' ' * round((1 - row.distribution) * 40))
+        parts.append(f" {row.count}")
+        lines.append("".join(parts))
+    return "\n".join(lines)
+
+
+# We adapt the Quantization here to avoid adding too much tracer related
+# code into the tracee
+Quantization.__str__ = format_quantization

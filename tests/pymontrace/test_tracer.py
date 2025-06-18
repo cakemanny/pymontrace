@@ -157,3 +157,28 @@ def test_get_proc_euid():
     assert get_proc_euid(os.getpid()) == os.geteuid()
     # This is probably not always true. e.g. in many linux containers
     assert get_proc_euid(1) == 0
+
+
+def test_print_quantization():
+
+    from pymontrace.tracee import Quantization
+    from pymontrace.tracer import format_quantization
+
+    q = Quantization()
+    q.add(0)
+
+    assert format_quantization(q) == """\
+               value  ------------- Distribution ------------- count
+                  -1 |                                         0
+                   0 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ 1
+                   1 |                                         0"""
+
+    q.add(3)
+    q.add(3)
+    assert format_quantization(q) == """\
+               value  ------------- Distribution ------------- count
+                  -1 |                                         0
+                   0 |@@@@@@@@@@@@@                            1
+                   1 |                                         0
+                   2 |@@@@@@@@@@@@@@@@@@@@@@@@@@@              2
+                   4 |                                         0"""

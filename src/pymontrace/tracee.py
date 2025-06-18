@@ -19,7 +19,6 @@ import threading
 import time
 import traceback
 from collections import abc, namedtuple
-from dataclasses import dataclass
 from types import CodeType, FrameType, SimpleNamespace
 from typing import Any, Callable, Literal, NoReturn, Optional, Sequence, Union
 
@@ -539,11 +538,6 @@ class Quantization:
 
     zero_idx = 64
 
-    @dataclass
-    class Bucket:
-        value: int
-        count: int
-
     def __init__(self) -> None:
         self.buckets = array.array('Q', [0] * 128)
 
@@ -568,21 +562,21 @@ class Quantization:
             raise ValueError('large number not yet quantizable: {value!r}')
         self.buckets[bucket_idx] += 1
 
-    @staticmethod
-    def quantize(value: int) -> int:
-        if value == 0:
-            return 0
-        if value > 0:
-            return 2 ** (value.bit_length() - 1)
-        assert value < 0
-        return -(2 ** ((-value).bit_length() - 1))
-
     @classmethod
     def bucket_idx(cls, value: int) -> int:
         if value >= 0:
             return cls.zero_idx + value.bit_length()
         else:
             return cls.zero_idx - value.bit_length()
+
+    @classmethod
+    def idx_value(cls, bucket_idx: int) -> int:
+        if bucket_idx == cls.zero_idx:
+            return 0
+        if bucket_idx < cls.zero_idx:
+            return - 2**(-(1 + bucket_idx - cls.zero_idx))
+        else:
+            return 2**(bucket_idx - 1 - cls.zero_idx)
 
 
 class VarNS(SimpleNamespace):

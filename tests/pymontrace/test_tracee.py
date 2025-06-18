@@ -270,24 +270,6 @@ def test_agg_perf(connected_remote):
 class TestQuantization:
 
     @staticmethod
-    def test_quantize():
-        from pymontrace.tracee import Quantization
-
-        assert Quantization.quantize(0) == 0
-        assert Quantization.quantize(1) == 1
-        assert Quantization.quantize(2) == 2
-        assert Quantization.quantize(3) == 2
-
-        assert [Quantization.quantize(x) for x in range(10)] == [
-            0, 1, 2, 2, 4, 4, 4, 4, 8, 8
-        ]
-
-        #                    v       v   v   v       v
-        negative = [-1, -2, -3, -4, -5, -6, -7, -8, -9]
-        expected = [-1, -2, -2, -4, -4, -4, -4, -8, -8]
-        assert [Quantization.quantize(x) for x in negative] == expected
-
-    @staticmethod
     def test_bucket_idx():
         from pymontrace.tracee import Quantization
         zero_idx = Quantization.zero_idx
@@ -306,6 +288,19 @@ class TestQuantization:
         negative = [-1, -2, -3, -4, -5, -6, -7, -8, -9]
         expected = [63, 62, 62, 61, 61, 61, 61, 60, 60]
         assert [Quantization.bucket_idx(x) for x in negative] == expected
+
+    @staticmethod
+    def test_idx_value():
+        from pymontrace.tracee import Quantization
+        zero_idx = Quantization.zero_idx
+
+        assert Quantization.idx_value(zero_idx - 3) == -4
+        assert Quantization.idx_value(zero_idx - 2) == -2
+        assert Quantization.idx_value(zero_idx - 1) == -1
+        assert Quantization.idx_value(zero_idx) == 0
+        assert Quantization.idx_value(zero_idx + 1) == 1
+        assert Quantization.idx_value(zero_idx + 2) == 2
+        assert Quantization.idx_value(zero_idx + 3) == 4
 
 
 def test_agg_quantize(connected_remote):
