@@ -32,6 +32,10 @@ def assert_never(arg: NoReturn) -> NoReturn:
     raise AssertionError(f"assert_never: got {arg!r}")
 
 
+def glob2re(glob_pattern: str):
+    return re.compile('^' + re.escape(glob_pattern).replace('\\*', '.*') + '$')
+
+
 class InvalidProbe:
     def __init__(self) -> None:
         raise IndexError('Invalid probe ID')
@@ -54,9 +58,7 @@ class LineProbe:
         self.isregex = False
         if star_count > 0 and not self.is_path_endswith:
             self.isregex = True
-            self.regex = re.compile(
-                '^' + re.escape(path).replace('\\*', '.*') + '$'
-            )
+            self.regex = glob2re(path)
 
     def matches(self, co_filename: str, line_number: int):
         if line_number != self.lineno:
@@ -80,11 +82,39 @@ class LineProbe:
             return value.path == self.path and value.lineno == self.lineno
         return False
 
+    @staticmethod
+    def listsites(path='*', lineno='*'):
+        # TODO: allow rangees for lineno
+        probe = LineProbe(path, '0')
+        for module in sys.modules.values():
+            try:
+                filepath = inspect.getfile(module)
+            except (OSError, TypeError):
+                continue
+            if not probe.matches_file(filepath):
+                continue
+            try:
+                lines, start = inspect.getsourcelines(module)
+                if start == 0:  # This might always be the case for modules
+                    start = 1
+                for i, line in enumerate(lines):
+                    line = line.removesuffix('\n')
+                    yield f'line:{filepath}:{i + start} {line}'
+            except OSError:
+                pass
+
 
 class PymontraceProbe:
     def __init__(self, _: str, hook: Literal['BEGIN', 'END']) -> None:
         self.is_begin = hook == 'BEGIN'
         self.is_end = hook == 'END'
+
+    @staticmethod
+    def listsites(_='', hook='*'):
+        pattern = glob2re(hook)
+        for h in ('BEGIN', 'END'):
+            if pattern.match(h):
+                yield f'pymontrace::{h}'
 
 
 _FUNC_PROBE_EVENT = Literal['start', 'yield', 'resume', 'return', 'unwind']
@@ -95,7 +125,7 @@ class FuncProbe:
     # Grouped by the shape of the sys.monitoring callback
     entry_sites = ('start', 'resume')
     return_sites = ('yield', 'return')
-    unwind_sites = ('unwind')
+    unwind_sites = ('unwind',)
 
     def __init__(self, qpath: str, site: _FUNC_PROBE_EVENT) -> None:
         for c in qpath:
@@ -130,9 +160,7 @@ class FuncProbe:
 
         elif star_count > 0:
             self.isregex = True
-            self.regex = re.compile(
-                '^' + re.escape(qpath).replace('\\*', '.*') + '$'
-            )
+            self.regex = glob2re(qpath)
 
     def __repr__(self):
         return f'FuncProbe(qpath={self.qpath!r}, site={self.site!r})'
@@ -191,6 +219,49 @@ class FuncProbe:
                 return True
 
         return self.qpath == qpath
+
+    @staticmethod
+    def listsites(qpath='*', site='*'):
+        funcsites = ('start', 'return', 'unwind')
+        gensites = ('yield', 'resume')
+
+        # it's a bit complicated to make fake frame objects and check matches
+        # and we don't refactor to keep the real match code fast
+
+        qp_regex = glob2re(qpath)
+        if site != '*':
+            site_regex = glob2re(site)
+            funcsites = tuple(site for site in funcsites if site_regex.match(site))
+            gensites = tuple(site for site in gensites if site_regex.match(site))
+
+        for name, module in sys.modules.items():
+            for x, xvalue in vars(module).items():
+                if inspect.isfunction(xvalue):
+                    if inspect.isfunction(xvalue):
+                        if qp_regex.match(qpath := f'{name}.{x}'):
+                            for site in funcsites:
+                                yield f"func:{qpath}:{site}"
+                    if inspect.iscoroutinefunction(xvalue) \
+                            or inspect.isgeneratorfunction(xvalue):
+                        if qp_regex.match(qpath := f'{name}.{x}'):
+                            for site in gensites:
+                                yield f"func:{qpath}:{site}"
+                elif inspect.isclass(o := xvalue):
+                    # We use dir instead of vars to see base class methods
+                    # on their subclasses too
+                    for y in dir(o):
+                        field = getattr(o, y, None)
+                        if field is None:
+                            continue
+                        if inspect.isfunction(field):
+                            if qp_regex.match(qpath := f'{name}.{x}.{y}'):
+                                for site in funcsites:
+                                    yield f"func:{qpath}:{site}"
+                        if inspect.iscoroutinefunction(field) \
+                                or inspect.isgeneratorfunction(field):
+                            if qp_regex.match(qpath := f'{name}.{x}.{y}'):
+                                for site in gensites:
+                                    yield f"func:{qpath}:{site}"
 
 
 class Frame:
@@ -793,6 +864,19 @@ class pmt:
             return f'{module_name}.{co_qualname}'
         return co_qualname
 
+    def printprobes(self, probename, *args):
+        # Used to handle the -l flag
+        # ... could use PROBES_BY_NAME and/or could glob match the probename
+        if probename == 'pymontrace':
+            for probesite in PymontraceProbe.listsites(*args):
+                pmt.print(probesite)
+        elif probename == 'func':
+            for probesite in FuncProbe.listsites(*args):
+                pmt.print(probesite)
+        elif probename == 'line':
+            for probesite in LineProbe.listsites(*args):
+                pmt.print(probesite)
+
     _end_actions: list[tuple[PymontraceProbe, CodeType, str]] = []
 
     vars = VarNS()
@@ -866,7 +950,7 @@ def safe_eval_no_frame(action: CodeType, snippet: str):
 
 
 def _handle_eval_error(
-        e: Exception, snippet: str, frame: Optional[FrameType] = None,
+    e: Exception, snippet: str, frame: Optional[FrameType] = None,
 ) -> None:
     buf = io.StringIO()
     print('Probe action failed:', file=buf)
