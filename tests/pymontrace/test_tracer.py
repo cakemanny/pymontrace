@@ -89,6 +89,35 @@ def test_validate_script():
         validate_script('invalid')
 
 
+def test_convert_probe_filter():
+    from pymontrace.tracer import convert_probe_filter
+
+    converted = convert_probe_filter('func:threading.*:end')
+
+    assert converted == \
+        "pymontrace::BEGIN {{ printprobes('func', 'threading.*', 'end'); exit() }}"
+
+
+def test_convert_probe_filter__invalid():
+    from pymontrace.tracer import convert_probe_filter
+
+    with pytest.raises(ValueError) as exc_info:
+        convert_probe_filter('fun:xx:end')
+    assert exc_info.match("Unknown probe name 'fun'")
+
+    with pytest.raises(ValueError) as exc_info:
+        convert_probe_filter('func:threading.*:end:')
+    assert exc_info.match('Too many probe parts')
+
+    with pytest.raises(ValueError) as exc_info:
+        convert_probe_filter('func:threading.*:end {{ print(ctx.a) }}')
+    assert "Unexpected '{' in probe filter" in str(exc_info.value)
+
+    with pytest.raises(ValueError) as exc_info:
+        convert_probe_filter('func:threading.*: end')
+    assert "Unexpected space in probe filter" in str(exc_info.value)
+
+
 def test_encode_script():
     from pymontrace.tracer import encode_script
 

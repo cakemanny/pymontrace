@@ -9,33 +9,53 @@ import sys
 import pymontrace.attacher
 from pymontrace import tracer
 from pymontrace.tracer import (
-    CommsFile, TraceState, create_and_bind_socket, decode_and_print_forever,
-    decode_and_print_remaining, encode_script, format_bootstrap_snippet,
-    format_untrace_snippet, to_remote_path, validate_script
+    CommsFile, TraceState, convert_probe_filter, create_and_bind_socket,
+    decode_and_print_forever, decode_and_print_remaining, encode_script,
+    format_bootstrap_snippet, format_untrace_snippet, to_remote_path,
+    validate_script
 )
 
 parser = argparse.ArgumentParser(prog='pymontrace')
-parser.add_argument(
+target_group = parser.add_argument_group('target selection')
+target_group_alts = target_group.add_mutually_exclusive_group(required=True)
+target_group_alts.add_argument(
     '-c', dest='pyprog',
     help=(
         "a python script to run and trace, including any arguments "
         "e.g. 'some_script.py \"one arg\" another'"
     ),
 )
-parser.add_argument(
+target_group_alts.add_argument(
     '-p', dest='pid', type=int,
     help='pid of a python process to attach to',
 )
 # used internally for handling -c',
-parser.add_argument(
+target_group_alts.add_argument(
     '-X', dest='subproc',
     help=argparse.SUPPRESS,
 )
-parser.add_argument(
+
+action_group = parser.add_argument_group('action')
+action_group_alts = action_group.add_mutually_exclusive_group(required=True)
+action_group_alts.add_argument(
     '-e', dest='prog_text', type=str,
     help="pymontrace program text e.g. 'line:*script.py:13 {{ print(ctx.a, ctx.b) }}'",
-    required=True,
 )
+action_group_alts.add_argument(
+    '-l', dest='probe_filter', type=str,
+    help=(
+        "list available probe sites, takes a probe spec as a filter "
+        "e.g. 'func:threading.*:start'"
+    )
+)
+# If/when we allow script files
+#
+# action_group_alts.add_argument(
+#     'script',
+#     type=argparse.FileType('r'),
+#     nargs='?',
+#     help='a pymontrace script file'
+# )
 
 
 def force_unlink(path):
@@ -180,6 +200,12 @@ def tracesubprocess(progpath: str, prog_text):
 
 def cli_main():
     args = parser.parse_args()
+
+    if args.probe_filter:
+        try:
+            args.prog_text = convert_probe_filter(args.probe_filter)
+        except Exception as e:
+            parser.error(str(e))
 
     try:
         validate_script(args.prog_text)

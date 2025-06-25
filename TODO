@@ -49,6 +49,7 @@ In priority order:
       code
       - no more need for locking
       - change send to be non-blocking?
+- [ ] line ranges for the line probe
 
 - [ ] Interval probes (probably using setitimer)
 - [ ] https://docs.python.org/3.14/howto/remote_debugging.html#remote-debugging

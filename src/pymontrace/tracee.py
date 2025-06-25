@@ -43,6 +43,8 @@ class InvalidProbe:
 
 class LineProbe:
     def __init__(self, path: str, lineno: str) -> None:
+        if path == '':
+            path = '*'
         self.path = path
         self.lineno = int(lineno)
 
@@ -84,6 +86,10 @@ class LineProbe:
 
     @staticmethod
     def listsites(path='*', lineno='*'):
+        if path == '':
+            path = '*'
+        if lineno == '':
+            lineno = '*'
         # TODO: allow rangees for lineno
         probe = LineProbe(path, '0')
         for module in sys.modules.values():
@@ -99,7 +105,9 @@ class LineProbe:
                     start = 1
                 for i, line in enumerate(lines):
                     line = line.removesuffix('\n')
-                    yield f'line:{filepath}:{i + start} {line}'
+                    this_lineno = i + start
+                    if lineno == '*' or str(this_lineno) == lineno:
+                        yield f'line:{filepath}:{i + start} {line}'
             except OSError:
                 pass
 
@@ -110,7 +118,11 @@ class PymontraceProbe:
         self.is_end = hook == 'END'
 
     @staticmethod
-    def listsites(_='', hook='*'):
+    def listsites(unused='', hook='*'):
+        if hook == '':
+            hook = '*'
+        if unused != '':
+            return
         pattern = glob2re(hook)
         for h in ('BEGIN', 'END'):
             if pattern.match(h):
@@ -128,6 +140,8 @@ class FuncProbe:
     unwind_sites = ('unwind',)
 
     def __init__(self, qpath: str, site: _FUNC_PROBE_EVENT) -> None:
+        if qpath == '':
+            qpath = '*'
         for c in qpath:
             if not (c.isalnum() or c in '*._'):
                 raise ValueError('invalid qpath glob: {qpath!r}')
@@ -222,6 +236,10 @@ class FuncProbe:
 
     @staticmethod
     def listsites(qpath='*', site='*'):
+        if qpath == '':
+            qpath = '*'
+        if site == '':
+            site = '*'
         funcsites = ('start', 'return', 'unwind')
         gensites = ('yield', 'resume')
 

@@ -89,7 +89,7 @@ def parse_script(script_text: str):
         return parseuntil
 
     whitespace = many(str.isspace)
-    nonempty_whitespace = manyone(str.isspace, 'whitespace')
+    nonempty_whitespace = manyone(str.isspace, 'whitespace')  # noqa
 
     parse_colon = expect(':')
     parse_probe_name = regex_parser(r'[^:\s]+', 'probe name')
@@ -153,7 +153,7 @@ def parse_script(script_text: str):
     _, i = whitespace(i)  # eat leading space
     while i:
         probespec, i = parse_probe_spec(i)
-        _, i = nonempty_whitespace(i)
+        _, i = whitespace(i)
         action, i = parse_probe_action(i)
 
         # Should we check it's valid python? this may not be the target's
@@ -173,6 +173,45 @@ def validate_script(script_text: str) -> str:
     """
     _ = parse_script(script_text)
     return script_text
+
+
+def convert_probe_filter(probe_filter: str) -> str:
+
+    # This really ought to reuse the parsing logic above...
+
+    parts = probe_filter.strip().split(':')
+
+    if len(parts) > 3:
+        raise ValueError('Too many probe parts. Expected at most 3')
+    if len(parts) >= 3:
+        # want to catch accidental mixup of -e and -l
+        final_part = parts[2]
+        if '{' in final_part:
+            pf = probe_filter.strip()
+            idx = pf.find('{', pf.find(':', pf.find(':') + 1) + 1)
+            additional = pf + '\n' + (' ' * idx) + '^~'
+            raise ValueError(
+                "Unexpected '{' in probe filter. "
+                "Did you mean to use the -e option instead of -l?"
+                f"\n{additional}"
+            )
+    if ' ' in (pf := probe_filter.strip()):
+        idx = pf.find(' ')
+        additional = pf + '\n' + (' ' * idx) + '^~'
+        raise ValueError(f"Unexpected space in probe filter.\n{additional}")
+
+    if parts[0] not in ('func', 'line', 'pymontrace'):
+        pf = probe_filter.strip()
+        additional = pf + '\n' + '^' + ('~' * (len(parts[0]) - 1))
+        raise ValueError(
+            f'Unknown probe name {parts[0]!r}. '
+            'Expected one of func, line, pymontrace.'
+            f"\n{additional}"
+        )
+
+    args = ', '.join(f'{part!r}' for part in parts)
+    prog_text = 'pymontrace::BEGIN {{ printprobes(' + args + '); exit() }}'
+    return prog_text
 
 
 def _encode_script(parsed_script) -> bytes:
