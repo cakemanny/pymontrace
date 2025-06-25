@@ -191,11 +191,17 @@ def tracesubprocess(progpath: str, prog_text):
         os.unlink(comms.localpath)
 
         tracestate = TraceState()
-        receive_and_print_until_interrupted(p.pid, s, tracestate)
+        outcome = receive_and_print_until_interrupted(p.pid, s, tracestate)
         # The child will also have had a SIGINT at this point as it's
         # in the same terminal group. So should have ended unless it's
         # installed its own signal handlers.
         decode_and_print_remaining(p.pid, s, tracestate)
+
+        if outcome == EndReason.ENDED_EARLY:
+            # User included an [pmt.]exit() call in their script
+            # We own the subprocess - if the tracing stops, we kill this
+            # patient to avoid an orphan.
+            p.terminate()
 
 
 def cli_main():
