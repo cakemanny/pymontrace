@@ -210,7 +210,9 @@ def convert_probe_filter(probe_filter: str) -> str:
         )
 
     args = ', '.join(f'{part!r}' for part in parts)
-    prog_text = 'pymontrace::BEGIN {{ printprobes(' + args + '); exit() }}'
+    # As two separate probes so the exit doesn't fail to happen on exception
+    prog_text = 'pymontrace::BEGIN {{ printprobes(' + args + ') }} ' \
+        + 'pymontrace::BEGIN {{ exit() }}'
     return prog_text
 
 

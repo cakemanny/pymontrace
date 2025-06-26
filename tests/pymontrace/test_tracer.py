@@ -95,7 +95,8 @@ def test_convert_probe_filter():
     converted = convert_probe_filter('func:threading.*:end')
 
     assert converted == \
-        "pymontrace::BEGIN {{ printprobes('func', 'threading.*', 'end'); exit() }}"
+        "pymontrace::BEGIN {{ printprobes('func', 'threading.*', 'end') }} " \
+        + "pymontrace::BEGIN {{ exit() }}"
 
 
 def test_convert_probe_filter__invalid():

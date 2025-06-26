@@ -253,7 +253,7 @@ class FuncProbe:
             funcsites = tuple(site for site in funcsites if site_regex.match(site))
             gensites = tuple(site for site in gensites if site_regex.match(site))
 
-        for name, module in sys.modules.items():
+        for name, module in sys.modules.copy().items():
             for x, xvalue in vars(module).items():
                 if inspect.isfunction(xvalue):
                     if inspect.isfunction(xvalue):
@@ -269,7 +269,10 @@ class FuncProbe:
                     # We use dir instead of vars to see base class methods
                     # on their subclasses too
                     for y in dir(o):
-                        field = getattr(o, y, None)
+                        try:
+                            field = getattr(o, y, None)
+                        except Exception:
+                            continue  # some descriptors try to import stuff
                         if field is None:
                             continue
                         if inspect.isfunction(field):
