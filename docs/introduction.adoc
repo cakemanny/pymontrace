@@ -116,7 +116,7 @@ pymontrace variables or into map entries.
 | `agg.min(arg)`
 | Computes the minimum over supplied arguments.
 
-| `agg.quantize(arg: int | float)`
+| `agg.quantize(arg: int \| float)`
 | Counts its arguments into power of 2 sized buckets and displays a histogram.
 
 |===
