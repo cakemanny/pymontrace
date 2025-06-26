@@ -241,6 +241,7 @@ class FuncProbe:
         if site == '':
             site = '*'
         funcsites = ('start', 'return', 'unwind')
+        # FIXME: only emit if on 3.12 or later
         gensites = ('yield', 'resume')
 
         # it's a bit complicated to make fake frame objects and check matches

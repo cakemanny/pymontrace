@@ -17,6 +17,26 @@ Second terminal
     .
 
 
+INSTALLATION:
+
+    pymontrace can be installed with pip or pipx or just run with pipx run at
+    your preference.
+
+        pip install pymontrace
+
+        pipx install pymontrace
+
+        pipx run pymontrace
+
+        uvx pymontrace
+
+
+DOCUMENTATION:
+
+    See  pymontrace -h  and  docs/introduction.adoc  in the github repository
+    for some initial documentation.
+
+
 WARNING:
 
   - This is under early development and is in no way safe to use against
