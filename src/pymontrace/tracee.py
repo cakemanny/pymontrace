@@ -821,6 +821,8 @@ class MapNS(SimpleNamespace):
 
     # Only happens on AttributeError
     def __getattr__(self, name: str):
+        if name.startswith("__") or name == '_is_coroutine_marker':
+            raise AttributeError(f"'MapNS' object has no attribute {name!r}")
         # At this point we create the buffer space
         buffer = remote.create_agg_buffer(name)
         new_map = PMTMap(buffer)
