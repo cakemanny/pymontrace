@@ -888,6 +888,17 @@ class pmt:
             return f'{module_name}.{co_qualname}'
         return co_qualname
 
+    def args(self):
+        frame = self._frame
+        if frame is None:
+            return None
+        f_code = frame.f_code
+        num_args = (f_code.co_argcount + f_code.co_kwonlyargcount)
+        result = {}
+        for name in f_code.co_varnames[:num_args]:
+            result[name] = frame.f_locals[name]
+        return result
+
     def printprobes(self, probename, *args):
         # Used to handle the -l flag
         # ... could use PROBES_BY_NAME and/or could glob match the probename

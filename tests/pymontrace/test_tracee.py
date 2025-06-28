@@ -1,3 +1,7 @@
+#
+# FuncProbe is tested in
+#   tests/pymontrace/tracee/test_func_probe.py
+#
 import inspect
 import struct
 import sys
@@ -5,6 +9,13 @@ import sys
 import pytest
 
 from pymontrace.tracee import FuncProbe, LineProbe, Message, remote
+
+
+@pytest.fixture(autouse=True, scope="module")
+def reset_pmt():
+    from pymontrace.tracee import pmt
+    yield
+    pmt._reset()
 
 
 def empty_user_action():
@@ -107,6 +118,39 @@ def test_pmt_print_error():
     assert encoded[0] == Message.ERROR
 
 
+def test_pmt_funcname():
+    from pymontrace.tracee import pmt
+
+    def some_func():
+        return inspect.currentframe()
+
+    the_pmt = pmt(some_func())
+
+    assert the_pmt.funcname() == 'some_func'
+
+
+def test_pmt_args():
+    from pymontrace.tracee import pmt
+
+    def some_func(c: str, d: int):
+        a = 10
+        a += 1
+        return inspect.currentframe()
+
+    the_pmt = pmt(some_func("a", 3))
+
+    assert the_pmt.args() == {'c': 'a', 'd': 3}
+
+    def some_func2(c: str, /, d: int, *, e: float):
+        a = 10
+        a += 1
+        return inspect.currentframe()
+
+    the_pmt = pmt(some_func2("a", 3, e=3.1))
+
+    assert the_pmt.args() == {'c': 'a', 'd': 3, 'e': 3.1}
+
+
 def test_remote_encode_threads():
 
     encoded = remote._encode_threads([7841, 7843])
@@ -140,13 +184,6 @@ def test_decode_pymontrace_program():
 
 
 # Aggregations
-
-@pytest.fixture(autouse=True, scope="module")
-def reset_pmt():
-    from pymontrace.tracee import pmt
-    yield
-    pmt._reset()
-
 
 def test_vars():
     from pymontrace.tracee import pmt

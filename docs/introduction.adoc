@@ -89,6 +89,9 @@ target.
 | `qualname()`
 | Returns the full module-qualified name of the function.
 
+| `args()`
+| Returns a dictionary containing the current function's arguments.
+
 | `exit()`
 | Ends tracing.
 

@@ -52,6 +52,13 @@ In priority order:
 - [ ] line ranges for the line probe
 - [ ] improve / extract parser and improve error messages
 
+- [ ] improve docs
+      - should we include pmt function reference in the -h output?
+- [o] more pmt functions
+      - args() to get the current function arguments?
+      - shadow locals() to print the current function locals?
+      ...
+
 - [ ] Interval probes (probably using setitimer)
 - [ ] https://docs.python.org/3.14/howto/remote_debugging.html#remote-debugging
 - [ ] Support FreeBSD + jails , Illumos + zones, ...

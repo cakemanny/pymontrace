@@ -135,3 +135,13 @@ def test_func_probe2__qualname2():
 
     assert FuncProbe('*.bar', 'start').matches(fr[0])
     assert FuncProbe('*.outer.*.bar', 'start').matches(fr[0])
+
+
+def test_list_sites():
+    from pymontrace.tracee import FuncProbe
+
+    listing = list(FuncProbe.listsites("pymontrace.tracee.*", "start"))
+
+    assert len([x for x in listing if 'FuncProbe.listsites' in x]) == 1
+    entry = [x for x in listing if 'FuncProbe.listsites' in x][0]
+    assert entry.startswith('func:pymontrace.tracee.FuncProbe.listsites:start'), entry
