@@ -1,0 +1,5 @@
+[book]
+authors = ["cakemanny"]
+language = "en"
+src = "."
+title = "pymontrace"
