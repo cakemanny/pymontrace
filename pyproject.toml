@@ -1,3 +1,4 @@
+# Guide for this file format: https://packaging.python.org/en/latest/guides/writing-pyproject-toml/
 [build-system]
 requires = ["setuptools>=77.0.0"]
 build-backend = "setuptools.build_meta"
@@ -33,6 +34,7 @@ dependencies = []
 
 [project.urls]
 Homepage  = "https://github.com/cakemanny/pymontrace"
+Documentation = "https://cakemanny.com/pymontrace/"
 Repository  = "https://github.com/cakemanny/pymontrace.git"
 
 [project.optional-dependencies]

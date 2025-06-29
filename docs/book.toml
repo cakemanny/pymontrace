@@ -1,5 +1,12 @@
+# Guide for edit this file: https://rust-lang.github.io/mdBook/format/configuration/index.html
+
 [book]
 authors = ["cakemanny"]
 language = "en"
 src = "."
 title = "pymontrace"
+
+[output.html]
+git-repository-url = "https://github.com/cakemanny/pymontrace"
+edit-url-template = "https://github.com/cakemanny/pymontrace/tree/master/docs/{path}"
+site-url = "/pymontrace/"
