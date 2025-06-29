@@ -1,0 +1,43 @@
+name: "Build and Deploy to GitHub Pages"
+# Based on https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+env:
+  MDBOOK_VERSION: "0.4.51"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall mdbook@${{ env.MDBOOK_VERSION }}
+      - run: |
+          cd docs
+          mdbook build
+      # debug
+      - run: find docs/book
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book/
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
