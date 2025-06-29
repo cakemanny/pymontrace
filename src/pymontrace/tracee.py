@@ -91,6 +91,7 @@ class LineProbe:
         if lineno == '':
             lineno = '*'
         # TODO: allow rangees for lineno
+        curdir = os.path.abspath('.')
         probe = LineProbe(path, '0')
         for module in sys.modules.values():
             try:
@@ -99,6 +100,8 @@ class LineProbe:
                 continue
             if not probe.matches_file(filepath):
                 continue
+            if filepath.startswith(curdir):
+                filepath = os.path.relpath(filepath)
             try:
                 lines, start = inspect.getsourcelines(module)
                 if start == 0:  # This might always be the case for modules
