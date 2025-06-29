@@ -37,6 +37,8 @@ fi
 
 pymontrace -c "$(dirname "$0")/script_to_debug.py" -e '
 pymontrace::BEGIN {{
+    import sys
+    vars.unwind = sys.version_info > (3, 12)
     vars.indent = 0
 }}
 
@@ -48,4 +50,10 @@ func:*:return {{
     vars.indent -= 1
     print("  " * vars.indent, "<-", qualname())
 }}
+func:*:unwind {{
+    if vars.unwind:
+        vars.indent -= 1
+        print("  " * vars.indent, "<*", qualname())
+}}
+
 '
