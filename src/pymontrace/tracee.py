@@ -865,7 +865,6 @@ class pmt:
 
     @staticmethod
     def exit(status=None):
-        # FIXME: this is not re-entrant
         unsettrace(preclose=remote.notify_end_early())
 
     def __init__(self, frame: Optional[FrameType]):
@@ -974,9 +973,10 @@ def safe_eval(action: CodeType, frame: FrameType, snippet: str):
         _handle_eval_error(e, snippet, frame)
 
 
-def safe_eval_no_frame(action: CodeType, snippet: str):
+def safe_eval_no_frame(action: CodeType, snippet: str, exit):
     try:
         noframepmt = pmt(frame=None)
+        object.__setattr__(noframepmt, 'exit', exit)
         eval(action, {
             'pmt': noframepmt,
             **noframepmt._asdict(),
@@ -1210,7 +1210,7 @@ def settrace(encoded_program: bytes, is_initial=True):
         ]
         for (probe, action, snippet) in pmt_probes:
             if probe.is_begin:
-                safe_eval_no_frame(action, snippet)
+                safe_eval_no_frame(action, snippet, exit=early_exit)
 
         if sys.version_info < (3, 12):
             # TODO: handle func probes
@@ -1336,7 +1336,7 @@ def unsettrace(preclose=None):
 
         for (probe, action, snippet) in pmt._end_actions:
             assert probe.is_end
-            safe_eval_no_frame(action, snippet)
+            safe_eval_no_frame(action, snippet, exit=null_exit)
 
         pmt._reset()
         if preclose is not None:
@@ -1345,3 +1345,15 @@ def unsettrace(preclose=None):
     except Exception:
         print(f'{__name__}.unsettrace failed', file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
+
+
+# An exit that can be called during BEGIN probes, before tracing has been
+# installed.
+def early_exit(status=None):
+    remote.notify_end_early()
+    remote.close()
+
+
+# An exit that can be called during END probes. We ignore exit in END probes
+def null_exit(status=None):
+    pass
