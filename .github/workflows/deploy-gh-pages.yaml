@@ -27,7 +27,7 @@ jobs:
           path: docs/book/
 
   deploy:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/master'
     permissions:
       contents: read
       pages: write
