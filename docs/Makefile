@@ -1,8 +1,9 @@
 
-all: introduction.html introduction.pdf
+.PHONY: build
+build:
+	mdbook build
 
-%.pdf: %.adoc
-	asciidoctor-pdf $^
-
-%.html: %.adoc
-	asciidoctor $^
+.PHONY: preview
+preview:
+	open -a "Google Chrome" http://localhost:3000/
+	mdbook serve
