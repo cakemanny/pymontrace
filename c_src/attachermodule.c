@@ -2,6 +2,7 @@
 #define Py_LIMITED_API 0x03090000
 #include <Python.h>
 #include "attacher.h"
+#include "pyarg_fix.h"
 
 /*
  * For supporting a small number of background or worker threads, not

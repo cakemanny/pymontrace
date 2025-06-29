@@ -4,6 +4,7 @@
 #include <sys/mman.h>
 #include <stdatomic.h>
 #include <sched.h>
+#include "pyarg_fix.h"
 
 // Ensure assertions are not compiled out.
 #ifdef NDEBUG
@@ -271,7 +272,7 @@ static PyObject *
 TraceBuffer_read(PyObject *op, PyObject *args)
 {
     char* out_buf = NULL;
-    int out_len = 0;
+    Py_ssize_t out_len = 0;
     TraceBufferObject *self = TraceBufferObject_CAST(op);
 
     struct mapping_header* hdr = self->data;
@@ -328,7 +329,7 @@ TraceBuffer_read(PyObject *op, PyObject *args)
             // Nothing to read
             PyMem_Free(out_buf); // in case we saw a length in a previous loop
             char empty_buf[1] = {};
-            return Py_BuildValue("y#", empty_buf, 0);
+            return Py_BuildValue("y#", empty_buf, (Py_ssize_t)0);
         }
 
         long offset = start;
@@ -585,7 +586,7 @@ AggBuffer_write(PyObject *op, PyObject *args)
 
     unsigned long epoch;
     const char* data;
-    ssize_t data_len;
+    Py_ssize_t data_len;
 
     if (!PyArg_ParseTuple(args, "ky#:write", &epoch, &data, &data_len)) {
         return NULL;
