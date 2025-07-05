@@ -15,7 +15,33 @@ from pymontrace.tracer import (
     validate_script
 )
 
-parser = argparse.ArgumentParser(prog='pymontrace')
+
+# Getting the version from package metadata adds quite a bit of overhead
+# so we only do it if requested.
+class VersionAction(argparse.Action):
+    def __init__(self, option_strings, dest, **kwargs):
+        help = "print pymontrace's version"
+        super().__init__(option_strings, dest, nargs=0, help=help)
+
+    def _get_version(self):
+        import importlib.metadata
+        return importlib.metadata.version("pymontrace")
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(self._get_version())
+        sys.exit(0)
+
+
+parser = argparse.ArgumentParser(
+    prog='pymontrace',
+    description=(
+        'Attaches to a running python program, or starts one, and injects '
+        'debugging statements into selected probe sites.'
+    ),
+    allow_abbrev=False,
+)
+
+parser.add_argument('--version', action=VersionAction)
 target_group = parser.add_argument_group('target selection')
 target_group_alts = target_group.add_mutually_exclusive_group(required=True)
 target_group_alts.add_argument(
