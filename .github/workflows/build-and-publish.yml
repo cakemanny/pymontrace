@@ -64,7 +64,8 @@ jobs:
           python-version: '3.9'
       - name: Build package
         run: |
-          pipx run build
+          python3.9 -m pip install build
+          python3.9 -m build
       - name: Upload distributions
         uses: actions/upload-artifact@v4
         with:
