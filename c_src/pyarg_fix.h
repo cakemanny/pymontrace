@@ -6,3 +6,8 @@
 PyAPI_FUNC(int) _PyArg_ParseTuple_SizeT(PyObject *, const char *, ...);
 #undef PyArg_ParseTuple
 #define PyArg_ParseTuple _PyArg_ParseTuple_SizeT
+
+
+PyAPI_FUNC(PyObject *) _Py_BuildValue_SizeT(const char *, ...);
+#undef Py_BuildValue
+#define Py_BuildValue                   _Py_BuildValue_SizeT
