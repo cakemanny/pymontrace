@@ -51,13 +51,14 @@ jobs:
         auditwheel repair -w wheelhouse/ dist/*.whl
 
     - name: Test Wheel
+      env:
+        UV_PYTHON_DOWNLOADS: never
       run: |
         for V in 3.9 3.10 3.11 3.12 3.13; do
           rm -rf .venv
-          python${V} -m venv .venv
+          uv venv -p ${V}
           source .venv/bin/activate
-          python3 -m pip install wheelhouse/*.whl
-          python3 -m pip install pytest
+          uv pip install pytest wheelhouse/*.whl
           pytest integration_tests/
           deactivate
         done
@@ -89,14 +90,22 @@ jobs:
       # Test Package
       - name: Test Wheel
         run: |
+          echo "::group::Prepare venvs"
           for V in 3.9 3.10 3.11 3.12 3.13; do
-            rm -rf .venv
-            python${V} -m venv .venv
-            source .venv/bin/activate
-            python3 -m pip install dist/*.whl
-            python3 -m pip install pytest
-            pytest integration_tests/
+            {
+              python${V} -m venv .venv${V}
+              .venv${V}/bin/pip install pytest dist/*.whl
+            } &
+          done
+          wait
+          echo "::endgroup::"
+          for V in 3.9 3.10 3.11 3.12 3.13; do
+            echo "::group::$(python${V} -VV)"
+            # shellcheck disable=SC1090
+            source .venv${V}/bin/activate
+            .venv${V}/bin/python3 -m pytest integration_tests/
             deactivate
+            echo "::endgroup::"
           done
 
       - name: Upload distributions
