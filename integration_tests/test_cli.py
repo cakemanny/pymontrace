@@ -87,13 +87,25 @@ def get_ptrace_scope() -> Union[int, None]:
     return None
 
 
+def has_cap_sys_ptrace():
+    try:
+        subprocess.check_call(["/usr/sbin/capsh", "--has-p=cap_sys_ptrace"])
+        return True
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        return False
+
+
 def test_end_probe():
     if sys.platform == 'darwin' and os.getuid() != 0:
         pytest.skip('needs root on darwin')
-    if str(sys.platform) == 'linux' and (scope := get_ptrace_scope()) not in (None, 0):
+    if str(sys.platform) == 'linux' and (
+            (scope := get_ptrace_scope()) not in (None, 0)
+            and not has_cap_sys_ptrace()
+    ):
         msg = f'need ptrace_scope: 0, found: {scope}'
         if os.getenv("CI"):
-            pytest.fail(msg)
+            print(msg, file=sys.stderr)
         else:
             pytest.skip(msg)
 
