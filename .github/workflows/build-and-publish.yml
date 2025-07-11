@@ -51,17 +51,7 @@ jobs:
         auditwheel repair -w wheelhouse/ dist/*.whl
 
     - name: Test Wheel
-      env:
-        UV_PYTHON_DOWNLOADS: never
-      run: |
-        for V in 3.9 3.10 3.11 3.12 3.13; do
-          rm -rf .venv
-          uv venv -p ${V}
-          source .venv/bin/activate
-          uv pip install pytest wheelhouse/*.whl
-          pytest integration_tests/
-          deactivate
-        done
+      run: ./hack/test-wheel.sh wheelhouse/*.whl
 
     - name: Upload distributions
       uses: actions/upload-artifact@v4
@@ -83,30 +73,13 @@ jobs:
             3.12
             3.13
       - run: python3 -VV
+      - uses: astral-sh/setup-uv@v6
       - name: Build package
         run: |
-          pipx run build
+          pipx run build --installer=uv
 
-      # Test Package
       - name: Test Wheel
-        run: |
-          echo "::group::Prepare venvs"
-          for V in 3.9 3.10 3.11 3.12 3.13; do
-            {
-              python${V} -m venv .venv${V}
-              .venv${V}/bin/pip install pytest dist/*.whl
-            } &
-          done
-          wait
-          echo "::endgroup::"
-          for V in 3.9 3.10 3.11 3.12 3.13; do
-            echo "::group::$(python${V} -VV)"
-            # shellcheck disable=SC1090
-            source .venv${V}/bin/activate
-            .venv${V}/bin/python3 -m pytest integration_tests/
-            deactivate
-            echo "::endgroup::"
-          done
+        run: ./hack/test-wheel.sh dist/*.whl
 
       - name: Upload distributions
         uses: actions/upload-artifact@v4
