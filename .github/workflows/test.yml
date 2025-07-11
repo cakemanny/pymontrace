@@ -60,11 +60,15 @@ jobs:
       # version installed and linked into the brew cellar, so we must use
       # brew reinstall.
       run: |
-        # shellcheck disable=SC2086
-        for V in $PYTHON_VERSIONS; do
-          brew uninstall -f --ignore-dependencies python@${V}
-          brew install --overwrite python@${V}
-        done
+        # shellcheck disable=SC2086,SC2046
+        brew uninstall -f --ignore-dependencies $(for V in $PYTHON_VERSIONS; do
+          # shellcheck disable=SC2046
+          printf "%s " python@${V};
+        done)
+        # shellcheck disable=SC2086,SC2046
+        brew install --overwrite $(for V in $PYTHON_VERSIONS; do
+          printf "%s " python@${V};
+        done)
     - name: Install the latest version of uv
       uses: astral-sh/setup-uv@v6
       with:
@@ -79,10 +83,12 @@ jobs:
         done
         uv --version
     - name: Create virtualenv
+      env:
+        UV_PYTHON_DOWNLOADS: never
       run: |
         # shellcheck disable=SC2086
         for V in $PYTHON_VERSIONS; do
-          python${V} -m venv .venv${V}
+          uv venv -p ${V} .venv${V}
         done
 
     - name: Install dependencies
@@ -105,8 +111,13 @@ jobs:
       run: |
         # shellcheck disable=SC2086,SC1090
         for V in $PYTHON_VERSIONS; do
-          source .venv${V}/bin/activate
-          pyright src
+          {
+            source .venv${V}/bin/activate
+            pyright src
+          } &
+        done
+        for V in $PYTHON_VERSIONS; do
+          wait -n
         done
     - name: Test with pytest
       timeout-minutes: 1
