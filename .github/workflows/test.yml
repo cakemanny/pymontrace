@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ "master" ]
 
+env:
+  PYTHON_VERSIONS: "3.9 3.10 3.11 3.12 3.13"
+
 jobs:
 
   check:
@@ -21,15 +24,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
-        runner: ["macos-13", "macos-latest", "ubuntu-latest"]
-        include:
-          # pymontrace seems to hang attaching to Python 3.13 on the arm runner
-          # so we just test a couple of versions for now.
-          - python-version: "3.9"
-            runner: "ubuntu-24.04-arm"
-          - python-version: "3.12"
-            runner: "ubuntu-24.04-arm"
+        runner: [
+          # "macos-13",
+          "macos-latest",
+          "ubuntu-latest",
+          # "ubuntu-24.04-arm"
+        ]
 
     runs-on: ${{ matrix.runner }}
 
@@ -48,15 +48,23 @@ jobs:
     - uses: actions/setup-python@v5
       if: ${{ ! startsWith(matrix.runner, 'macos-') }}
       with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install Python ${{ matrix.python-version }}
+        python-version: |
+            3.9
+            3.10
+            3.11
+            3.12
+            3.13
+    - name: Install Python
       if: ${{ startsWith(matrix.runner, 'macos-') }}
       # The github hosted runners seem to come with certain system python
       # version installed and linked into the brew cellar, so we must use
       # brew reinstall.
       run: |
-        brew uninstall -f --ignore-dependencies python@${{ matrix.python-version }}
-        brew install --overwrite python@${{ matrix.python-version }}
+        # shellcheck disable=SC2086
+        for V in $PYTHON_VERSIONS; do
+          brew uninstall -f --ignore-dependencies python@${V}
+          brew install --overwrite python@${V}
+        done
     - name: Install the latest version of uv
       uses: astral-sh/setup-uv@v6
       with:
@@ -64,49 +72,70 @@ jobs:
     - name: Print Versions
       run: |
         uname -a
-        python${{ matrix.python-version }} -VV
-        file "$( which python${{ matrix.python-version }} )"
+        # shellcheck disable=SC2086
+        for V in $PYTHON_VERSIONS; do
+          python${V} -VV
+          file "$( which python${V} )"
+        done
         uv --version
     - name: Create virtualenv
       run: |
-        python${{ matrix.python-version }} -m venv .venv
+        # shellcheck disable=SC2086
+        for V in $PYTHON_VERSIONS; do
+          python${V} -m venv .venv${V}
+        done
 
     - name: Install dependencies
       env:
         PYMONTRACE_DEBUG: ${{ runner.debug && '1' || '' }}
       run: |
-        source .venv/bin/activate
-        uv pip install -e '.[test]' pyright
+        # shellcheck disable=SC2086,SC1090
+        for V in $PYTHON_VERSIONS; do
+          source .venv${V}/bin/activate
+          uv pip install -e '.[test]' pyright
+        done
     - name: Lint with flake8
       run: |
-        source .venv/bin/activate
-        flake8 src --count --show-source --statistics
+        # shellcheck disable=SC2086,SC1090
+        for V in $PYTHON_VERSIONS; do
+          source .venv${V}/bin/activate
+          flake8 src --count --show-source --statistics
+        done
     - name: Typecheck with Pyright
       run: |
-        source .venv/bin/activate
-        pyright src
+        # shellcheck disable=SC2086,SC1090
+        for V in $PYTHON_VERSIONS; do
+          source .venv${V}/bin/activate
+          pyright src
+        done
     - name: Test with pytest
       timeout-minutes: 1
       env:
         PYTEST_ADDOPTS: ${{ runner.debug && '-vv -s' || '' }}
       run: |
-        source .venv/bin/activate
-        ulimit -c unlimited
-        if [[ $(uname) == "Darwin" ]]; then
-          sudo pytest -v --color=yes
-        else
-          pytest -v --color=yes
-        fi
+        # shellcheck disable=SC2086,SC1090
+        for V in $PYTHON_VERSIONS; do
+          source .venv${V}/bin/activate
+          ulimit -c unlimited
+          if [[ $(uname) == "Darwin" ]]; then
+            sudo pytest -v --color=yes
+          else
+            pytest -v --color=yes
+          fi
+        done
     - name: Run Integration tests
       run: |
-        source .venv/bin/activate
-        ulimit -c unlimited
-        if [[ $(uname) == "Darwin" ]]; then
-          sudo pytest integration_tests
-        else
-          echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
-          pytest integration_tests
-        fi
+        # shellcheck disable=SC2086,SC1090
+        for V in $PYTHON_VERSIONS; do
+          source .venv${V}/bin/activate
+          ulimit -c unlimited
+          if [[ $(uname) == "Darwin" ]]; then
+            sudo pytest integration_tests
+          else
+            echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+            pytest integration_tests
+          fi
+        done
 
     - if: ${{ env.ACT == 'true' }}
       name: Install gdb and systemd-coredump
@@ -135,7 +164,10 @@ jobs:
             echo "::group::Install gdb"
             sudo apt-get update && sudo apt-get install -y gdb
             echo "::endgroup::"
-            gdb --batch -ex 'backtrace' "$( which python${{ matrix.python-version }} )" core
+            # Not sure how we will know which one dumped core...
+            for V in 3.9; do
+              gdb --batch -ex 'backtrace' "$( which python${V} )" core
+            done
           else
             echo "$(tput setaf 6)Rerun the workflow with debugging enabled" \
                  "to dump the stacktrace with gdb $(tput sgr0)"
