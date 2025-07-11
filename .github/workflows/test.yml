@@ -109,15 +109,20 @@ jobs:
         done
     - name: Typecheck with Pyright
       run: |
-        # shellcheck disable=SC2086,SC1090
+        # shellcheck disable=SC2086
+        i=0
         for V in $PYTHON_VERSIONS; do
           {
+            # shellcheck disable=SC2086,SC1090
             source .venv${V}/bin/activate
             pyright src
           } &
+          pyright_pids[i++]=" $! "
         done
-        for V in $PYTHON_VERSIONS; do
-          wait -n
+        # shellcheck disable=SC2086
+        for pid in "${pyright_pids[@]}"; do
+          echo wait $pid
+          wait $pid
         done
     - name: Test with pytest
       timeout-minutes: 1
