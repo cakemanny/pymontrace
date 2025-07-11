@@ -92,7 +92,7 @@ jobs:
         # shellcheck disable=SC2086,SC1090
         for V in $PYTHON_VERSIONS; do
           source .venv${V}/bin/activate
-          uv pip install -e '.[test]' pyright
+          uv pip install '.[test]' pyright
         done
     - name: Lint with flake8
       run: |
