@@ -4,7 +4,7 @@
 #include <sys/mman.h>
 #include <stdatomic.h>
 #include <sched.h>
-#include "pyarg_fix.h"
+#include "py_ssizet_fix.h"
 
 // Ensure assertions are not compiled out.
 #ifdef NDEBUG
