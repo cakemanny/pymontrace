@@ -12,8 +12,8 @@ jobs:
   build-sdist:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-python@v5
+    - uses: actions/checkout@v7
+    - uses: actions/setup-python@v7
       with:
         python-version: '3.13'
     - run: |
@@ -40,7 +40,7 @@ jobs:
       image: ${{ matrix.image }}
       options: --cap-add=SYS_PTRACE
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - name: Build package
       run: |
         for V in 3.9; do
@@ -63,8 +63,8 @@ jobs:
     # Creates universal2 wheels that are compatible with macos 10.13
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: |
             3.9
@@ -73,7 +73,7 @@ jobs:
             3.12
             3.13
       - run: python3 -VV
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10.0.1
       - name: Build package
         run: |
           pipx run build --installer=uv

@@ -13,7 +13,7 @@ jobs:
     container:
       image: python:3.9
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     # Acquire python header files
     - run: make check
 
@@ -44,8 +44,8 @@ jobs:
       run: |
         echo "set man-db/auto-update false" | sudo debconf-communicate
         sudo dpkg-reconfigure man-db
-    - uses: actions/checkout@v4
-    - uses: actions/setup-python@v5
+    - uses: actions/checkout@v7
+    - uses: actions/setup-python@v7
       if: ${{ ! startsWith(matrix.runner, 'macos-') }}
       with:
         python-version: ${{ matrix.python-version }}
@@ -58,7 +58,7 @@ jobs:
         brew uninstall -f --ignore-dependencies python@${{ matrix.python-version }}
         brew install --overwrite python@${{ matrix.python-version }}
     - name: Install the latest version of uv
-      uses: astral-sh/setup-uv@v6
+      uses: astral-sh/setup-uv@v10.0.1
       with:
         version: "latest"
     - name: Print Versions
