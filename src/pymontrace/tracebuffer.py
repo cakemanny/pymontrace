@@ -123,7 +123,7 @@ def open_agg_buffer(filename: str, size=DEFAULT_BUFFER_SIZE) -> AggBuffer:
 
 
 def encode_entry(key, value, Quantization) -> bytes:
-    key_data = pickle.dumps(key)
+    key_data = pickle.dumps(key, 5)
     return _tracebuffer.encode_entry(key_data, value, Quantization)
 
 

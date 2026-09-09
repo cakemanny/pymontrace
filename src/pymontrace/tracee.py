@@ -731,7 +731,7 @@ class PMTMap(abc.MutableMapping):
     def _encode(key, value) -> bytes:
         # pickle does not encode with a consistent size for same type
         # so we cannot use it for the value, which changes
-        key_data = pickle.dumps(key)
+        key_data = pickle.dumps(key, 5)
 
         return (len(key_data).to_bytes(4, sys.byteorder)
                 + key_data
