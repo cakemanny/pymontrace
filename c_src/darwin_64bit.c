@@ -86,6 +86,8 @@ struct allocation {
     vm_size_t size;
 };
 
+enum { MAX_THREADS = 32 };
+
 /**
  * Private data for the exception handler to maintain state between
  * exceptions.
@@ -94,7 +96,7 @@ static __thread struct state_slot {
     thread_act_t thread;
     struct allocation allocation; /* page allocated to inject code into */
     att_threadstate_t orig_threadstate;
-} t_threadstate[16];
+} t_threadstate[MAX_THREADS];
 
 
 struct pyfn_addrs {
@@ -1153,7 +1155,6 @@ attach_and_execute(const int pid, const char* python_code)
 {
     int err = 0;
     kern_return_t kr;
-    enum { MAX_THREADS = 16 };
     struct tgt_thread thrds[MAX_THREADS] = {};
     mach_port_t exception_port = MACH_PORT_NULL;
     struct handler_args args = {};
@@ -1582,7 +1583,6 @@ execute_in_threads(
 {
     int err = 0;
     kern_return_t kr = 0;
-    enum { MAX_THREADS = 16 };
     struct tgt_thread thrds[MAX_THREADS] = {};
     mach_port_t exception_port = MACH_PORT_NULL;
     int found_threads = 0;

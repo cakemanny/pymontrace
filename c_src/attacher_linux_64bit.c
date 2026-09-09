@@ -504,7 +504,7 @@ detach_sgl_thread(pid_t tid)
     return 0;
 }
 
-enum { MAX_THRDS = 16 };
+enum { MAX_THRDS = 32 };
 
 struct tgt_thrd {
     pid_t       tid;

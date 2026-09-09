@@ -8,7 +8,7 @@
  * For supporting a small number of background or worker threads, not
  * something like a threaded http server.
  */
-enum { MAX_THREADS = 16 };
+enum { MAX_THREADS = 32 };
 
 #define ATTACH_ERR_MSG  "Error occurred installing/uninstalling probes."
 #define UNKNOWN_STATE_ERR_MSG  \
@@ -79,7 +79,7 @@ convert_tids(PyObject *arg, uint64_t* tids)
     ssize_t len = PySequence_Length(arg);
     if (len > MAX_THREADS) {
         PyErr_SetString(PyExc_ValueError,
-                "Number of tids cannot exceed 16" /* MAX_THREADS */ );
+                "Number of tids cannot exceed 32" /* MAX_THREADS */ );
         return 0;
     }
     for (int i = 0; i < len; i++) {
