@@ -77,7 +77,7 @@ jobs:
       - uses: astral-sh/setup-uv@v10.0.1
       - name: Build package
         run: |
-          pipx run build --installer=uv
+          uv tool run --from build pyproject-build
 
       - name: Test Wheel
         run: ./hack/test-wheel.sh dist/*.whl
