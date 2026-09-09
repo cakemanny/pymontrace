@@ -15,7 +15,7 @@ jobs:
     - uses: actions/checkout@v7
     - uses: actions/setup-python@v7
       with:
-        python-version: '3.13'
+        python-version: '3.14'
     - run: |
         pipx run build --sdist
     - name: Upload distributions
@@ -72,6 +72,7 @@ jobs:
             3.11
             3.12
             3.13
+            3.14
       - run: python3 -VV
       - uses: astral-sh/setup-uv@v10.0.1
       - name: Build package
