@@ -12,14 +12,14 @@ jobs:
   build-sdist:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v7
-    - uses: actions/setup-python@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
       with:
         python-version: '3.14'
     - run: |
         pipx run build --sdist
     - name: Upload distributions
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: release-dists-sdist
         path: dist/
@@ -40,7 +40,7 @@ jobs:
       image: ${{ matrix.image }}
       options: --cap-add=SYS_PTRACE
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Build package
       run: |
         for V in 3.9; do
@@ -54,7 +54,7 @@ jobs:
       run: ./hack/test-wheel.sh wheelhouse/*.whl
 
     - name: Upload distributions
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: ${{ matrix.artifact }}
         path: wheelhouse/
@@ -63,8 +63,8 @@ jobs:
     # Creates universal2 wheels that are compatible with macos 10.13
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: |
             3.9
@@ -83,7 +83,7 @@ jobs:
         run: ./hack/test-wheel.sh dist/*.whl
 
       - name: Upload distributions
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-dists-macos
           path: dist/*.whl
@@ -104,22 +104,22 @@ jobs:
 
     steps:
     - name: Retrieve sdist
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
         name: release-dists-sdist
         path: dist/
     - name: Retrieve amd64
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
         name: release-dists-amd64
         path: dist/
     - name: Retrieve arm64
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
         name: release-dists-arm64
         path: dist/
     - name: Retrieve macos
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
         name: release-dists-macos
         path: dist/

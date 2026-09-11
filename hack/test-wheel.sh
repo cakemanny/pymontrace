@@ -12,7 +12,7 @@ export UV_PYTHON_DOWNLOADS=never
 wheel_path=$1
 test -f "$wheel_path"
 
-for V in 3.9 3.10 3.11 3.12 3.13; do
+for V in 3.9 3.10 3.11 3.12 3.13 3.14; do
     echo "::group::$(python${V} -VV)"
     rm -rf .venv
     uv venv -p ${V}
