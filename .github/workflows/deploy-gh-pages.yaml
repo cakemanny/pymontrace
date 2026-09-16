@@ -9,12 +9,18 @@ on:
 env:
   MDBOOK_VERSION: "0.4.51"
 
+permissions: {}
+
 jobs:
   build:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: cargo-bins/cargo-binstall@main
+        with:
+          persist-credentials: false
+      - uses: cargo-bins/cargo-binstall@b874e25ea559687bec77e281e9b271aa1367b624 # v1.23.0
       - run: cargo binstall mdbook@${{ env.MDBOOK_VERSION }}
       - run: |
           cd docs
